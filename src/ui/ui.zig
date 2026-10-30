@@ -196,6 +196,7 @@ pub const D3D11Area = d3d11_area.D3D11Area;
 pub const Painter = painter.Painter;
 pub const WindowUi = runtime.WindowUi;
 pub const SharedResources = runtime.SharedResources;
+pub const WindowDragArea = title_bar.WindowDragArea;
 pub const App = runtime.App;
 /// An app's window (see `App.openWindow`).
 pub const Window = runtime.App.Window;

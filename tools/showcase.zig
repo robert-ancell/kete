@@ -152,8 +152,14 @@ pub const Showcase = struct {
             .three_d => three_d.build(cx, &s.three_d),
         };
 
-        const header = cx.make(kete.Padding{
-            .padding = .symmetric(24, 12),
+        // The window's buttons are over the header's right end (the window is
+        // drawn in its title bar): what is there keeps clear of them.
+        var clear_right: f32 = 24;
+        if (cx.window()) |w| for (w.cutouts()) |c| {
+            clear_right = @max(clear_right, @as(f32, @floatFromInt(w.size()[0])) - c.x + 8);
+        };
+        const header = cx.make(kete.WindowDragArea{ .child = cx.make(kete.Padding{
+            .padding = .{ .left = 24, .right = clear_right, .top = 12, .bottom = 12 },
             .child = cx.make(kete.Row{
                 .spacing = 16,
                 .cross_axis_alignment = .center,
@@ -174,7 +180,7 @@ pub const Showcase = struct {
                     },
                 }),
             }),
-        });
+        }) });
 
         const body = cx.make(kete.Row{
             .cross_axis_alignment = .stretch,
@@ -230,6 +236,7 @@ pub fn main(init: std.process.Init) !void {
         .root = .of(&root),
         .size = .{ 1120, 760 },
         .min_size = .{ 800, 480 },
+        .draw_in_title_bar = true,
         .on_close_request = .close,
     });
     try app.run();

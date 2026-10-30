@@ -942,6 +942,9 @@ pub const WaylandWindow = struct {
         size: [2]u32 = default_size,
         min_size: ?[2]u32 = null,
         maximized: bool = false,
+        /// The app draws in the title bar: the compositor is asked to leave
+        /// the decorations to the toolkit.
+        draw_in_title_bar: bool = false,
         /// A window it belongs to (a dialog's, a tool window's), on the
         /// same display.
         parent: ?*WaylandWindow = null,
@@ -1064,6 +1067,10 @@ pub const WaylandWindow = struct {
             m = try mgr.request(p.zxdg_decoration_manager_v1.request.get_toplevel_decoration);
             m.uint(dec.id).uint(w.toplevel.id).end();
             w.toplevel_decoration = dec;
+            if (options.draw_in_title_bar) {
+                m = try dec.request(p.zxdg_toplevel_decoration_v1.request.set_mode);
+                m.uint(p.zxdg_toplevel_decoration_v1.mode.client_side).end();
+            }
         }
         m = try w.toplevel.request(p.xdg_toplevel.request.set_title);
         m.string(options.title).end();

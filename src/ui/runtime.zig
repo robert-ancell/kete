@@ -378,8 +378,14 @@ pub const WindowUi = struct {
     controls: ?*window_mod.WindowControls = null,
     /// The app's window it is the UI of (null when it is not an `App`'s).
     app_window: ?*App.Window = null,
-    /// Automatic title bar node (used when `decorations == .toolkit`).
+    /// Whether the app draws under the title bar (`WindowOptions.draw_in_title_bar`).
+    content_in_title_bar: bool = false,
+    /// The title bar node (used when `decorations == .toolkit`): the whole
+    /// bar, or just the window's buttons, over the content.
     title_bar_root: ?*Node = null,
+    /// What the window draws over the content (`cutouts`).
+    cutouts_buf: [1]geometry.Rect = undefined,
+    cutouts_len: usize = 0,
     /// The system's clipboard (the app gives it); without one, text is
     /// copied within the app (`local_clipboard`).
     clipboard: ?Clipboard = null,
@@ -604,6 +610,19 @@ pub const WindowUi = struct {
         return ui.win != null and ui.decorations == .toolkit and !ui.fullscreen;
     }
 
+    /// True when the toolkit draws the window's buttons over the content,
+    /// which goes under the title bar (and not a bar of its own).
+    pub fn hasControlsOverlay(ui: *const WindowUi) bool {
+        return ui.content_in_title_bar and ui.hasToolkitTitleBar();
+    }
+
+    /// The parts of the window drawn over the app's content (a phone's
+    /// notch, so to say): the window's buttons, if the content is in the title
+    /// bar, in logical pixels. Good until the next frame.
+    pub fn cutouts(ui: *const WindowUi) []const geometry.Rect {
+        return ui.cutouts_buf[0..ui.cutouts_len];
+    }
+
     /// What the app runs on (see `widget.BackendInfo`).
     pub fn backend(ui: *const WindowUi) widget.BackendInfo {
         return .{
@@ -734,7 +753,8 @@ pub const WindowUi = struct {
         // The title-bar height is a constant; only the minimum width (and the
         // root's minimum size) need the expensive traversal, which we skip when
         // the tree structure has not changed since we last computed them.
-        const tb_min_h: f32 = if (tb != null) title_bar_mod.TitleBar.height else 0;
+        const overlay = ui.hasControlsOverlay();
+        const tb_min_h: f32 = if (tb != null and !overlay) title_bar_mod.TitleBar.height else 0;
         if (ui.min_size_version != ui.build_version) {
             ui.cached_raw_min = r.minSize(.unbounded);
             ui.cached_tb_min = if (tb) |t| t.minSize(.unbounded) else .{};
@@ -762,13 +782,23 @@ pub const WindowUi = struct {
         }
         const window: Size = .{ .w = @floatFromInt(w_px), .h = @floatFromInt(h_px) };
         var tb_h: f32 = 0;
-        if (tb) |t| {
+        if (tb) |t| if (!overlay) {
             const ts = t.layout(.{ .min_w = window.w, .max_w = window.w, .max_h = window.h });
             t.offset = .{ 0, 0 };
             tb_h = ts.h;
-        }
+        };
         _ = r.layout(.tight(.{ .w = window.w, .h = @max(0, window.h - tb_h) }));
         r.offset = .{ 0, tb_h };
+        // The window's buttons over the content, in the top right corner.
+        ui.cutouts_len = 0;
+        if (tb) |t| if (overlay) {
+            const ts = t.layout(.{ .max_w = window.w, .max_h = window.h });
+            t.offset = .{ window.w - ts.w, 0 };
+            if (ts.w > 0) {
+                ui.cutouts_buf[0] = .{ .x = t.offset[0], .y = 0, .w = ts.w, .h = ts.h };
+                ui.cutouts_len = 1;
+            }
+        };
         const m = ui.buildMenu(window);
         const d = ui.buildDrag(window);
         const tt = ui.buildTooltip(window);
@@ -869,7 +899,7 @@ pub const WindowUi = struct {
         }
         const title = if (ui.win) |w| w.title() else "";
         var cx: Context = .{ .ui = ui, .arena = ui.arena() };
-        const w = cx.make(title_bar_mod.TitleBar{ .title = title });
+        const w = if (ui.hasControlsOverlay()) cx.make(title_bar_mod.TitleBarControls{}) else cx.make(title_bar_mod.TitleBar{ .title = title });
         if (ui.title_bar_root) |tb| if (tb.widget.vtable != w.vtable) {
             tb.destroy();
             ui.title_bar_root = null;
@@ -995,8 +1025,10 @@ pub const WindowUi = struct {
         ui.frame_size = .{ width * s, height * s };
         ui.paint_order = 0;
         var p: Painter = .{ .ui = ui, .node = r };
-        if (tb) |t| p.paintNode(t);
+        const overlay = ui.hasControlsOverlay();
+        if (tb) |t| if (!overlay) p.paintNode(t);
         p.paintNode(r);
+        if (tb) |t| if (overlay) p.paintNode(t);
         if (drag) |d| p.paintNode(d);
         if (menu) |m| if (ui.menu_popup == null) p.paintNode(m);
         if (tooltip) |tt| if (ui.tooltip_popup == null) p.paintNode(tt);
@@ -1926,6 +1958,12 @@ pub const App = struct {
         size: [2]u32 = .{ 1280, 720 },
         min_size: ?[2]u32 = null,
         maximized: bool = false,
+        /// Whether what it draws goes under its title bar, the way the
+        /// system's own controls (close, minimize, maximize) are drawn over
+        /// it: where they are is in `Window.cutouts`, and `WindowDragArea`
+        /// marks what moves the window. Where the window system draws the
+        /// title bar (and will not leave it), it is not under it.
+        draw_in_title_bar: bool = false,
         /// What is under it all (ARGB); the theme's surface colour if null.
         clear_color: ?u32 = null,
         /// A window it belongs to (a dialog's, a tool window's): it stays
@@ -1939,6 +1977,9 @@ pub const App = struct {
         /// What it draws.
         root: Root,
         min_size: ?[2]u32 = null,
+        /// As `WindowOptions.draw_in_title_bar` says (the window is already
+        /// open, so a backend's own asks for it when it is).
+        draw_in_title_bar: bool = false,
         clear_color: ?u32 = null,
         on_close_request: OnCloseRequest = .ignore,
     };
@@ -1999,10 +2040,11 @@ pub const App = struct {
             .size = options.size,
             .min_size = options.min_size,
             .maximized = options.maximized,
+            .draw_in_title_bar = options.draw_in_title_bar,
             .parent = parent,
         });
         errdefer win.close();
-        const w = try a.adopt(win, .{ .root = options.root, .min_size = options.min_size, .clear_color = options.clear_color, .on_close_request = options.on_close_request });
+        const w = try a.adopt(win, .{ .root = options.root, .min_size = options.min_size, .draw_in_title_bar = options.draw_in_title_bar, .clear_color = options.clear_color, .on_close_request = options.on_close_request });
         w.owns_window = true;
         w.ui.enableAccessibility(a.environ);
         return w;
@@ -2034,6 +2076,7 @@ pub const App = struct {
         if (a.followSystem()) a.applyTheme();
         ui.theme = a.theme.scheme();
         ui.min_size_floor = options.min_size orelse .{ 0, 0 };
+        ui.content_in_title_bar = options.draw_in_title_bar;
         ui.attachWindow(win, &w.controls);
         ui.app_window = w;
         win.setRedraw(.{ .ctx = w, .f = Window.redraw });
@@ -2342,6 +2385,25 @@ pub const App = struct {
         pub fn setMinimized(w: *Window) void {
             if (w.closed) return;
             w.win.setMinimized();
+        }
+
+        /// The parts of it the window system or the toolkit draws over what
+        /// the app draws (as a phone's notch is), in logical pixels from its
+        /// top left: the window's buttons, when the app draws in the title
+        /// bar (`WindowOptions.draw_in_title_bar`). The app can draw under
+        /// them, but should keep what matters out of them. Empty otherwise.
+        /// Good until the next frame.
+        pub fn cutouts(w: *const Window) []const geometry.Rect {
+            if (w.closed) return &.{};
+            return w.ui.cutouts();
+        }
+
+        /// Whether what the app draws goes under the window's title bar, with
+        /// the window's buttons over it (`cutouts`): false where the window
+        /// system draws the title bar, or the window is fullscreen, and the
+        /// app has to draw its own bar below it, if it has one.
+        pub fn contentInTitleBar(w: *const Window) bool {
+            return !w.closed and w.ui.hasControlsOverlay();
         }
 
         /// Whether it covers the whole display.

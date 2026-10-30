@@ -103,6 +103,7 @@ pub const MetalArea = ui.MetalArea;
 pub const D3D11Area = ui.D3D11Area;
 
 pub const Window = ui.Window;
+pub const WindowDragArea = ui.WindowDragArea;
 
 test {
     _ = ui;

@@ -16,6 +16,7 @@ const geometry = @import("geometry.zig");
 const widget = @import("widget.zig");
 const Column = @import("flex.zig").Column;
 const RoundedBox = @import("rounded_box.zig").RoundedBox;
+const Padding = @import("padding.zig").Padding;
 const Row = @import("flex.zig").Row;
 const SizedBox = @import("sized_box.zig").SizedBox;
 const BarButton = @import("bar_button.zig").BarButton;
@@ -53,9 +54,9 @@ pub const TitleBar = struct {
     pub const height = 44;
     /// The buttons' size, the space between them, and that at the bar's
     /// ends and around the title.
-    const button_size = 34;
-    const spacing = 4;
-    const margin = 8;
+    pub const button_size = 34;
+    pub const spacing = 4;
+    pub const margin = 8;
     /// How much of the title still shows in the narrowest window.
     const min_title_width = 120;
 
@@ -67,39 +68,89 @@ pub const TitleBar = struct {
     pub fn build(self: *const TitleBar, cx: *Context) Widget {
         // A fullscreen window has none.
         if (cx.ui.fullscreen) return cx.make(@import("sized_box.zig").SizedBox.empty);
-        const controls = cx.ui.controls;
-        const win = cx.ui.win;
-        const can_minimize = if (win) |w| w.canMinimize() else false;
-        const can_maximize = if (win) |w| w.canMaximize() else true;
-        const on_minimize = self.on_minimize orelse if (controls) |c| (if (can_minimize) widget.Callback.of(c, WindowControls.minimize) else null) else null;
-        const on_maximize = self.on_maximize orelse if (controls) |c| (if (can_maximize) widget.Callback.of(c, WindowControls.toggleMaximized) else null) else null;
-        const on_close = self.on_close orelse if (controls) |c| widget.Callback.of(c, WindowControls.close) else null;
-        const on_drag = self.on_drag orelse if (controls) |c| widget.Callback.of(c, WindowControls.drag) else null;
+        const actions = actionsOf(cx, .{ .minimize = self.on_minimize, .maximize = self.on_maximize, .close = self.on_close, .drag = self.on_drag });
         const maximized = if (self.on_maximize != null) self.maximized else cx.ui.maximized;
         const t = cx.theme();
-        var buttons: [3]Widget = undefined;
-        var n: usize = 0;
-        if (on_minimize) |f| {
-            buttons[n] = cx.make(BarButton{ .on_press = f, .size = button_size, .icon = .minimize });
-            n += 1;
-        }
-        if (on_maximize) |f| {
-            // A square fills the screen; two, one behind the other, go back
-            // to the window's own size.
-            buttons[n] = cx.make(BarButton{ .on_press = f, .size = button_size, .icon = if (maximized) .filter_none else .crop_square });
-            n += 1;
-        }
-        if (on_close) |f| {
-            buttons[n] = cx.make(BarButton{ .on_press = f, .size = button_size, .icon = .close });
-            n += 1;
-        }
-        return cx.make(DragArea{ .on_drag = on_drag, .on_maximize = on_maximize, .child = cx.make(RoundedBox{ .color = t.surface_container, .child = cx.make(Bar{
+        return cx.make(DragArea{ .on_drag = actions.drag, .on_maximize = actions.maximize, .child = cx.make(RoundedBox{ .color = t.surface_container, .child = cx.make(Bar{
             .title = self.title,
             .children = cx.makeAll(.{
                 Text{ .text = self.title, .style = .{ .color = t.on_surface }, .wrap = false, .ellipsis = true },
-                Row{ .spacing = spacing, .fill = false, .children = buttons[0..n] },
+                Row{ .spacing = spacing, .fill = false, .children = buttonsOf(cx, actions, maximized) },
             }),
         }) }) });
+    }
+};
+
+/// What the window's buttons do, and what pressing its title bar does: null
+/// where the window cannot.
+const Actions = struct {
+    minimize: ?widget.Callback = null,
+    maximize: ?widget.Callback = null,
+    close: ?widget.Callback = null,
+    drag: ?widget.Callback = null,
+};
+
+/// What `given` says, or else what the window's controls do (if it can).
+fn actionsOf(cx: *Context, given: Actions) Actions {
+    const controls = cx.ui.controls;
+    const win = cx.ui.win;
+    const can_minimize = if (win) |w| w.canMinimize() else false;
+    const can_maximize = if (win) |w| w.canMaximize() else true;
+    return .{
+        .minimize = given.minimize orelse if (controls) |c| (if (can_minimize) widget.Callback.of(c, WindowControls.minimize) else null) else null,
+        .maximize = given.maximize orelse if (controls) |c| (if (can_maximize) widget.Callback.of(c, WindowControls.toggleMaximized) else null) else null,
+        .close = given.close orelse if (controls) |c| widget.Callback.of(c, WindowControls.close) else null,
+        .drag = given.drag orelse if (controls) |c| widget.Callback.of(c, WindowControls.drag) else null,
+    };
+}
+
+/// The buttons for what `actions` has, left to right.
+fn buttonsOf(cx: *Context, actions: Actions, maximized: bool) []const Widget {
+    const buttons = cx.arena.alloc(Widget, 3) catch return &.{};
+    var n: usize = 0;
+    if (actions.minimize) |f| {
+        buttons[n] = cx.make(BarButton{ .on_press = f, .size = TitleBar.button_size, .icon = .minimize });
+        n += 1;
+    }
+    if (actions.maximize) |f| {
+        // A square fills the screen; two, one behind the other, go back
+        // to the window's own size.
+        buttons[n] = cx.make(BarButton{ .on_press = f, .size = TitleBar.button_size, .icon = if (maximized) .filter_none else .crop_square });
+        n += 1;
+    }
+    if (actions.close) |f| {
+        buttons[n] = cx.make(BarButton{ .on_press = f, .size = TitleBar.button_size, .icon = .close });
+        n += 1;
+    }
+    return buttons[0..n];
+}
+
+/// The window's buttons on their own, in the top right corner over what the
+/// app draws (see `WindowUi.cutouts`): for a window whose content is in its
+/// title bar. The buttons have no background, as the system's have.
+pub const TitleBarControls = struct {
+    pub fn build(_: *const TitleBarControls, cx: *Context) Widget {
+        if (cx.ui.fullscreen) return cx.make(@import("sized_box.zig").SizedBox.empty);
+        const buttons = buttonsOf(cx, actionsOf(cx, .{}), cx.ui.maximized);
+        const room = (TitleBar.height - TitleBar.button_size) / 2;
+        return cx.make(Padding{
+            .padding = .{ .top = room, .bottom = room, .right = TitleBar.margin },
+            .child = cx.make(Row{ .spacing = TitleBar.spacing, .fill = false, .children = buttons }),
+        });
+    }
+};
+
+/// Where pressing the left button starts moving the window, and a double
+/// click maximizes it (or takes it back): the app's own title bar, or the
+/// part of it that is not a button or the like, for a window whose content
+/// is in its title bar.
+pub const WindowDragArea = struct {
+    /// What is in it.
+    child: ?Widget = null,
+
+    pub fn build(self: *const WindowDragArea, cx: *Context) Widget {
+        const actions = actionsOf(cx, .{});
+        return cx.make(DragArea{ .on_drag = actions.drag, .on_maximize = actions.maximize, .child = self.child });
     }
 };
 
@@ -368,6 +419,63 @@ test "WindowUi automatically adds TitleBar when the toolkit draws the decoration
     try testing.expectEqual(@as(f32, 0), u.root.?.offset[1]);
     try testing.expectEqual(@as(f32, 600), u.root.?.size.h);
     try testing.expectEqual(window_mod.WindowDecorations.system, u.decorations);
+}
+
+test "a window whose content is in its title bar has the buttons over it, reported as a cutout" {
+    const WindowUi = @import("runtime.zig").WindowUi;
+    const window_mod = @import("window");
+    const font = @import("font");
+    const f = try font.Font.init(font.default_font_data);
+    const u = try WindowUi.create(testing.allocator, testing.io, &f);
+    defer u.destroy();
+
+    const MockWaylandWin = struct {
+        pub const platform: window_mod.WindowPlatform = .wayland;
+        pub const buffer_transport: window_mod.WindowBufferTransport = .memory;
+        title: []const u8 = "Kete Test",
+        decorations: window_mod.WindowDecorations = .toolkit,
+        width: u32 = 800,
+        height: u32 = 600,
+    };
+    var mock_win: MockWaylandWin = .{};
+    var controls: WindowControls = .init(&mock_win);
+    u.attachWindow(&mock_win, &controls);
+    u.content_in_title_bar = true;
+
+    const Root = struct {
+        pub fn build(_: *const @This(), cx: *Context) Widget {
+            return cx.make(SizedBox{ .width = 200, .height = 100 });
+        }
+    };
+
+    // The content fills the window: nothing is above it, and the buttons
+    // are in the corner, where the window says they are.
+    u.frame(800, 600, 0, Root{});
+    try testing.expect(u.title_bar_root != null);
+    try testing.expectEqual(@as(f32, 0), u.root.?.offset[1]);
+    try testing.expectEqual(@as(f32, 600), u.root.?.size.h);
+    try testing.expect(u.hasControlsOverlay());
+    const cut = u.cutouts();
+    try testing.expectEqual(@as(usize, 1), cut.len);
+    try testing.expectEqual(@as(f32, 0), cut[0].y);
+    try testing.expectEqual(@as(f32, 800), cut[0].x + cut[0].w);
+    try testing.expectEqual(@as(f32, TitleBar.height), cut[0].h);
+
+    // The close button is in it, and does what the system's does.
+    const at: geometry.Point = .{ 800 - 8 - 17, 22 };
+    u.pointerMotion(at);
+    u.pointerButton(at, .left, true);
+    u.pointerButton(at, .left, false);
+    try testing.expect(controls.close_requested);
+
+    // Where the system draws the decorations, the content is not under them.
+    controls.close_requested = false;
+    mock_win.decorations = .system;
+    u.syncWindow(&mock_win);
+    u.frame(800, 600, 1, Root{});
+    try testing.expect(u.title_bar_root == null);
+    try testing.expect(!u.hasControlsOverlay());
+    try testing.expectEqual(@as(usize, 0), u.cutouts().len);
 }
 
 fn findText(n: *Node) ?*Node {

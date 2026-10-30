@@ -1278,6 +1278,10 @@ pub const WindowOptions = struct {
     size: ?[2]u32 = null,
     min_size: ?[2]u32 = null,
     maximized: bool = false,
+    /// The app draws in the window's title bar: the window system gives up
+    /// drawing there where it can (the compositor is asked to leave the
+    /// decorations to the toolkit, on Wayland).
+    draw_in_title_bar: bool = false,
     /// A window it belongs to (a dialog's, a tool window's), opened on the
     /// same display: it stays above it.
     parent: ?Window = null,
