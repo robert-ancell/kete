@@ -5,6 +5,11 @@
 //! that `TranslateMessage` makes of it (so dead keys and the keyboard's
 //! layout work as everywhere else on Windows).
 //!
+//! The content can go under the title bar (`Options.draw_in_title_bar`): the
+//! window has no frame of its own then (`WM_NCCALCSIZE`), its edges that resize
+//! are answered for (`WM_NCHITTEST`), and DWM still draws its buttons over the
+//! content, in the frame extended into it: `cutouts` says where they are.
+//!
 //! It is single-threaded, and is built not to drop frames:
 //!
 //! * One wait for everything (`wait`): `MsgWaitForMultipleObjectsEx` on
@@ -83,6 +88,8 @@ const WM_CAPTURECHANGED = 0x0215;
 const WM_ACTIVATE = 0x0006;
 const WM_MOUSEACTIVATE = 0x0021;
 const WM_NCLBUTTONDOWN = 0x00a1;
+const WM_NCCALCSIZE = 0x0083;
+const WM_NCHITTEST = 0x0084;
 const MA_NOACTIVATE = 3;
 const WS_EX_LAYERED: w32.DWORD = 0x00080000;
 const WS_EX_NOACTIVATE: w32.DWORD = 0x08000000;
@@ -116,6 +123,19 @@ const QS_ALLINPUT: w32.DWORD = 0x04ff;
 const QS_INPUT: UINT = 0x0407;
 const MWMO_INPUTAVAILABLE: w32.DWORD = 0x0004;
 const HTCLIENT = 1;
+const HTCAPTION = 2;
+const HTLEFT = 10;
+const HTRIGHT = 11;
+const HTTOP = 12;
+const HTTOPLEFT = 13;
+const HTTOPRIGHT = 14;
+const HTBOTTOM = 15;
+const HTBOTTOMLEFT = 16;
+const HTBOTTOMRIGHT = 17;
+const SM_CYCAPTION = 4;
+const SM_CXSIZEFRAME = 32;
+const SM_CXPADDEDBORDER = 92;
+const DWMWA_CAPTION_BUTTON_BOUNDS: w32.DWORD = 5;
 const TME_LEAVE: w32.DWORD = 2;
 const CF_UNICODETEXT: UINT = 13;
 const SPI_GETWHEELSCROLLLINES: UINT = 0x68;
@@ -334,6 +354,8 @@ pub const Win32Window = struct {
     /// `openPopup`), and the next one's id.
     popups: [max_popups]?Popup = @splat(null),
     next_popup_id: u32 = 1,
+    /// The content is under the title bar (`Options.draw_in_title_bar`).
+    draw_in_title_bar: bool = false,
 
     /// A popup: a layered window over the window (owned by it), which never
     /// takes the keyboard, its pointer input the window's (in its
@@ -365,6 +387,9 @@ pub const Win32Window = struct {
         size: [2]u32 = .{ 960, 640 },
         min_size: ?[2]u32 = null,
         maximized: bool = false,
+        /// The app draws in the title bar: the window's content fills it, and
+        /// the window's buttons are over the content (`cutouts`).
+        draw_in_title_bar: bool = false,
         /// A window it belongs to (a dialog's, a tool window's): it owns
         /// it, so that it stays above it, and is minimized with it.
         parent: ?*Win32Window = null,
@@ -397,6 +422,7 @@ pub const Win32Window = struct {
             .title_buf = try gpa.dupe(u8, options.title),
             .width = options.size[0],
             .height = options.size[1],
+            .draw_in_title_bar = options.draw_in_title_bar,
         };
         errdefer gpa.free(w.title_buf);
         if (options.min_size) |m| w.min_size = m;
@@ -407,6 +433,7 @@ pub const Win32Window = struct {
         const hwnd = u.CreateWindowExW(0, class_name, w32.wide(&title_w, options.title).ptr, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, owner, null, instance, w) orelse return error.CreateWindowFailed;
         w.hwnd = hwnd;
         w.updateScale(u);
+        w.extendFrame(u);
         w.resizeTo(u, options.size);
         w.dark = w32.appsUseDark();
         w.applyDarkTitleBar();
@@ -501,9 +528,75 @@ pub const Win32Window = struct {
     /// pixels at its scale).
     fn resizeTo(w: *Win32Window, u: *const w32.User32, logical: [2]u32) void {
         var r: w32.RECT = .{ .right = @intCast(logical[0] * w.scale), .bottom = @intCast(logical[1] * w.scale) };
-        const dpi = u.GetDpiForWindow(w.hwnd);
-        _ = u.AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, w32.FALSE, 0, if (dpi == 0) 96 else dpi);
+        w.outerRect(u, &r);
         _ = u.SetWindowPos(w.hwnd, null, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    /// Whether the content is under the title bar, and the window has no
+    /// frame of its own (`Options.draw_in_title_bar`; not in fullscreen).
+    fn customFrame(w: *const Win32Window) bool {
+        return w.draw_in_title_bar and !w.fullscreen;
+    }
+
+    /// How thick the window's frame is, in pixels at its DPI (what a
+    /// maximized window overhangs the screen by, and its edges that resize).
+    fn frameThickness(w: *const Win32Window, u: *const w32.User32) i32 {
+        const dpi = u.GetDpiForWindow(w.hwnd);
+        const d: w32.UINT = if (dpi == 0) 96 else dpi;
+        return u.GetSystemMetricsForDpi(SM_CXSIZEFRAME, d) + u.GetSystemMetricsForDpi(SM_CXPADDEDBORDER, d);
+    }
+
+    /// Makes `r` (a client area) the window's rectangle round it: with a frame
+    /// of its own, the rectangle it is (a window with the content in the title
+    /// bar has none).
+    fn outerRect(w: *const Win32Window, u: *const w32.User32, r: *w32.RECT) void {
+        if (w.draw_in_title_bar) return;
+        const dpi = u.GetDpiForWindow(w.hwnd);
+        _ = u.AdjustWindowRectExForDpi(r, WS_OVERLAPPEDWINDOW, w32.FALSE, 0, if (dpi == 0) 96 else dpi);
+    }
+
+    /// Has DWM draw the window's buttons over the content (it draws them in
+    /// the part of the frame extended into the client area), and the frame
+    /// worked out again.
+    fn extendFrame(w: *Win32Window, u: *const w32.User32) void {
+        if (!w.draw_in_title_bar) return;
+        const d = w32.dwmapi() orelse return;
+        const dpi = u.GetDpiForWindow(w.hwnd);
+        const caption = u.GetSystemMetricsForDpi(SM_CYCAPTION, if (dpi == 0) 96 else dpi);
+        const margins: w32.MARGINS = .{ .cyTopHeight = w.frameThickness(u) + caption };
+        _ = d.DwmExtendFrameIntoClientArea(w.hwnd, &margins);
+        _ = u.SetWindowPos(w.hwnd, null, 0, 0, 0, 0, SWP_NOMOVE | 0x0001 | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+
+    /// Starts moving the window with the pointer, from the left button's press:
+    /// for the app's own title bar. Nothing, if it is not held.
+    pub fn startMove(w: *Win32Window) void {
+        if (w.buttons_held == 0) return;
+        const u = w32.user32() orelse return;
+        _ = u.ReleaseCapture();
+        _ = u.SendMessageW(w.hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+    }
+
+    /// Where the window's buttons (minimize, maximize, close) are over the
+    /// content, if the app draws in the title bar: their rectangle, with some
+    /// room around it. None in fullscreen, or minimized.
+    pub fn cutouts(w: *const Win32Window, out: *[window.max_cutouts]gfx.Rect) usize {
+        if (!w.customFrame() or w.minimized) return 0;
+        const d = w32.dwmapi() orelse return 0;
+        const u = w32.user32() orelse return 0;
+        var r: w32.RECT = .{};
+        if (!w32.succeeded(d.DwmGetWindowAttribute(w.hwnd, DWMWA_CAPTION_BUTTON_BOUNDS, &r, @sizeOf(w32.RECT)))) return 0;
+        // In the window's pixels from its top left: the client area is inside
+        // it by what a maximized window overhangs the screen by.
+        const inset: i32 = if (u.IsZoomed(w.hwnd) != 0) w.frameThickness(u) else 0;
+        const s: f32 = @floatFromInt(w.scale);
+        const room = 6;
+        const x = @max(@as(f32, @floatFromInt(r.left - inset)) / s - room, 0);
+        const y = @max(@as(f32, @floatFromInt(r.top - inset)) / s - room, 0);
+        const right = @as(f32, @floatFromInt(r.right - inset)) / s + room;
+        const bottom = @as(f32, @floatFromInt(r.bottom - inset)) / s + room;
+        out[0] = .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
+        return 1;
     }
 
     fn updateScale(w: *Win32Window, u: *const w32.User32) void {
@@ -597,8 +690,7 @@ pub const Win32Window = struct {
             WM_GETMINMAXINFO => {
                 const info: *w32.MINMAXINFO = @ptrFromInt(@as(usize, @bitCast(lparam)));
                 var r: w32.RECT = .{ .right = @intCast(w.min_size[0] * w.scale), .bottom = @intCast(w.min_size[1] * w.scale) };
-                const dpi = u.GetDpiForWindow(w.hwnd);
-                _ = u.AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, w32.FALSE, 0, if (dpi == 0) 96 else dpi);
+                w.outerRect(u, &r);
                 info.ptMinTrackSize = .{ .x = r.right - r.left, .y = r.bottom - r.top };
                 return 0;
             },
@@ -606,7 +698,54 @@ pub const Win32Window = struct {
                 // The size Windows suggests for the new DPI.
                 const r: *const w32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
                 _ = u.SetWindowPos(w.hwnd, null, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                w.extendFrame(u);
                 return 0;
+            },
+            WM_NCCALCSIZE => {
+                // With the content in the title bar, the whole window is the
+                // client area (but for what a maximized window overhangs the
+                // screen by).
+                if (!w.customFrame()) return null;
+                if (wparam != 0) {
+                    const params: *w32.NCCALCSIZE_PARAMS = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    if (u.IsZoomed(w.hwnd) != 0) {
+                        const f = w.frameThickness(u);
+                        params.rgrc[0].left += f;
+                        params.rgrc[0].top += f;
+                        params.rgrc[0].right -= f;
+                        params.rgrc[0].bottom -= f;
+                    }
+                }
+                return 0;
+            },
+            WM_NCHITTEST => {
+                if (!w.customFrame()) return null;
+                // The window's buttons are DWM's to answer for.
+                if (w32.dwmapi()) |d| {
+                    var result: LRESULT = 0;
+                    if (d.DwmDefWindowProc(w.hwnd, message, wparam, lparam, &result) != 0) return result;
+                }
+                if (u.IsZoomed(w.hwnd) != 0) return HTCLIENT;
+                // The edges, which resize it (there is no frame to do so).
+                var r: w32.RECT = .{};
+                _ = u.GetWindowRect(w.hwnd, &r);
+                const bits: usize = @bitCast(lparam);
+                const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(bits))));
+                const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(bits >> 16))));
+                const f = w.frameThickness(u);
+                const left = x < r.left + f;
+                const right = x >= r.right - f;
+                const top = y < r.top + f;
+                const bottom = y >= r.bottom - f;
+                if (top and left) return HTTOPLEFT;
+                if (top and right) return HTTOPRIGHT;
+                if (bottom and left) return HTBOTTOMLEFT;
+                if (bottom and right) return HTBOTTOMRIGHT;
+                if (left) return HTLEFT;
+                if (right) return HTRIGHT;
+                if (top) return HTTOP;
+                if (bottom) return HTBOTTOM;
+                return HTCLIENT;
             },
             WM_DISPLAYCHANGE => {
                 w.updateRefresh();

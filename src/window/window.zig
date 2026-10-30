@@ -1134,8 +1134,8 @@ pub const Window = struct {
         w.vtable.setFullscreen(w.ptr, on);
     }
     /// Starts moving the window with the pointer, for a title bar pressed by the
-    /// user. Does nothing unless a button is held. Not yet on macOS and Windows,
-    /// where the system's own title bar moves the window.
+    /// user. Does nothing unless a button is held. Where the system draws the
+    /// title bar it moves the window itself.
     pub fn startMove(w: Window) void {
         w.vtable.startMove(w.ptr);
     }
@@ -1299,8 +1299,8 @@ pub const WindowOptions = struct {
     /// The app draws in the window's title bar: the window system gives up
     /// drawing there where it can. On Wayland the compositor is asked to leave
     /// the decorations to the toolkit, which draws the window's buttons over
-    /// the content; on macOS the content goes under the title bar, and the
-    /// system's own buttons stay over it (see `Window.cutouts`).
+    /// the content; on macOS and Windows the content goes under the title
+    /// bar, and the system's own buttons stay over it (see `Window.cutouts`).
     draw_in_title_bar: bool = false,
     /// A window it belongs to (a dialog's, a tool window's), opened on the
     /// same display: it stays above it.

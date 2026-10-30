@@ -375,6 +375,8 @@ pub const User32 = struct {
     SetCursor: *const fn (?HCURSOR) callconv(cc) ?HCURSOR,
     SetCapture: *const fn (HWND) callconv(cc) ?HWND,
     ReleaseCapture: *const fn () callconv(cc) BOOL,
+    SendMessageW: *const fn (HWND, UINT, WPARAM, LPARAM) callconv(cc) LRESULT,
+    GetSystemMetricsForDpi: *const fn (c_int, UINT) callconv(cc) c_int,
     TrackMouseEvent: *const fn (*TRACKMOUSEEVENT) callconv(cc) BOOL,
     GetDC: *const fn (?HWND) callconv(cc) ?HDC,
     ReleaseDC: *const fn (?HWND, HDC) callconv(cc) c_int,
@@ -435,9 +437,19 @@ pub fn gdi32() ?*const Gdi32 {
     return procs(Gdi32, "gdi32.dll");
 }
 
+/// How far the window's frame is extended into its client area.
+pub const MARGINS = extern struct { cxLeftWidth: c_int = 0, cxRightWidth: c_int = 0, cyTopHeight: c_int = 0, cyBottomHeight: c_int = 0 };
+
+/// What `WM_NCCALCSIZE` says about the window's size (`lParam`, when
+/// `wParam` is true).
+pub const NCCALCSIZE_PARAMS = extern struct { rgrc: [3]RECT, lppos: ?*anyopaque };
+
 pub const Dwmapi = struct {
     DwmGetCompositionTimingInfo: *const fn (?HWND, *anyopaque) callconv(cc) HRESULT,
     DwmSetWindowAttribute: *const fn (HWND, DWORD, *const anyopaque, DWORD) callconv(cc) HRESULT,
+    DwmGetWindowAttribute: *const fn (HWND, DWORD, *anyopaque, DWORD) callconv(cc) HRESULT,
+    DwmExtendFrameIntoClientArea: *const fn (HWND, *const MARGINS) callconv(cc) HRESULT,
+    DwmDefWindowProc: *const fn (HWND, UINT, WPARAM, LPARAM, *LRESULT) callconv(cc) BOOL,
 };
 
 pub fn dwmapi() ?*const Dwmapi {
