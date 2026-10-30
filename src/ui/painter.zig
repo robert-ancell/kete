@@ -71,6 +71,14 @@ pub const Painter = struct {
         return p.canvas().drawText(p.ui.atlas, .{ .font = f, .size = size }, x, baseline, str, color);
     }
 
+    /// Draws `str` in the UI's font from `from` (where its baseline starts),
+    /// running `direction` (up, down or upside down, its glyphs turned with
+    /// it); where its baseline ends.
+    pub fn textRunning(p: *Painter, size: f32, from: [2]f32, direction: gfx.Canvas.TextDirection, str: []const u8, color: gfx.Color) [2]f32 {
+        const f = p.ui.font orelse return from;
+        return p.canvas().drawTextRunning(p.ui.atlas, .{ .font = f, .size = size }, from, direction, str, color);
+    }
+
     /// Draws an icon `size` square with its top left at (`x`, `y`).
     pub fn icon(p: *Painter, which: @import("icons").IconName, x: f32, y: f32, size: f32, color: gfx.Color) void {
         var buf: [4]u8 = undefined;

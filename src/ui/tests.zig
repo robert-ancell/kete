@@ -3212,3 +3212,51 @@ test "a badge sits on its child's corner as Material 3's does, the child's size 
         }
     }
 }
+
+test "text running up, left or down is the upright text turned, and as big turned" {
+    const u = try ui.WindowUi.createDefault(testing.allocator, testing.io);
+    defer u.destroy();
+    u.attachRenderer(u.shared.software_renderer.renderer(), false);
+    const Case = struct {
+        direction: gfx.Canvas.TextDirection,
+        pub fn build(self: *const @This(), cx: *Context) Widget {
+            return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.Text{
+                .text = "Card 1\nWrites",
+                .style = .{ .size = 14, .color = .rgb(0xffffff) },
+                .direction = self.direction,
+            }) });
+        }
+    };
+    const n = 120;
+    u.theme = .dark;
+    u.frame(n, n, 0, Case{ .direction = .right });
+    const upright = find(u.root.?, ui.Text).?.size;
+    var want = try Image.init(u, n, n);
+    defer want.deinit();
+    const bg = want.at(n - 1, n - 1);
+    const w: u32 = @intFromFloat(upright.w);
+    const h: u32 = @intFromFloat(upright.h);
+    for ([_]gfx.Canvas.TextDirection{ .up, .left, .down }, 1..) |dir, frame| {
+        u.frame(n, n, frame, Case{ .direction = dir });
+        const size = find(u.root.?, ui.Text).?.size;
+        const sideways = dir != .left;
+        try testing.expectEqual(if (sideways) upright.h else upright.w, size.w);
+        try testing.expectEqual(if (sideways) upright.w else upright.h, size.h);
+        var got = try Image.init(u, n, n);
+        defer got.deinit();
+        var lit: u32 = 0;
+        for (0..h) |y| for (0..w) |x| {
+            const xi: u32 = @intCast(x);
+            const yi: u32 = @intCast(y);
+            const to: [2]u32 = switch (dir) {
+                .up => .{ yi, w - 1 - xi },
+                .left => .{ w - 1 - xi, h - 1 - yi },
+                .down => .{ h - 1 - yi, xi },
+                .right => unreachable,
+            };
+            try testing.expectEqual(want.at(xi, yi), got.at(to[0], to[1]));
+            lit += @intFromBool(want.at(xi, yi) != bg);
+        };
+        try testing.expect(lit > 40);
+    }
+}

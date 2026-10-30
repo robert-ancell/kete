@@ -63,6 +63,12 @@ pub const Text = struct {
     wrap: bool = true,
     /// End lines too wide for the space with "…" instead of overflowing.
     ellipsis: bool = false,
+    /// The way its lines run: right (as usual), or up (turned a quarter
+    /// counter-clockwise, as along a card's left edge), left (upside down)
+    /// or down (turned a quarter clockwise, as on a book's spine). Turned a
+    /// quarter, it wraps (and aligns) in the height it has, and is as wide
+    /// as its lines are high.
+    direction: gfx.Canvas.TextDirection = .right,
 
     const Laid = struct { lines: []const Line, style: font.Style };
 
@@ -148,7 +154,25 @@ pub const Text = struct {
         return .{ .role = .paragraph, .text = self.text };
     }
 
-    pub fn layout(self: *const Text, n: *Node, c: Constraints) Size {
+    /// Whether its lines run up or down (so its width and height are its
+    /// lines' height and length).
+    fn sideways(self: *const Text) bool {
+        return self.direction == .up or self.direction == .down;
+    }
+
+    /// `c`, with width and height swapped if the text runs sideways: the
+    /// constraints in the text's own terms, and back.
+    fn turn(self: *const Text, c: Constraints) Constraints {
+        if (!self.sideways()) return c;
+        return .{ .min_w = c.min_h, .max_w = c.max_h, .min_h = c.min_w, .max_h = c.max_w };
+    }
+
+    fn turnSize(self: *const Text, s: Size) Size {
+        return if (self.sideways()) .{ .w = s.h, .h = s.w } else s;
+    }
+
+    pub fn layout(self: *const Text, n: *Node, c_in: Constraints) Size {
+        const c = self.turn(c_in);
         const style = self.fontStyle(n) orelse return c.smallest();
         const arena = n.ui.arena();
         const lines = self.wrapped(n, style, if (self.wrap) c.max_w else geometry.inf) catch return c.smallest();
@@ -161,11 +185,13 @@ pub const Text = struct {
         const laid = arena.create(Laid) catch return c.smallest();
         laid.* = .{ .lines = lines, .style = style };
         n.scratch = laid;
-        n.setContent(.{ .x = 0, .y = 0, .w = widest, .h = height });
-        return c.constrain(.{ .w = @ceil(widest), .h = @ceil(height) });
+        const content = self.turnSize(.{ .w = widest, .h = height });
+        n.setContent(.{ .x = 0, .y = 0, .w = content.w, .h = content.h });
+        return self.turnSize(c.constrain(.{ .w = @ceil(widest), .h = @ceil(height) }));
     }
 
-    pub fn minSize(self: *const Text, n: *Node, c: Constraints) Size {
+    pub fn minSize(self: *const Text, n: *Node, c_in: Constraints) Size {
+        const c = self.turn(c_in);
         const style = self.fontStyle(n) orelse return c.smallest();
         // Wrapped, with no width to fit, it can be as narrow as its widest
         // word (never a whole paragraph on one line).
@@ -178,21 +204,32 @@ pub const Text = struct {
             for (lines) |l| widest = @max(widest, l.width);
         }
         const height = @as(f32, @floatFromInt(lines.len)) * style.lineHeight();
-        return c.constrain(.{ .w = @ceil(widest), .h = @ceil(height) });
+        return self.turnSize(c.constrain(.{ .w = @ceil(widest), .h = @ceil(height) }));
     }
 
     pub fn paint(self: *const Text, n: *Node, p: *Painter) void {
         const laid: *const Laid = @ptrCast(@alignCast(n.scratch orelse return));
         const color = self.style.color orelse n.theme().on_surface;
         const lh = laid.style.lineHeight();
+        // Its length along the lines, in its own terms.
+        const length = if (self.sideways()) n.size.h else n.size.w;
+        const w = n.size.w;
+        const h = n.size.h;
         for (laid.lines, 0..) |l, i| {
-            const x = switch (self.text_align) {
+            // Along the line and across the lines, then turned.
+            const a: f32 = switch (self.text_align) {
                 .start => 0,
-                .center => @max((n.size.w - l.width) / 2, 0),
-                .end => @max(n.size.w - l.width, 0),
+                .center => @max((length - l.width) / 2, 0),
+                .end => @max(length - l.width, 0),
             };
-            const baseline = @as(f32, @floatFromInt(i)) * lh + laid.style.ascent();
-            _ = p.text(laid.style.size, x, baseline, l.text, color);
+            const b = @as(f32, @floatFromInt(i)) * lh + laid.style.ascent();
+            const from: [2]f32 = switch (self.direction) {
+                .right => .{ a, b },
+                .up => .{ b, h - a },
+                .left => .{ w - a, h - b },
+                .down => .{ w - b, a },
+            };
+            _ = p.textRunning(laid.style.size, from, self.direction, l.text, color);
         }
     }
 };
