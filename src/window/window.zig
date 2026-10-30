@@ -598,6 +598,10 @@ pub const PopupPlacement = struct {
     }
 };
 
+/// The most parts of a window the window system draws over its content
+/// (`Window.cutouts`).
+pub const max_cutouts = 4;
+
 /// Generic window interface (`Window.of(&impl)`).
 pub const Window = struct {
     /// The window it stands for (a pointer to a backend's window).
@@ -643,6 +647,7 @@ pub const Window = struct {
         layout: *const fn (ptr: *anyopaque) KeyboardLayout,
         watch: *const fn (ptr: *anyopaque, source: Source, on: bool) void,
         refreshNs: *const fn (ptr: *anyopaque) u64,
+        cutouts: *const fn (ptr: *anyopaque, out: *[max_cutouts]gfx.Rect) usize,
         applyConfigure: *const fn (ptr: *anyopaque) anyerror!?[2]u32,
         releaseSpareBuffers: *const fn (ptr: *anyopaque) void,
         beginSoftwareFrame: *const fn (ptr: *anyopaque) anyerror!gfx.software.Image,
@@ -847,6 +852,10 @@ pub const Window = struct {
                 if (@hasDecl(T, "layout")) return self(p).layout();
                 return .{};
             }
+            fn cutoutsFn(p: *anyopaque, out: *[max_cutouts]gfx.Rect) usize {
+                if (@hasDecl(T, "cutouts")) return self(p).cutouts(out);
+                return 0;
+            }
             fn refreshNsFn(p: *anyopaque) u64 {
                 if (@hasDecl(T, "refreshNs")) return self(p).refreshNs();
                 if (@hasField(T, "refresh_ns")) return self(p).refresh_ns;
@@ -959,6 +968,7 @@ pub const Window = struct {
                 .layout = layoutFn,
                 .watch = watchFn,
                 .refreshNs = refreshNsFn,
+                .cutouts = cutoutsFn,
                 .applyConfigure = applyConfigureFn,
                 .releaseSpareBuffers = releaseSpareBuffersFn,
                 .beginSoftwareFrame = beginSoftwareFrameFn,
@@ -1176,6 +1186,14 @@ pub const Window = struct {
     pub fn refreshNs(w: Window) u64 {
         return w.vtable.refreshNs(w.ptr);
     }
+    /// The parts of the window the window system draws over what the app draws
+    /// (the window's buttons, when it was opened with `draw_in_title_bar`), in
+    /// logical pixels from its top left: written to `out`, and returned (none
+    /// for a window that has not, or whose system draws the title bar apart
+    /// from the content).
+    pub fn cutouts(w: Window, out: *[max_cutouts]gfx.Rect) []const gfx.Rect {
+        return out[0..w.vtable.cutouts(w.ptr, out)];
+    }
     /// Applies the size the windowing system last asked for; returns it if
     /// it changed.
     pub fn applyConfigure(w: Window) !?[2]u32 {
@@ -1279,8 +1297,10 @@ pub const WindowOptions = struct {
     min_size: ?[2]u32 = null,
     maximized: bool = false,
     /// The app draws in the window's title bar: the window system gives up
-    /// drawing there where it can (the compositor is asked to leave the
-    /// decorations to the toolkit, on Wayland).
+    /// drawing there where it can. On Wayland the compositor is asked to leave
+    /// the decorations to the toolkit, which draws the window's buttons over
+    /// the content; on macOS the content goes under the title bar, and the
+    /// system's own buttons stay over it (see `Window.cutouts`).
     draw_in_title_bar: bool = false,
     /// A window it belongs to (a dialog's, a tool window's), opened on the
     /// same display: it stays above it.

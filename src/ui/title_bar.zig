@@ -478,6 +478,50 @@ test "a window whose content is in its title bar has the buttons over it, report
     try testing.expectEqual(@as(usize, 0), u.cutouts().len);
 }
 
+test "the parts a window system draws over the content are reported, as the toolkit's buttons are" {
+    const WindowUi = @import("runtime.zig").WindowUi;
+    const window_mod = @import("window");
+    const font = @import("font");
+    const f = try font.Font.init(font.default_font_data);
+    const u = try WindowUi.create(testing.allocator, testing.io, &f);
+    defer u.destroy();
+
+    // A window like macOS's: its system draws the decorations, and its buttons
+    // are over the content, in the top left corner.
+    const MockMacWin = struct {
+        pub const platform: window_mod.WindowPlatform = .macos;
+        pub const buffer_transport: window_mod.WindowBufferTransport = .memory;
+        pub const decorations: window_mod.WindowDecorations = .system;
+        title: []const u8 = "Kete Test",
+        width: u32 = 800,
+        height: u32 = 600,
+        buttons: bool = true,
+        pub fn cutouts(self: *const @This(), out: *[window_mod.max_cutouts]geometry.Rect) usize {
+            if (!self.buttons) return 0;
+            out[0] = .{ .x = 8, .y = 6, .w = 60, .h = 20 };
+            return 1;
+        }
+    };
+    var mock_win: MockMacWin = .{};
+    u.attachWindow(&mock_win, null);
+    const Root = struct {
+        pub fn build(_: *const @This(), cx: *Context) Widget {
+            return cx.make(SizedBox{ .width = 200, .height = 100 });
+        }
+    };
+    u.frame(800, 600, 0, Root{});
+    try testing.expect(u.title_bar_root == null);
+    try testing.expectEqual(@as(usize, 1), u.cutouts().len);
+    try testing.expectEqual(@as(f32, 60), u.cutouts()[0].w);
+    // The root fills the window: the title bar is the system's, and not the toolkit's.
+    try testing.expectEqual(@as(f32, 600), u.root.?.size.h);
+
+    // In fullscreen they are gone.
+    mock_win.buttons = false;
+    u.frame(800, 600, 1, Root{});
+    try testing.expectEqual(@as(usize, 0), u.cutouts().len);
+}
+
 fn findText(n: *Node) ?*Node {
     if (n.widget.is(Text)) return n;
     for (n.children.items) |ch| if (findText(ch)) |t| return t;

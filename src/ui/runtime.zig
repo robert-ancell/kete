@@ -384,7 +384,7 @@ pub const WindowUi = struct {
     /// bar, or just the window's buttons, over the content.
     title_bar_root: ?*Node = null,
     /// What the window draws over the content (`cutouts`).
-    cutouts_buf: [1]geometry.Rect = undefined,
+    cutouts_buf: [window_mod.max_cutouts]geometry.Rect = undefined,
     cutouts_len: usize = 0,
     /// The system's clipboard (the app gives it); without one, text is
     /// copied within the app (`local_clipboard`).
@@ -791,6 +791,10 @@ pub const WindowUi = struct {
         r.offset = .{ 0, tb_h };
         // The window's buttons over the content, in the top right corner.
         ui.cutouts_len = 0;
+        // What the window system draws over the content, if it does.
+        if (!overlay) if (ui.win) |win| {
+            ui.cutouts_len = win.cutouts(&ui.cutouts_buf).len;
+        };
         if (tb) |t| if (overlay) {
             const ts = t.layout(.{ .max_w = window.w, .max_h = window.h });
             t.offset = .{ window.w - ts.w, 0 };
@@ -2390,8 +2394,9 @@ pub const App = struct {
         /// The parts of it the window system or the toolkit draws over what
         /// the app draws (as a phone's notch is), in logical pixels from its
         /// top left: the window's buttons, when the app draws in the title
-        /// bar (`WindowOptions.draw_in_title_bar`). The app can draw under
-        /// them, but should keep what matters out of them. Empty otherwise.
+        /// bar (`WindowOptions.draw_in_title_bar`): the toolkit's, or the
+        /// window system's. The app can draw under them, but should keep what
+        /// matters out of them. Empty otherwise.
         /// Good until the next frame.
         pub fn cutouts(w: *const Window) []const geometry.Rect {
             if (w.closed) return &.{};
@@ -2403,7 +2408,7 @@ pub const App = struct {
         /// system draws the title bar, or the window is fullscreen, and the
         /// app has to draw its own bar below it, if it has one.
         pub fn contentInTitleBar(w: *const Window) bool {
-            return !w.closed and w.ui.hasControlsOverlay();
+            return !w.closed and (w.ui.hasControlsOverlay() or w.ui.cutouts().len > 0);
         }
 
         /// Whether it covers the whole display.

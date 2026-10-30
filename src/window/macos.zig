@@ -1,6 +1,8 @@
 //! MacWindow: a native macOS window: AppKit's NSWindow, with the system's
 //! own title bar, buttons, resizing and full screen (the system draws
-//! the decorations), and a view of kete's in it.
+//! the decorations), and a view of kete's in it. The view can go under the
+//! title bar (`Options.draw_in_title_bar`), with the system's buttons over
+//! it: `cutouts` says where they are.
 //!
 //! Frames are drawn on the CPU into one of three buffers in turn (so the
 //! damage tracking draws only what changed, as on Wayland) and shown as
@@ -51,6 +53,11 @@ pub const MacWindow = struct {
     close_requested: bool = false,
     maximized: bool = false,
     fullscreen: bool = false,
+    /// The content is under the title bar (`Options.draw_in_title_bar`).
+    draw_in_title_bar: bool = false,
+    /// The last press of the left button (kept), which moving the window
+    /// from where the app says (`startMove`) goes on from.
+    last_press: Id = null,
     refresh_ns: u64 = std.time.ns_per_s / 60,
     /// A frame was shown less than a refresh ago (when the display shows
     /// it), so the next waits; and when it was shown.
@@ -169,6 +176,9 @@ pub const MacWindow = struct {
         size: [2]u32 = .{ 960, 640 },
         min_size: ?[2]u32 = null,
         maximized: bool = false,
+        /// The app draws in the title bar: the window's content fills it, and
+        /// the window's buttons are over the content (`cutouts`).
+        draw_in_title_bar: bool = false,
         /// A window it belongs to (a dialog's, a tool window's): it stays
         /// above it, and moves with it.
         parent: ?*MacWindow = null,
@@ -196,13 +206,20 @@ pub const MacWindow = struct {
         errdefer gpa.free(w.title_buf);
 
         const rect: objc.Rect = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = @floatFromInt(options.size[0]), .height = @floatFromInt(options.size[1]) } };
-        // Titled, closable, minimizable and resizable: the system's frame.
-        const style: u64 = 1 | 2 | 4 | 8;
+        // Titled, closable, minimizable and resizable: the system's frame
+        // (with the content under the title bar, if the app draws there).
+        const style: u64 = 1 | 2 | 4 | 8 | (if (options.draw_in_title_bar) @as(u64, 1 << 15) else 0);
         const nswin = msg(Id, objc.class("NSWindow"), "alloc", .{});
         w.win = msg(Id, nswin, "initWithContentRect:styleMask:backing:defer:", .{ rect, style, @as(u64, 2), objc.no });
         msg(void, w.win, "setReleasedWhenClosed:", .{objc.no});
         msg(void, w.win, "setTitle:", .{objc.nsString(options.title)});
         msg(void, w.win, "setAcceptsMouseMovedEvents:", .{objc.yes});
+        w.draw_in_title_bar = options.draw_in_title_bar;
+        if (options.draw_in_title_bar) {
+            // The title bar shows nothing of its own (the buttons stay).
+            msg(void, w.win, "setTitlebarAppearsTransparent:", .{objc.yes});
+            msg(void, w.win, "setTitleVisibility:", .{@as(isize, 1)});
+        }
 
         // A view hosting a layer of its own, whose contents are the frames.
         w.view = msg(Id, msg(Id, viewClass(), "alloc", .{}), "initWithFrame:", .{rect});
@@ -263,6 +280,7 @@ pub const MacWindow = struct {
         msg(void, w.view, "release", .{});
         msg(void, w.win, "release", .{});
         objc.release(w.plain_layer);
+        objc.release(w.last_press);
         if (w.display_link) |link| {
             msg(void, link, "invalidate", .{});
             objc.release(link);
@@ -579,6 +597,48 @@ pub const MacWindow = struct {
         if ((msg(objc.Bool, w.win, "isZoomed", .{}) != 0) != on) msg(void, w.win, "zoom:", .{@as(Id, null)});
     }
 
+    /// Starts moving the window with the pointer, from the last press of the left
+    /// button: for the app's own title bar.
+    pub fn startMove(w: *MacWindow) void {
+        const e = w.last_press orelse return;
+        msg(void, w.win, "performWindowDragWithEvent:", .{e});
+    }
+
+    /// Where the window's buttons (close, minimize, zoom) are over the content,
+    /// if the app draws in the title bar: their rectangle, with some room
+    /// around it. None in fullscreen, when they are hidden.
+    pub fn cutouts(w: *const MacWindow, out: *[window.max_cutouts]gfx.Rect) usize {
+        if (!w.draw_in_title_bar or w.fullscreen) return 0;
+        const pool = objc.push();
+        defer objc.pop(pool);
+        var lo: [2]f32 = .{ std.math.inf(f32), std.math.inf(f32) };
+        var hi: [2]f32 = .{ -std.math.inf(f32), -std.math.inf(f32) };
+        for ([_]isize{ 0, 1, 2 }) |which| {
+            const button = msg(Id, w.win, "standardWindowButton:", .{which}) orelse continue;
+            if (msg(objc.Bool, button, "isHidden", .{}) != 0) continue;
+            const parent = msg(Id, button, "superview", .{}) orelse continue;
+            const frame = objc.msgRect(button, "frame");
+            // Two corners, in the window's coordinates and then the view's
+            // (where down is positive).
+            const corners = [2]objc.Point{
+                .{ .x = frame.origin.x, .y = frame.origin.y },
+                .{ .x = frame.origin.x + frame.size.width, .y = frame.origin.y + frame.size.height },
+            };
+            for (corners) |corner| {
+                const in_window = msg(objc.Point, parent, "convertPoint:toView:", .{ corner, @as(Id, null) });
+                const p = msg(objc.Point, w.view, "convertPoint:fromView:", .{ in_window, @as(Id, null) });
+                lo = .{ @min(lo[0], @as(f32, @floatCast(p.x))), @min(lo[1], @as(f32, @floatCast(p.y))) };
+                hi = .{ @max(hi[0], @as(f32, @floatCast(p.x))), @max(hi[1], @as(f32, @floatCast(p.y))) };
+            }
+        }
+        if (lo[0] > hi[0]) return 0;
+        const room = 6;
+        const x = @max(lo[0] - room, 0);
+        const y = @max(lo[1] - room, 0);
+        out[0] = .{ .x = x, .y = y, .w = hi[0] + room - x, .h = hi[1] + room - y };
+        return 1;
+    }
+
     pub fn setMinimized(w: *MacWindow) void {
         msg(void, w.win, "miniaturize:", .{@as(Id, null)});
     }
@@ -830,6 +890,11 @@ pub const MacWindow = struct {
 
     fn mouse(view: Id, event: Id, button: window.PointerButton, pressed: bool) void {
         const w = ofView(view) orelse return;
+        if (button == .left and pressed) {
+            const kept = objc.retain(event);
+            objc.release(w.last_press);
+            w.last_press = kept;
+        }
         const pos = w.locate(event);
         w.push(.{ .motion = pos });
         w.push(.{ .button = .{ .pos = pos, .button = button, .pressed = pressed } });
