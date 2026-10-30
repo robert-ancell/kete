@@ -439,23 +439,56 @@ pub const Canvas = struct {
     /// batch of a canvas uses the same one). Returns the pen position after
     /// the text (in logical coordinates). Glyphs that do not fit in the atlas are left out.
     pub fn drawText(c: *Canvas, atlas: *Atlas, style: font.Style, x: f32, baseline: f32, text: []const u8, color: Color) f32 {
+        return c.drawTextRunning(atlas, style, .{ x, baseline }, .right, text, color)[0];
+    }
+
+    /// The way a line of text runs (`drawTextRunning`): rightwards (as
+    /// usual), or turned a quarter, half or three quarters round.
+    pub const TextDirection = enum {
+        /// Left to right, upright.
+        right,
+        /// Bottom to top: turned a quarter counter-clockwise (as along the
+        /// left edge of a card).
+        up,
+        /// Right to left, upside down.
+        left,
+        /// Top to bottom: turned a quarter clockwise (as on a book's spine).
+        down,
+    };
+
+    /// Draws `text` from `from` (where its baseline starts), running in
+    /// `direction`, with its glyphs turned with it; where the baseline ends.
+    /// Turned by quarters, its glyphs stay as sharp as upright ones.
+    pub fn drawTextRunning(c: *Canvas, atlas: *Atlas, style: font.Style, from: Point, direction: TextDirection, text: []const u8, color: Color) Point {
         c.atlas = atlas;
         const s = c.scale;
-        const ox = c.origin[0];
-        const base = @round((baseline + c.origin[1]) * s);
-        const phys_size = style.size * s;
         const run = atlas.runs.get(style, text);
-        const end = x + if (run) |r| r.width else font.measure(style, text);
+        const width = if (run) |r| r.width else font.measure(style, text);
+        // Physical pixels: along the text (`along`, increasing as it runs),
+        // and across it (the baseline, a whole pixel, increasing downwards
+        // in the glyphs' own terms).
+        const px: Point = .{ (from[0] + c.origin[0]) * s, (from[1] + c.origin[1]) * s };
+        const turn: Turn = .{ .direction = direction };
+        const start = turn.along(px);
+        const base = @round(turn.across(px));
+        const end: Point = switch (direction) {
+            .right => .{ from[0] + width, from[1] },
+            .up => .{ from[0], from[1] - width },
+            .left => .{ from[0] - width, from[1] },
+            .down => .{ from[0], from[1] + width },
+        };
         if (color.a <= 0 or text.len == 0) return end;
-        const bounds: Rect = .{ .x = (x + ox - style.size) * s, .y = base - 1.5 * phys_size, .w = (end - x + 2 * style.size) * s, .h = 2.5 * phys_size };
-        c.note(.text, bounds, .{ @intFromPtr(style.font), @intFromPtr(style.font.fallback), phys_size, (x + ox) * s, base, color }, text);
-        // Glyphs reach about an em above and below the baseline at most.
+        const phys_size = style.size * s;
+        // Glyphs reach about an em above and below the baseline at most, and
+        // an em before and after the text.
+        const bounds = turn.rect(start - phys_size, start + (width + style.size) * s, base - 1.5 * phys_size, base + phys_size);
+        c.note(.text, bounds, .{ @intFromPtr(style.font), @intFromPtr(style.font.fallback), phys_size, px[0], px[1], @backingInt(direction), color }, text);
         const b = c.batchFor(.text, bounds) orelse return end;
         var l = font.Layout.init(style, text, 0);
         var i: usize = 0;
         while (true) : (i += 1) {
             const item = if (run) |r| (if (i < r.glyphs.len) r.glyphs[i] else break) else l.next() orelse break;
-            const quarter: i32 = @intFromFloat(@round(std.math.clamp((item.x + x + ox) * s, -1e6, 1e6) * 4));
+            const quarter: i32 = @intFromFloat(@round(std.math.clamp(item.x * s + start, -1e6, 1e6) * 4));
             if (item.font.colorLayers(item.glyph)) |layers_init| {
                 var layers = layers_init;
                 while (layers.next()) |layer| {
@@ -463,43 +496,90 @@ pub const Canvas = struct {
                         const p = Color.argb(hex);
                         break :blk p.withAlpha(p.a * color.a);
                     } else color;
-                    if (!c.emitGlyph(b, atlas, item.font, layer.glyph, phys_size, quarter, base, lc)) return end;
+                    if (!c.emitGlyph(b, atlas, item.font, layer.glyph, phys_size, quarter, base, turn, lc)) return end;
                 }
                 continue;
             }
-            if (!c.emitGlyph(b, atlas, item.font, item.glyph, phys_size, quarter, base, color)) return end;
+            if (!c.emitGlyph(b, atlas, item.font, item.glyph, phys_size, quarter, base, turn, color)) return end;
         }
         return end;
     }
 
-    fn emitGlyph(c: *Canvas, b: *Batch, atlas: *Atlas, f: *const font.Font, glyph: u16, size: f32, quarter: i32, base: f32, color: Color) bool {
+    /// Where text runs: physical pixels along it and across it (from the
+    /// glyphs' point of view: rightwards, and downwards), and back.
+    const Turn = struct {
+        direction: TextDirection,
+
+        fn along(t: Turn, p: Point) f32 {
+            return switch (t.direction) {
+                .right => p[0],
+                .up => -p[1],
+                .left => -p[0],
+                .down => p[1],
+            };
+        }
+
+        fn across(t: Turn, p: Point) f32 {
+            return switch (t.direction) {
+                .right => p[1],
+                .up => p[0],
+                .left => -p[1],
+                .down => -p[0],
+            };
+        }
+
+        /// The point `a` along and `b` across.
+        fn point(t: Turn, a: f32, b: f32) Point {
+            return switch (t.direction) {
+                .right => .{ a, b },
+                .up => .{ b, -a },
+                .left => .{ -a, -b },
+                .down => .{ -b, a },
+            };
+        }
+
+        /// The rectangle from `a0` to `a1` along and `b0` to `b1` across.
+        fn rect(t: Turn, a0: f32, a1: f32, b0: f32, b1: f32) Rect {
+            const p = t.point(a0, b0);
+            const q = t.point(a1, b1);
+            const x0 = @min(p[0], q[0]);
+            const y0 = @min(p[1], q[1]);
+            return .{ .x = x0, .y = y0, .w = @max(p[0], q[0]) - x0, .h = @max(p[1], q[1]) - y0 };
+        }
+    };
+
+    fn emitGlyph(c: *Canvas, b: *Batch, atlas: *Atlas, f: *const font.Font, glyph: u16, size: f32, quarter: i32, base: f32, turn: Turn, color: Color) bool {
         const e = atlas.glyph(f, glyph, size, @intCast(quarter & 3)) orelse return true;
         if (e.w == 0) return true;
         const inv_aw: f32 = 1.0 / @as(f32, @floatFromInt(atlas_mod.width));
         const inv_ah: f32 = 1.0 / @as(f32, @floatFromInt(atlas_mod.height));
-        const x0: f32 = @floatFromInt((quarter >> 2) + e.left);
-        const y0 = base + @as(f32, @floatFromInt(e.top));
-        const x1 = x0 + @as(f32, @floatFromInt(e.w));
-        const y1 = y0 + @as(f32, @floatFromInt(e.h));
+        // The glyph's box along and across the text, and its corners turned.
+        const a0: f32 = @floatFromInt((quarter >> 2) + e.left);
+        const b0 = base + @as(f32, @floatFromInt(e.top));
+        const a1 = a0 + @as(f32, @floatFromInt(e.w));
+        const b1 = b0 + @as(f32, @floatFromInt(e.h));
         const tu0 = @as(f32, @floatFromInt(e.x)) * inv_aw;
         const tv0 = @as(f32, @floatFromInt(e.y)) * inv_ah;
         const tu1 = @as(f32, @floatFromInt(e.x + e.w)) * inv_aw;
         const tv1 = @as(f32, @floatFromInt(e.y + e.h)) * inv_ah;
-        const cx0 = c.clipX(x0);
-        const cy0 = c.clipY(y0);
-        const cx1 = c.clipX(x1);
-        const cy1 = c.clipY(y1);
+        const corners = [4]struct { a: f32, b: f32, u: f32, v: f32 }{
+            .{ .a = a0, .b = b0, .u = tu0, .v = tv0 },
+            .{ .a = a1, .b = b0, .u = tu1, .v = tv0 },
+            .{ .a = a1, .b = b1, .u = tu1, .v = tv1 },
+            .{ .a = a0, .b = b1, .u = tu0, .v = tv1 },
+        };
+        var quad: [4][shaders.text_floats]f32 = undefined;
+        for (corners, &quad) |k, *out| {
+            const p = turn.point(k.a, k.b);
+            out.* = .{ c.clipX(p[0]), c.clipY(p[1]), k.u, k.v, color.r, color.g, color.b, color.a };
+        }
         const out = c.vertices(b, shaders.text_floats, 6) orelse return false;
-        const v0 = [shaders.text_floats]f32{ cx0, cy0, tu0, tv0, color.r, color.g, color.b, color.a };
-        const v1 = [shaders.text_floats]f32{ cx1, cy0, tu1, tv0, color.r, color.g, color.b, color.a };
-        const v2 = [shaders.text_floats]f32{ cx1, cy1, tu1, tv1, color.r, color.g, color.b, color.a };
-        const v3 = [shaders.text_floats]f32{ cx0, cy1, tu0, tv1, color.r, color.g, color.b, color.a };
-        out[0] = v0;
-        out[1] = v1;
-        out[2] = v2;
-        out[3] = v0;
-        out[4] = v2;
-        out[5] = v3;
+        out[0] = quad[0];
+        out[1] = quad[1];
+        out[2] = quad[2];
+        out[3] = quad[0];
+        out[4] = quad[2];
+        out[5] = quad[3];
         return true;
     }
 

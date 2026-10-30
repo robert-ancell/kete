@@ -639,6 +639,56 @@ test "text matches the font renderer's own drawing" {
     try testing.expect(lit > 150);
 }
 
+test "text turned a quarter, a half or three quarters is the upright text turned, pixel for pixel" {
+    const f = try font.Font.init(font.default_font_data);
+    var atlas = try atlas_mod.Atlas.init(testing.allocator);
+    defer atlas.deinit();
+    var c = Canvas.init(testing.allocator);
+    defer c.deinit();
+    const n = 80;
+    const style: font.Style = .{ .font = &f, .size = 16 };
+    const width = font.measure(style, "Kg1");
+    // Upright, its baseline from (10, 50) (and a quarter pixel along, for
+    // the glyphs' steps).
+    c.begin(n, n);
+    _ = c.drawText(&atlas, style, 10.25, 50, "Kg1", Color.rgb(0xffffff));
+    var upright: [n * n]u32 = @splat(0xff000000);
+    try render(&c, .{ .pixels = &upright, .width = n, .height = n });
+    var lit: u32 = 0;
+    for (upright) |px| lit += @intFromBool(px != 0xff000000);
+    try testing.expect(lit > 50);
+
+    // Each way, from where the upright pixel (x, y) is turned to.
+    const Case = struct { direction: Canvas.TextDirection, from: [2]f32, end: [2]f32 };
+    const cases = [_]Case{
+        .{ .direction = .up, .from = .{ 30, 69.75 }, .end = .{ 30, 69.75 - width } },
+        .{ .direction = .left, .from = .{ 69.75, 30 }, .end = .{ 69.75 - width, 30 } },
+        .{ .direction = .down, .from = .{ 50, 10.25 }, .end = .{ 50, 10.25 + width } },
+    };
+    for (cases) |case| {
+        c.begin(n, n);
+        const end = c.drawTextRunning(&atlas, style, case.from, case.direction, "Kg1", Color.rgb(0xffffff));
+        try testing.expectApproxEqAbs(case.end[0], end[0], 0.001);
+        try testing.expectApproxEqAbs(case.end[1], end[1], 0.001);
+        var turned: [n * n]u32 = @splat(0xff000000);
+        try render(&c, .{ .pixels = &turned, .width = n, .height = n });
+        for (0..n) |y| for (0..n) |x| {
+            // Along the text and across it, from the upright baseline's
+            // start; then where that is, turned.
+            const a = @as(i32, @intCast(x)) - 10;
+            const b = @as(i32, @intCast(y)) - 50;
+            const to: [2]i32 = switch (case.direction) {
+                .up => .{ 30 + b, 69 - a },
+                .left => .{ 69 - a, 30 - b - 1 },
+                .down => .{ 50 - b - 1, 10 + a },
+                .right => unreachable,
+            };
+            if (to[0] < 0 or to[1] < 0 or to[0] >= n or to[1] >= n) continue;
+            try testing.expectEqual(upright[y * n + x], turned[@as(usize, @intCast(to[1])) * n + @as(usize, @intCast(to[0]))]);
+        };
+    }
+}
+
 test "images are drawn from their own textures, stretched, tinted by how opaque" {
     var c = Canvas.init(testing.allocator);
     defer c.deinit();
