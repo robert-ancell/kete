@@ -712,3 +712,55 @@ test "images are drawn from their own textures, stretched, tinted by how opaque"
     try testing.expectEqual(@as(u32, 0xff000000), img.at(25, 4));
     try testing.expectEqual(@as(u32, 0xff000000), img.at(4, 25));
 }
+
+test "dashed lines are broken as their pattern says, and only the dashes in view are drawn" {
+    var c = Canvas.init(testing.allocator);
+    defer c.deinit();
+    const n = 64;
+    var pixels: [n * n]u32 = undefined;
+    const img: Image = .{ .pixels = &pixels, .width = n, .height = n };
+    const white = Color.rgb(0xffffff);
+    const black: u32 = 0xff000000;
+
+    // Dashes 6 long, 4 apart, along y = 10.
+    c.begin(n, n);
+    c.strokeDashedPolyline(&.{ .{ 2, 10 }, .{ 62, 10 } }, false, 2, .{ .pattern = &.{ 6, 4 } }, white);
+    @memset(&pixels, black);
+    try render(&c, img);
+    for (0..60) |k| {
+        const x = 2 + k;
+        const on = k % 10 < 6;
+        const px = pixels[9 * n + x];
+        // Clear inside each dash and each gap (their ends are faded).
+        if (k % 10 == 0 or k % 10 == 5 or k % 10 == 6 or k % 10 == 9) continue;
+        try testing.expectEqual(if (on) @as(u32, 0xffffffff) else black, px);
+    }
+
+    // Dots: round, 8 apart.
+    c.begin(n, n);
+    c.strokeDashedPolyline(&.{ .{ 4, 30 }, .{ 60, 30 } }, false, 4, .{ .pattern = &.{ 0, 8 }, .cap = .round }, white);
+    @memset(&pixels, black);
+    try render(&c, img);
+    try testing.expectEqual(@as(u32, 0xffffffff), pixels[29 * n + 4]);
+    try testing.expectEqual(@as(u32, 0xffffffff), pixels[29 * n + 12]);
+    try testing.expectEqual(black, pixels[29 * n + 8]);
+    try testing.expectEqual(black, pixels[26 * n + 12]);
+
+    // A dashed rectangle's edge is where a solid one's is: inside it.
+    c.begin(n, n);
+    c.strokeDashedRect(.{ .x = 10, .y = 10, .w = 40, .h = 40 }, 2, .{ .pattern = &.{ 4, 4 } }, white);
+    @memset(&pixels, black);
+    try render(&c, img);
+    var lit: u32 = 0;
+    for (12..48) |x| lit += @intFromBool(pixels[10 * n + x] == 0xffffffff);
+    try testing.expect(lit > 10 and lit < 26);
+    for (0..n) |x| try testing.expectEqual(black, pixels[9 * n + x]);
+
+    // A line ten million pixels long through the canvas: only what is in
+    // it is made (a few dashes' vertices, not millions).
+    c.begin(n, n);
+    c.strokeDashedPolyline(&.{ .{ -5_000_000, 40 }, .{ 5_000_000, 40 } }, false, 2, .{ .pattern = &.{ 2, 2 } }, white);
+    var floats: usize = 0;
+    for (c.batches.items) |*b| floats += b.floats.items.len;
+    try testing.expect(floats > 0 and floats < 20_000);
+}

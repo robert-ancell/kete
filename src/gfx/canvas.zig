@@ -20,6 +20,10 @@ const geometry = @import("geometry.zig");
 const shaders = @import("shaders.zig");
 const font = @import("font");
 const atlas_mod = @import("atlas.zig");
+const dash_mod = @import("dash.zig");
+
+/// How a line is broken into dashes (see `strokeDashedPolyline`).
+pub const Dash = dash_mod.Dash;
 
 pub const Atlas = atlas_mod.Atlas;
 
@@ -432,6 +436,134 @@ pub const Canvas = struct {
         geometry.strokePolyline(sink.sink(), scaled[0..n], closed, sw);
     }
 
+    /// Strokes a polyline `width` wide (as `strokePolyline`), dashed as
+    /// `dash` (its lengths in logical pixels; see `Dash`). Only the dashes
+    /// that can show (in the canvas, within its clip) are made: a line
+    /// mostly out of sight (across a map zoomed far in) costs as much as
+    /// the part of it in view. The pattern runs on round the corners,
+    /// where a dash bends as the line does. Any number of points.
+    pub fn strokeDashedPolyline(c: *Canvas, points: []const Point, closed: bool, width: f32, dash: Dash, color: Color) void {
+        if (points.len < 2 or width <= 0 or color.a <= 0) return;
+        const s = c.scale;
+        const sw = width * s;
+        // What the ends and the joins reach beyond the line.
+        const reach = @max(sw * geometry.miter_limit / 2, sw / 2) + 1;
+        const bounds = c.moved(boundsOf(points)).outset(reach);
+        c.note(.dashed, bounds, .{ c.origin, s, color, width, closed, dash.offset, dash.cap, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(dash.pattern)) }, std.mem.sliceAsBytes(points));
+        // Fitted round a closed line.
+        const stretch = if (closed) blk: {
+            var length: f32 = 0;
+            for (points, 0..) |p, k| {
+                const q = points[(k + 1) % points.len];
+                length += std.math.hypot(q[0] - p[0], q[1] - p[1]);
+            }
+            break :blk dash.fitScale(length);
+        } else 1;
+        // A pattern too fine to draw dash by dash: the line, as faint as
+        // its dashes would make it.
+        if (dash.period() * stretch * s < 2) {
+            const recorder = c.recorder;
+            c.recorder = null;
+            defer c.recorder = recorder;
+            const faint = color.withAlpha(color.a * dash.drawn());
+            var start: usize = 0;
+            const max = geometry.max_points;
+            while (start + 1 < points.len) : (start += max - 1) c.strokePolyline(points[start..@min(start + max, points.len)], false, width, faint);
+            if (closed) c.strokePolyline(&.{ points[points.len - 1], points[0] }, false, width, faint);
+            return;
+        }
+        // Where the dashes can show, in the points' terms.
+        var view: Rect = .{ .x = 0, .y = 0, .w = c.width, .h = c.height };
+        if (c.clip) |cl| view = view.intersect(cl) orelse return;
+        view = view.outset(reach);
+        const visible = [4]f32{ view.x / s - c.origin[0], view.y / s - c.origin[1], (view.x + view.w) / s - c.origin[0], (view.y + view.h) / s - c.origin[1] };
+        const Each = struct {
+            canvas: *Canvas,
+            width: f32,
+            cap: Dash.Cap,
+            color: Color,
+            bounds: Rect,
+
+            fn f(ctx: *anyopaque, dash_points: []const Point) void {
+                const e: *@This() = @ptrCast(@alignCast(ctx));
+                const cv = e.canvas;
+                if (dash_points.len >= 2) {
+                    var scaled: [geometry.max_points]Point = undefined;
+                    for (dash_points, scaled[0..dash_points.len]) |p, *out| out.* = .{ (p[0] + cv.origin[0]) * cv.scale, (p[1] + cv.origin[1]) * cv.scale };
+                    var sink: SolidSink = .{ .canvas = cv, .bounds = e.bounds, .color = e.color };
+                    geometry.strokePolyline(sink.sink(), scaled[0..dash_points.len], false, e.width * cv.scale);
+                }
+                if (e.cap == .round) {
+                    cv.fillCircle(dash_points[0], e.width / 2, e.color);
+                    if (dash_points.len >= 2) cv.fillCircle(dash_points[dash_points.len - 1], e.width / 2, e.color);
+                }
+            }
+        };
+        const recorder = c.recorder;
+        c.recorder = null;
+        defer c.recorder = recorder;
+        var each: Each = .{ .canvas = c, .width = width, .cap = dash.cap, .color = color, .bounds = bounds };
+        _ = dash_mod.walk(points, closed, dash, stretch, visible, .{ .ctx = &each, .f = Each.f });
+    }
+
+    /// Strokes the inside edge of `r` (as `strokeRoundedRect`), dashed as
+    /// `dash`, from the top left corner round clockwise.
+    pub fn strokeDashedRoundedRect(c: *Canvas, r: Rect, radii: CornerRadii, width: f32, dash: Dash, color: Color) void {
+        if (r.w <= 0 or r.h <= 0 or width <= 0) return;
+        // The middle of the stroke: half its width in from the edge.
+        const h = @min(width / 2, @min(r.w, r.h) / 2);
+        const x0 = r.x + h;
+        const y0 = r.y + h;
+        const x1 = r.x + r.w - h;
+        const y1 = r.y + r.h - h;
+        const limit = @min(r.w, r.h) / 2;
+        var pts: [4 * 33]Point = undefined;
+        var n: usize = 0;
+        // Each corner: its centre, the radius of the stroke's middle, and
+        // the angle it starts at (from the right, clockwise, y down).
+        const corners = [4]struct { cx: f32, cy: f32, radius: f32, from: f32 }{
+            .{ .cx = r.x + @min(radii.tl, limit), .cy = r.y + @min(radii.tl, limit), .radius = @min(radii.tl, limit) - h, .from = std.math.pi },
+            .{ .cx = r.x + r.w - @min(radii.tr, limit), .cy = r.y + @min(radii.tr, limit), .radius = @min(radii.tr, limit) - h, .from = 1.5 * std.math.pi },
+            .{ .cx = r.x + r.w - @min(radii.br, limit), .cy = r.y + r.h - @min(radii.br, limit), .radius = @min(radii.br, limit) - h, .from = 0 },
+            .{ .cx = r.x + @min(radii.bl, limit), .cy = r.y + r.h - @min(radii.bl, limit), .radius = @min(radii.bl, limit) - h, .from = 0.5 * std.math.pi },
+        };
+        const square = [4]Point{ .{ x0, y0 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } };
+        for (corners, square) |k, sq| {
+            if (k.radius <= 0) {
+                pts[n] = sq;
+                n += 1;
+                continue;
+            }
+            // Short chords: about two pixels each, at most 32 a corner.
+            const steps: usize = @intFromFloat(std.math.clamp(@ceil(k.radius * c.scale * std.math.pi / 4), 1, 32));
+            for (0..steps + 1) |i| {
+                const a = k.from + 0.5 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(steps));
+                pts[n] = .{ k.cx + k.radius * @cos(a), k.cy + k.radius * @sin(a) };
+                n += 1;
+            }
+        }
+        c.strokeDashedPolyline(pts[0..n], true, width, dash, color);
+    }
+
+    /// Strokes the inside edge of `r` (as `strokeRect`), dashed as `dash`.
+    pub fn strokeDashedRect(c: *Canvas, r: Rect, width: f32, dash: Dash, color: Color) void {
+        c.strokeDashedRoundedRect(r, .{}, width, dash, color);
+    }
+
+    /// Strokes the inside edge of a circle (as `strokeCircle`), dashed as
+    /// `dash`, from its top round clockwise.
+    pub fn strokeDashedCircle(c: *Canvas, center: Point, radius: f32, width: f32, dash: Dash, color: Color) void {
+        const r = radius - @min(width, radius) / 2;
+        if (r <= 0) return;
+        const steps: usize = @intFromFloat(std.math.clamp(@ceil(r * c.scale * std.math.tau / 2), 8, 512));
+        var pts: [512]Point = undefined;
+        for (0..steps) |i| {
+            const a = -0.5 * std.math.pi + std.math.tau * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(steps));
+            pts[i] = .{ center[0] + r * @cos(a), center[1] + r * @sin(a) };
+        }
+        c.strokeDashedPolyline(pts[0..steps], true, width, dash, color);
+    }
+
     // --- Text -----------------------------------------------------------------
 
     /// Draws one line of text with its baseline at `baseline` (rounded to
@@ -735,7 +867,7 @@ pub const Canvas = struct {
 
     // --- Recording ----------------------------------------------------------------
 
-    const Op = enum(u8) { rounded_rect, polygon, polyline, path, shaded, text, image, image_triangles };
+    const Op = enum(u8) { rounded_rect, polygon, polyline, path, shaded, text, image, image_triangles, dashed };
 
     /// Notes a shape in the recorder: what it is (its operation, the
     /// fixed-size `params` and the variable `data`, with the clip) and the

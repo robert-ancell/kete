@@ -27,6 +27,7 @@ pub const Constraints = ui.Constraints;
 pub const Insets = ui.Insets;
 pub const Alignment = ui.Alignment;
 pub const Color = gfx.Color;
+pub const Dash = gfx.Dash;
 pub const CornerRadii = gfx.CornerRadii;
 pub const PointerButton = ui.PointerButton;
 pub const KeyboardKey = ui.KeyboardKey;

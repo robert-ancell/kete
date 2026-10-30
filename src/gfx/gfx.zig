@@ -16,6 +16,8 @@
 //!     try software.render(&canvas, img);
 
 pub const geometry = @import("geometry.zig");
+pub const dash = @import("dash.zig");
+pub const Dash = dash.Dash;
 pub const atlas = @import("atlas.zig");
 pub const shaders = @import("shaders.zig");
 pub const canvas = @import("canvas.zig");
@@ -68,6 +70,7 @@ pub const D3D11Target = renderer.D3D11Target;
 
 test {
     _ = geometry;
+    _ = dash;
     _ = atlas;
     _ = shaders;
     _ = canvas;
