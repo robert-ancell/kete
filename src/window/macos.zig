@@ -78,6 +78,12 @@ pub const MacWindow = struct {
     input: std.ArrayList(InputEvent) = .empty,
     taken: std.ArrayList(InputEvent) = .empty,
     modifiers: u64 = 0,
+    /// The pointer lock asked for (`lockPointer`), and whether it is in
+    /// effect (while the window has the keyboard): the pointer is hidden,
+    /// held at the middle of the window, and its moves come as
+    /// `relative_motion`.
+    lock_wanted: bool = false,
+    pointer_locked: bool = false,
     /// The buffers frames are drawn in, in turn, and which is being drawn.
     buffers: [3]Buffer = @splat(.{}),
     back: usize = 0,
@@ -267,6 +273,7 @@ pub const MacWindow = struct {
     pub fn close(w: *MacWindow) void {
         const pool = objc.push();
         defer objc.pop(pool);
+        w.unlockPointer();
         for (&w.popups) |*slot| if (slot.*) |*pop| {
             w.destroyPopup(pop);
             slot.* = null;
@@ -647,6 +654,58 @@ pub const MacWindow = struct {
         if (w.fullscreen != on) msg(void, w.win, "toggleFullScreen:", .{@as(Id, null)});
     }
 
+    /// Locks the pointer (see `Window.lockPointer`): hidden and held at the
+    /// middle of the window while it has the keyboard, its moves told as
+    /// `relative_motion`. Whether it can be.
+    pub fn lockPointer(w: *MacWindow) bool {
+        if (w.lock_wanted) return true;
+        if (pointerFunctions() == null) return false;
+        w.lock_wanted = true;
+        if (msg(objc.Bool, w.win, "isKeyWindow", .{}) != 0) w.holdPointer();
+        return true;
+    }
+
+    /// Lets the pointer go (see `Window.unlockPointer`).
+    pub fn unlockPointer(w: *MacWindow) void {
+        if (!w.lock_wanted) return;
+        w.lock_wanted = false;
+        w.releasePointer();
+    }
+
+    /// Holds the pointer (the lock takes effect): moved to the middle of
+    /// the window, kept there (the mouse no longer moves it), and hidden.
+    fn holdPointer(w: *MacWindow) void {
+        if (w.pointer_locked) return;
+        const pf = pointerFunctions() orelse return;
+        const pool = objc.push();
+        defer objc.pop(pool);
+        // The middle of the view, on the screen; in CoreGraphics' terms,
+        // from the top of the main screen down.
+        const bounds = objc.msgRect(w.view, "bounds");
+        const mid_view: objc.Point = .{ .x = bounds.origin.x + bounds.size.width / 2, .y = bounds.origin.y + bounds.size.height / 2 };
+        const in_window = msg(objc.Point, w.view, "convertPoint:toView:", .{ mid_view, @as(Id, null) });
+        const on_screen = msg(objc.Point, w.win, "convertPointToScreen:", .{in_window});
+        const main = msg(Id, msg(Id, objc.class("NSScreen"), "screens", .{}), "firstObject", .{});
+        const main_height = if (main != null) objc.msgRect(main, "frame").size.height else 0;
+        _ = pf.warp(.{ .x = on_screen.x, .y = main_height - on_screen.y });
+        _ = pf.associate(0);
+        msg(void, objc.class("NSCursor"), "hide", .{});
+        w.pointer_locked = true;
+        w.push(.{ .pointer_locked = true });
+        postWake();
+    }
+
+    /// Lets the pointer go (the lock no longer in effect).
+    fn releasePointer(w: *MacWindow) void {
+        if (!w.pointer_locked) return;
+        const pf = pointerFunctions() orelse return;
+        _ = pf.associate(1);
+        msg(void, objc.class("NSCursor"), "unhide", .{});
+        w.pointer_locked = false;
+        w.push(.{ .pointer_locked = false });
+        postWake();
+    }
+
     pub fn setCursor(_: *MacWindow, cursor: window.PointerCursor) void {
         const pool = objc.push();
         defer objc.pop(pool);
@@ -943,6 +1002,14 @@ pub const MacWindow = struct {
         }
         fn mouseMoved(v: Id, _: objc.Sel, e: Id) callconv(.c) void {
             const w = ofView(v) orelse return;
+            if (w.pointer_locked) {
+                // Held still: how far the mouse moved, in points (down
+                // is positive).
+                const dx = msg(objc.CGFloat, e, "deltaX", .{});
+                const dy = msg(objc.CGFloat, e, "deltaY", .{});
+                if (dx != 0 or dy != 0) w.push(.{ .relative_motion = .{ @floatCast(dx), @floatCast(dy) } });
+                return;
+            }
             w.push(.{ .motion = w.locate(e) });
         }
         fn mouseExited(v: Id, _: objc.Sel, _: Id) callconv(.c) void {
@@ -1002,6 +1069,18 @@ pub const MacWindow = struct {
             const w = objc.owner(MacWindow, d) orelse return;
             w.endMenus();
             postWake();
+        }
+        /// The window lost the keyboard: its menus are done, and a pointer
+        /// lock lets go until it gets it back.
+        fn resignKey(d: Id, _: objc.Sel, _: Id) callconv(.c) void {
+            const w = objc.owner(MacWindow, d) orelse return;
+            w.endMenus();
+            w.releasePointer();
+            postWake();
+        }
+        fn becomeKey(d: Id, _: objc.Sel, _: Id) callconv(.c) void {
+            const w = objc.owner(MacWindow, d) orelse return;
+            if (w.lock_wanted) w.holdPointer();
         }
         fn modeChanged(d: Id, sel: objc.Sel, n: Id) callconv(.c) void {
             // Out of a live resize, or to or from full screen.
@@ -1063,7 +1142,8 @@ pub const MacWindow = struct {
             .{ .sel = "windowShouldClose:", .imp = &m.windowShouldClose, .types = b },
             .{ .sel = "windowDidResize:", .imp = &m.resized, .types = "v@:@" },
             .{ .sel = "windowDidEndLiveResize:", .imp = &m.modeChanged, .types = "v@:@" },
-            .{ .sel = "windowDidResignKey:", .imp = &m.endMenus, .types = "v@:@" },
+            .{ .sel = "windowDidResignKey:", .imp = &m.resignKey, .types = "v@:@" },
+            .{ .sel = "windowDidBecomeKey:", .imp = &m.becomeKey, .types = "v@:@" },
             .{ .sel = "windowWillMove:", .imp = &m.endMenus, .types = "v@:@" },
             .{ .sel = "windowWillStartLiveResize:", .imp = &m.endMenus, .types = "v@:@" },
             .{ .sel = "holdTick:", .imp = &m.holdTick, .types = "v@:@" },
@@ -1329,6 +1409,20 @@ fn cgFunctions() ?CG {
         .image = objc.symbol(@FieldType(CG, "image"), "CGImageCreate") orelse return null,
         .releaseProvider = objc.symbol(@FieldType(CG, "releaseProvider"), "CGDataProviderRelease") orelse return null,
         .releaseImage = objc.symbol(@FieldType(CG, "releaseImage"), "CGImageRelease") orelse return null,
+    };
+}
+
+/// Holding the pointer still (for a pointer lock): moving it, and whether
+/// the mouse moves it.
+const PointerFunctions = struct {
+    warp: *const fn (objc.Point) callconv(.c) i32,
+    associate: *const fn (u32) callconv(.c) i32,
+};
+
+fn pointerFunctions() ?PointerFunctions {
+    return .{
+        .warp = objc.symbol(@FieldType(PointerFunctions, "warp"), "CGWarpMouseCursorPosition") orelse return null,
+        .associate = objc.symbol(@FieldType(PointerFunctions, "associate"), "CGAssociateMouseAndMouseCursorPosition") orelse return null,
     };
 }
 

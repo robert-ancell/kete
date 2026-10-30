@@ -407,7 +407,51 @@ pub const User32 = struct {
     WindowFromPoint: *const fn (POINT) callconv(cc) ?HWND,
     UpdateLayeredWindow: *const fn (HWND, ?HDC, ?*const POINT, ?*const SIZE, ?HDC, ?*const POINT, DWORD, ?*const BLENDFUNCTION, DWORD) callconv(cc) BOOL,
     IsWindowVisible: *const fn (HWND) callconv(cc) BOOL,
+    ClipCursor: *const fn (?*const RECT) callconv(cc) BOOL,
+    RegisterRawInputDevices: *const fn ([*]const RAWINPUTDEVICE, UINT, UINT) callconv(cc) BOOL,
+    GetRawInputData: *const fn (?*anyopaque, UINT, ?*anyopaque, *UINT, UINT) callconv(cc) UINT,
+    GetSystemMetrics: *const fn (c_int) callconv(cc) c_int,
 };
+
+/// A kind of device whose raw input a window takes (`WM_INPUT`).
+pub const RAWINPUTDEVICE = extern struct {
+    usUsagePage: u16,
+    usUsage: u16,
+    dwFlags: DWORD,
+    hwndTarget: ?HWND,
+};
+
+pub const RAWINPUTHEADER = extern struct {
+    dwType: DWORD,
+    dwSize: DWORD,
+    hDevice: ?HANDLE,
+    wParam: WPARAM,
+};
+
+/// A mouse's raw input: how far it moved (or, with `MOUSE_MOVE_ABSOLUTE`,
+/// where to, 0 to 65535 across the screen).
+pub const RAWMOUSE = extern struct {
+    usFlags: u16,
+    /// (The union of `ulButtons` with the next two is 4-byte aligned.)
+    _pad: u16 = 0,
+    usButtonFlags: u16,
+    usButtonData: u16,
+    ulRawButtons: u32,
+    lLastX: LONG,
+    lLastY: LONG,
+    ulExtraInformation: u32,
+};
+
+pub const RAWINPUT_MOUSE = extern struct {
+    header: RAWINPUTHEADER,
+    mouse: RAWMOUSE,
+};
+
+pub const RID_INPUT: UINT = 0x10000003;
+pub const RIM_TYPEMOUSE: DWORD = 0;
+pub const RIDEV_REMOVE: DWORD = 0x00000001;
+pub const MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
+pub const MOUSE_VIRTUAL_DESKTOP: u16 = 0x02;
 
 pub const SIZE = extern struct { cx: LONG, cy: LONG };
 

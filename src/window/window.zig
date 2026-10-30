@@ -392,9 +392,9 @@ pub const InputEvent = union(enum) {
     /// The window's touches were cancelled by the shell.
     touch_cancel,
     /// Relative pointer motion `[dx, dy]`, in logical pixels, for a locked
-    /// pointer (not yet on macOS and Windows).
+    /// pointer (`Window.lockPointer`).
     relative_motion: [2]f32,
-    /// The pointer lock took effect (true), or ended (false) (not yet on macOS and Windows).
+    /// The pointer lock took effect (true), or ended (false).
     pointer_locked: bool,
     /// An input method committed UTF-8 text (not yet on macOS and Windows).
     text_commit: struct {
@@ -640,6 +640,8 @@ pub const Window = struct {
         setFullscreen: *const fn (ptr: *anyopaque, on: bool) void,
         startMove: *const fn (ptr: *anyopaque) void,
         setTextInput: *const fn (ptr: *anyopaque, state: ?TextInputState) void,
+        lockPointer: *const fn (ptr: *anyopaque) bool,
+        unlockPointer: *const fn (ptr: *anyopaque) void,
         startDrag: *const fn (ptr: *anyopaque, mime_type: []const u8, bytes: []const u8, actions: DragActions) bool,
         takeDrop: *const fn (ptr: *anyopaque) ?DroppedData,
         nextPresentationNs: *const fn (ptr: *anyopaque, now_ns: u64) u64,
@@ -827,6 +829,13 @@ pub const Window = struct {
             fn startMoveFn(p: *anyopaque) void {
                 if (@hasDecl(T, "startMove")) self(p).startMove();
             }
+            fn lockPointerFn(p: *anyopaque) bool {
+                if (@hasDecl(T, "lockPointer")) return self(p).lockPointer();
+                return false;
+            }
+            fn unlockPointerFn(p: *anyopaque) void {
+                if (@hasDecl(T, "unlockPointer")) self(p).unlockPointer();
+            }
             fn setTextInputFn(p: *anyopaque, state: ?TextInputState) void {
                 if (@hasDecl(T, "setTextInput")) self(p).setTextInput(state);
             }
@@ -961,6 +970,8 @@ pub const Window = struct {
                 .setFullscreen = setFullscreenFn,
                 .startMove = startMoveFn,
                 .setTextInput = setTextInputFn,
+                .lockPointer = lockPointerFn,
+                .unlockPointer = unlockPointerFn,
                 .startDrag = startDragFn,
                 .takeDrop = takeDropFn,
                 .nextPresentationNs = nextPresentationNsFn,
@@ -1143,6 +1154,21 @@ pub const Window = struct {
     /// an on-screen keyboard and where to put its candidates), or that none is
     /// focused if null. Commits come back as `text_commit` and `text_preedit` events.
     /// Not yet on macOS and Windows: it does nothing there.
+    /// Locks the pointer to the window (for a game, or a 3D view turned by
+    /// the mouse): while the window has the keyboard, the pointer is hidden
+    /// and held still, and its moves come as `relative_motion` (in logical
+    /// pixels), between `pointer_locked` events saying the lock took effect
+    /// and ended. It ends while the window loses the keyboard, and takes
+    /// effect again when it gets it back, until `unlockPointer`. False if
+    /// the window cannot (on Wayland, without the compositor's pointer
+    /// constraints and relative pointer).
+    pub fn lockPointer(w: Window) bool {
+        return w.vtable.lockPointer(w.ptr);
+    }
+    /// Ends the pointer lock (the pointer shows, and moves, again).
+    pub fn unlockPointer(w: Window) void {
+        w.vtable.unlockPointer(w.ptr);
+    }
     pub fn setTextInput(w: Window, state: ?TextInputState) void {
         w.vtable.setTextInput(w.ptr, state);
     }

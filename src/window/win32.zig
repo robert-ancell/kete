@@ -53,6 +53,13 @@ const LRESULT = w32.LRESULT;
 const WM_DESTROY = 0x0002;
 const WM_SIZE = 0x0005;
 const WM_KILLFOCUS = 0x0008;
+const WM_SETFOCUS = 0x0007;
+const WM_MOVE = 0x0003;
+const WM_INPUT = 0x00FF;
+const SM_CXSCREEN = 0;
+const SM_CYSCREEN = 1;
+const SM_CXVIRTUALSCREEN = 78;
+const SM_CYVIRTUALSCREEN = 79;
 const WM_PAINT = 0x000f;
 const WM_CLOSE = 0x0010;
 const WM_ERASEBKGND = 0x0014;
@@ -304,6 +311,17 @@ pub const Win32Window = struct {
     /// Whether the pointer is in the window (its leaving is tracked), and
     /// the buttons held (the window has the mouse while any is).
     pointer_in: bool = false,
+    /// The pointer lock asked for (`lockPointer`), and whether it is in
+    /// effect (while the window has the keyboard): the pointer is hidden,
+    /// held at the middle of the window, and its moves come as
+    /// `relative_motion`, from raw input.
+    lock_wanted: bool = false,
+    pointer_locked: bool = false,
+    /// Whether it has the keyboard.
+    focused: bool = false,
+    /// Where a device that gives where the pointer is (a tablet, a remote
+    /// desktop) last put it (0 to 65535 across the screen).
+    raw_absolute: ?[2]i32 = null,
     buttons_held: u32 = 0,
     /// Where the pointer last was in the window, in logical pixels (where
     /// the wheel turns: its messages say where on the screen).
@@ -469,6 +487,7 @@ pub const Win32Window = struct {
     }
 
     pub fn close(w: *Win32Window) void {
+        w.unlockPointer();
         for (&w.popups) |*slot| if (slot.*) |*pop| {
             w.destroyPopup(pop);
             slot.* = null;
@@ -683,6 +702,7 @@ pub const Win32Window = struct {
             },
             WM_SIZE => {
                 w.minimized = wparam == SIZE_MINIMIZED;
+                if (w.pointer_locked) w.clipPointer(u);
                 // While resized by its edge, each size is drawn at once.
                 if (w.in_modal and !w.minimized) w.drawNow();
                 return 0;
@@ -759,8 +779,22 @@ pub const Win32Window = struct {
             },
             WM_SETCURSOR => {
                 if ((@as(usize, @bitCast(lparam)) & 0xffff) != HTCLIENT) return null;
-                _ = u.SetCursor(cursorHandle(u, w.cursor));
+                _ = u.SetCursor(if (w.pointer_locked) null else cursorHandle(u, w.cursor));
                 return 1;
+            },
+            WM_SETFOCUS => {
+                w.focused = true;
+                if (w.lock_wanted) w.holdPointer();
+                return null;
+            },
+            WM_MOVE => {
+                if (w.pointer_locked) w.clipPointer(u);
+                return null;
+            },
+            WM_INPUT => {
+                if (w.pointer_locked) w.rawInput(u, lparam);
+                // Windows frees what it read.
+                return null;
             },
             WM_ENTERSIZEMOVE, WM_ENTERMENULOOP => {
                 // Moved or resized: its popups are done (a tooltip comes
@@ -802,9 +836,14 @@ pub const Win32Window = struct {
             },
             WM_KILLFOCUS => {
                 w.high_surrogate = 0;
+                w.focused = false;
+                // The lock lets go until the window has the keyboard again.
+                w.releasePointer();
                 return null;
             },
             WM_MOUSEMOVE => {
+                // Held still while locked: its moves come from raw input.
+                if (w.pointer_locked) return 0;
                 if (!w.pointer_in) {
                     w.pointer_in = true;
                     var tme: w32.TRACKMOUSEEVENT = .{ .dwFlags = TME_LEAVE, .hwndTrack = w.hwnd };
@@ -1157,10 +1196,94 @@ pub const Win32Window = struct {
         return w.fullscreen;
     }
 
+    /// Locks the pointer (see `Window.lockPointer`): hidden and held at the
+    /// middle of the window while it has the keyboard, its moves told as
+    /// `relative_motion`. Whether it can be.
+    pub fn lockPointer(w: *Win32Window) bool {
+        if (w.lock_wanted) return true;
+        w.lock_wanted = true;
+        if (w.focused) w.holdPointer();
+        return true;
+    }
+
+    /// Lets the pointer go (see `Window.unlockPointer`).
+    pub fn unlockPointer(w: *Win32Window) void {
+        if (!w.lock_wanted) return;
+        w.lock_wanted = false;
+        w.releasePointer();
+    }
+
+    /// Holds the pointer (the lock takes effect): raw input on, the pointer
+    /// clipped to a pixel at the window's middle, and hidden.
+    fn holdPointer(w: *Win32Window) void {
+        const u = w32.user32() orelse return;
+        if (!w.pointer_locked) {
+            const dev: w32.RAWINPUTDEVICE = .{ .usUsagePage = 1, .usUsage = 2, .dwFlags = 0, .hwndTarget = w.hwnd };
+            if (u.RegisterRawInputDevices(@ptrCast(&dev), 1, @sizeOf(w32.RAWINPUTDEVICE)) == 0) return;
+            w.raw_absolute = null;
+        }
+        w.clipPointer(u);
+        _ = u.SetCursor(null);
+        if (w.pointer_locked) return;
+        w.pointer_locked = true;
+        w.push(.{ .pointer_locked = true });
+    }
+
+    /// Clips the pointer to a pixel at the middle of the window (again, as
+    /// the window moves).
+    fn clipPointer(w: *Win32Window, u: *const w32.User32) void {
+        var r: w32.RECT = .{};
+        _ = u.GetClientRect(w.hwnd, &r);
+        var mid: w32.POINT = .{ .x = @divTrunc(r.left + r.right, 2), .y = @divTrunc(r.top + r.bottom, 2) };
+        _ = u.ClientToScreen(w.hwnd, &mid);
+        const clip: w32.RECT = .{ .left = mid.x, .top = mid.y, .right = mid.x + 1, .bottom = mid.y + 1 };
+        _ = u.ClipCursor(&clip);
+    }
+
+    /// Lets the pointer go (the lock no longer in effect).
+    fn releasePointer(w: *Win32Window) void {
+        if (!w.pointer_locked) return;
+        const u = w32.user32() orelse return;
+        _ = u.ClipCursor(null);
+        const dev: w32.RAWINPUTDEVICE = .{ .usUsagePage = 1, .usUsage = 2, .dwFlags = w32.RIDEV_REMOVE, .hwndTarget = null };
+        _ = u.RegisterRawInputDevices(@ptrCast(&dev), 1, @sizeOf(w32.RAWINPUTDEVICE));
+        _ = u.SetCursor(cursorHandle(u, w.cursor));
+        w.pointer_locked = false;
+        w.push(.{ .pointer_locked = false });
+    }
+
+    /// A mouse's raw input, while the pointer is locked: how far it moved,
+    /// in logical pixels.
+    fn rawInput(w: *Win32Window, u: *const w32.User32, lparam: LPARAM) void {
+        var raw: w32.RAWINPUT_MOUSE = undefined;
+        var len: UINT = @sizeOf(w32.RAWINPUT_MOUSE);
+        const from: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(lparam)));
+        if (u.GetRawInputData(from, w32.RID_INPUT, &raw, &len, @sizeOf(w32.RAWINPUTHEADER)) == std.math.maxInt(UINT)) return;
+        if (raw.header.dwType != w32.RIM_TYPEMOUSE) return;
+        const m = raw.mouse;
+        var dx: f32 = @floatFromInt(m.lLastX);
+        var dy: f32 = @floatFromInt(m.lLastY);
+        if (m.usFlags & w32.MOUSE_MOVE_ABSOLUTE != 0) {
+            // Where it is (a tablet, a remote desktop): how far from where
+            // it was, in the screen's pixels.
+            const at: [2]i32 = .{ m.lLastX, m.lLastY };
+            const was = w.raw_absolute orelse at;
+            w.raw_absolute = at;
+            const virtual = m.usFlags & w32.MOUSE_VIRTUAL_DESKTOP != 0;
+            const sw: f32 = @floatFromInt(u.GetSystemMetrics(if (virtual) SM_CXVIRTUALSCREEN else SM_CXSCREEN));
+            const sh: f32 = @floatFromInt(u.GetSystemMetrics(if (virtual) SM_CYVIRTUALSCREEN else SM_CYSCREEN));
+            dx = @as(f32, @floatFromInt(at[0] - was[0])) * sw / 65535;
+            dy = @as(f32, @floatFromInt(at[1] - was[1])) * sh / 65535;
+        }
+        if (dx == 0 and dy == 0) return;
+        const s: f32 = @floatFromInt(@max(w.scale, 1));
+        w.push(.{ .relative_motion = .{ dx / s, dy / s } });
+    }
+
     pub fn setCursor(w: *Win32Window, cursor: window.PointerCursor) void {
         if (w.cursor == cursor) return;
         w.cursor = cursor;
-        if (!w.pointer_in) return;
+        if (!w.pointer_in or w.pointer_locked) return;
         const u = w32.user32() orelse return;
         _ = u.SetCursor(cursorHandle(u, cursor));
     }
