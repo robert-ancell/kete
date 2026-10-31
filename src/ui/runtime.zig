@@ -262,6 +262,20 @@ pub const SharedResources = struct {
         for (s.uis.items) |ui| ui.presenter = .{ .renderer = r };
     }
 
+    /// The GPU device the windows are drawn with, for the app to draw on
+    /// too (see `gfx.GpuDevice`); null if they are drawn on the CPU (or with
+    /// a renderer of the app's, `attachRenderer`). It is there from the
+    /// start, before any window is opened, and stays while the renderer
+    /// does. It may be called from any thread.
+    pub fn gpuDevice(s: *const SharedResources) ?gfx.GpuDevice {
+        const r = s.renderer orelse return null;
+        if (s.vulkan_renderer) |*x| if (r.ptr == @as(*const anyopaque, @ptrCast(x))) return .{ .vulkan = x.sharedDevice() orelse return null };
+        if (s.opengl_renderer) |*x| if (r.ptr == @as(*const anyopaque, @ptrCast(x))) return .{ .opengl = x.sharedDisplay() orelse return null };
+        if (s.metal_renderer) |*x| if (r.ptr == @as(*const anyopaque, @ptrCast(x))) return .{ .metal = x.sharedDevice() };
+        if (s.d3d11_renderer) |*x| if (r.ptr == @as(*const anyopaque, @ptrCast(x))) return .{ .d3d11 = x.sharedDevice() };
+        return null;
+    }
+
     /// Something to wake the UI for a frame from another thread or task
     /// (it only marks it to be drawn if there are no fds left).
     pub fn waker(s: *SharedResources) Waker {
@@ -2018,6 +2032,12 @@ pub const App = struct {
     /// task (see `Waker`).
     pub fn waker(a: *App) Waker {
         return a.shared.waker();
+    }
+
+    /// The GPU device its windows are drawn with, for the app to draw on too
+    /// (see `SharedResources.gpuDevice`).
+    pub fn gpuDevice(a: *const App) ?gfx.GpuDevice {
+        return a.shared.gpuDevice();
     }
 
     /// Closes its windows (and frees their handles), and lets it go.

@@ -24,6 +24,7 @@ const Segment = renderer_mod.Segment;
 const DmabufTarget = renderer_mod.DmabufTarget;
 const DmabufImage = renderer_mod.DmabufImage;
 const GpuArea = renderer_mod.GpuArea;
+const DrmNode = renderer_mod.DrmNode;
 
 pub const VkFlags = u32;
 pub const VkBool32 = u32;
@@ -103,6 +104,8 @@ pub const VkStructureType = enum(u32) {
     timeline_semaphore_submit_info = 1000207003,
     semaphore_wait_info = 1000207004,
     semaphore_signal_info = 1000207005,
+    physical_device_properties_2 = 1000059001,
+    physical_device_drm_properties_ext = 1000353000,
     external_memory_image_create_info = 1000072001,
     import_memory_fd_info_khr = 1000074000,
     memory_fd_properties_khr = 1000074001,
@@ -487,6 +490,7 @@ pub const VulkanRenderer = struct {
             .queue = ctx.queue,
             .queue_family = ctx.queue_family,
             .timelines = ctx.timelines != null,
+            .drm = ctx.drm,
         };
     }
 
@@ -772,6 +776,37 @@ const VkImportSemaphoreFdInfoKHR = extern struct {
     handleType: u32 = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
     fd: c_int,
 };
+
+const VkPhysicalDeviceDrmPropertiesEXT = extern struct {
+    sType: VkStructureType = .physical_device_drm_properties_ext,
+    pNext: ?*anyopaque = null,
+    hasPrimary: VkBool32 = VK_FALSE,
+    hasRender: VkBool32 = VK_FALSE,
+    primaryMajor: i64 = 0,
+    primaryMinor: i64 = 0,
+    renderMajor: i64 = 0,
+    renderMinor: i64 = 0,
+};
+
+const VkPhysicalDeviceProperties2 = extern struct {
+    sType: VkStructureType = .physical_device_properties_2,
+    pNext: ?*anyopaque = null,
+    /// `VkPhysicalDeviceProperties`, which is not looked at (it is smaller).
+    properties: [1024]u8 align(8) = undefined,
+};
+
+/// The DRM render node of `phys` (`VK_EXT_physical_device_drm`), or null if
+/// it cannot be had.
+fn drmNodeOf(get_inst_proc: GetInstanceProcAddr, instance: VkInstance, procs: InstanceProcs, phys: VkPhysicalDevice) ?DrmNode {
+    if (!Owned2DContext.hasExtensions(procs, phys, &.{"VK_EXT_physical_device_drm"})) return null;
+    const sym = get_inst_proc(instance, "vkGetPhysicalDeviceProperties2") orelse return null;
+    const get_props: *const fn (VkPhysicalDevice, *VkPhysicalDeviceProperties2) callconv(.c) void = @ptrCast(@alignCast(sym));
+    var drm: VkPhysicalDeviceDrmPropertiesEXT = .{};
+    var props: VkPhysicalDeviceProperties2 = .{ .pNext = &drm };
+    get_props(phys, &props);
+    if (drm.hasRender == VK_FALSE) return null;
+    return .{ .major = @intCast(drm.renderMajor), .minor = @intCast(drm.renderMinor) };
+}
 
 /// GPU work that a scene waits for before it is drawn (as its `wait`): done
 /// once `semaphore`, a timeline semaphore on the scene's device
@@ -1657,6 +1692,8 @@ const Owned2DContext = struct {
     timelines: ?TimelineProcs = null,
     sync_fd: ?SyncFdProcs = null,
     frame_waits: SubmitWaits = .{},
+    /// The GPU's DRM render node, if Vulkan says.
+    drm: ?DrmNode = null,
     retired_sources: std.ArrayList(RetiredSource) = .empty,
     /// Drawing a window's frame (`drawFrame`): the shader, pipelines that
     /// round its corners (`mask`) and put its shadow under it (`under`),
@@ -1816,6 +1853,7 @@ const Owned2DContext = struct {
         };
         errdefer self.destroy();
         if (extensions.timelines) self.timelines = loadProcs(TimelineProcs, device, inst_procs.GetDeviceProcAddr);
+        self.drm = drmNodeOf(get_inst_proc, instance, inst_procs, phys_dev);
         if (extensions.sync_fd) self.sync_fd = loadProcs(SyncFdProcs, device, inst_procs.GetDeviceProcAddr);
         if (with_dmabuf) self.initDirect(inst_procs.GetDeviceProcAddr);
 
@@ -3083,6 +3121,9 @@ pub const SharedDevice = struct {
     queue_family: u32,
     /// Whether the device has timeline semaphores turned on.
     timelines: bool = false,
+    /// The GPU's DRM render node, if Vulkan says: for drawing on the same
+    /// GPU with OpenGL (`OpenGlContext.initOnDevice`).
+    drm: ?DrmNode = null,
 };
 
 /// A frame being drawn straight into a window buffer on the 2D renderer's

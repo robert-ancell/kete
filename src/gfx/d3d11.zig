@@ -403,7 +403,43 @@ pub fn createDevice(warp: bool) !struct { device: Obj, context: Obj } {
 pub const SharedDevice = struct {
     device: Obj,
     context: Obj,
+    /// The adapter's LUID, if DXGI says: for a device of the app's on the
+    /// same GPU.
+    luid: ?Luid = null,
 };
+
+/// An adapter's locally unique id (`DXGI_ADAPTER_DESC.AdapterLuid`): two
+/// devices are on the same GPU if their adapters' are the same.
+pub const Luid = extern struct {
+    low: u32,
+    high: i32,
+};
+
+/// `DXGI_ADAPTER_DESC`, as `IDXGIAdapter::GetDesc` (slot 8) gives it.
+const AdapterDesc = extern struct {
+    Description: [128]u16,
+    VendorId: u32,
+    DeviceId: u32,
+    SubSysId: u32,
+    Revision: u32,
+    DedicatedVideoMemory: usize,
+    DedicatedSystemMemory: usize,
+    SharedSystemMemory: usize,
+    AdapterLuid: Luid,
+};
+const GetDesc = fn (Obj, *AdapterDesc) callconv(cc) HRESULT;
+
+/// The LUID of the adapter `device` is on, or null if DXGI cannot say.
+fn adapterLuid(device: Obj) ?Luid {
+    const dxgi_device = w32.query(device, &iid_dxgi_device) orelse return null;
+    defer w32.release(dxgi_device);
+    var adapter: ?Obj = null;
+    if (!w32.succeeded(w32.call(dxgi_device, 7, GetAdapter, .{&adapter}))) return null;
+    defer w32.release(adapter);
+    var desc: AdapterDesc = undefined;
+    if (!w32.succeeded(w32.call(adapter.?, 8, GetDesc, .{&desc}))) return null;
+    return desc.AdapterLuid;
+}
 
 /// A frame the Direct3D 11 renderer is drawing into a window, given to a 3D
 /// scene's `GpuDraw.direct` (with `.d3d11`) to draw into on the GPU.
@@ -712,7 +748,7 @@ pub const D3D11Renderer = struct {
     /// (`OffscreenContext.initShared`), and for windows to make their swap
     /// chains on.
     pub fn sharedDevice(r: *const D3D11Renderer) SharedDevice {
-        return .{ .device = r.device.?, .context = r.context };
+        return .{ .device = r.device.?, .context = r.context, .luid = adapterLuid(r.device.?) };
     }
 
     // --- Textures ---------------------------------------------------------------------

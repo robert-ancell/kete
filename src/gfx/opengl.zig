@@ -25,6 +25,7 @@ const DmabufImage = renderer_mod.DmabufImage;
 const DmabufTarget = renderer_mod.DmabufTarget;
 const Segment = renderer_mod.Segment;
 const GpuArea = renderer_mod.GpuArea;
+const DrmNode = renderer_mod.DrmNode;
 
 pub const GLenum = c_uint;
 pub const GLboolean = u8;
@@ -188,6 +189,72 @@ const DirectProcs = struct {
     }
 };
 
+/// The OpenGL renderer's EGL display and context
+/// (`OpenGlRenderer.sharedDisplay`), for a context sharing what is made on
+/// it with the renderer's (`OffscreenContext.initShared`); and its GPU, if
+/// EGL says.
+pub const SharedDisplay = struct {
+    display: ?*anyopaque,
+    context: ?*anyopaque,
+    drm: ?DrmNode = null,
+};
+
+const EGLDeviceEXT = ?*anyopaque;
+const EGLAttrib = isize;
+const EGL_DEVICE_EXT: EGLint = 0x322C;
+const EGL_DRM_RENDER_NODE_FILE_EXT: EGLint = 0x3377;
+const EGL_PLATFORM_DEVICE_EXT: EGLenum = 0x313F;
+
+/// EGL's GPUs (`EGL_EXT_device_enumeration`, `EGL_EXT_device_query`), a
+/// display on one (`EGL_EXT_platform_device`), and their DRM render nodes
+/// (`EGL_EXT_device_drm_render_node`), if EGL has them.
+const DeviceProcs = struct {
+    QueryDevicesEXT: *const fn (EGLint, ?[*]EGLDeviceEXT, *EGLint) callconv(.c) EGLBoolean,
+    QueryDeviceStringEXT: *const fn (EGLDeviceEXT, EGLint) callconv(.c) ?[*:0]const u8,
+    QueryDisplayAttribEXT: *const fn (EGLDisplay, EGLint, *EGLAttrib) callconv(.c) EGLBoolean,
+    GetPlatformDisplayEXT: *const fn (EGLenum, ?*anyopaque, ?[*]const EGLint) callconv(.c) EGLDisplay,
+
+    fn load(lib: *std.DynLib, egl: *const EglProcs) ?DeviceProcs {
+        // The client extensions (of no display).
+        const extensions = eglExtensions(lib, EGL_NO_DISPLAY) orelse return null;
+        const base = hasExtension(extensions, "EGL_EXT_device_base");
+        if (!base and !(hasExtension(extensions, "EGL_EXT_device_enumeration") and hasExtension(extensions, "EGL_EXT_device_query"))) return null;
+        if (!hasExtension(extensions, "EGL_EXT_platform_device")) return null;
+        var p: DeviceProcs = undefined;
+        inline for (@typeInfo(DeviceProcs).@"struct".field_names) |field_name| {
+            const sym = egl.GetProcAddress("egl" ++ field_name) orelse return null;
+            @field(p, field_name) = @ptrCast(@alignCast(sym));
+        }
+        return p;
+    }
+
+    fn nodeOf(x: DeviceProcs, dev: EGLDeviceEXT) ?DrmNode {
+        return DrmNode.ofPath(x.QueryDeviceStringEXT(dev, EGL_DRM_RENDER_NODE_FILE_EXT) orelse return null);
+    }
+};
+
+/// The DRM render node of `dpy`'s GPU, or null if EGL cannot say.
+fn displayNode(lib: *std.DynLib, egl: *const EglProcs, dpy: EGLDisplay) ?DrmNode {
+    const x = DeviceProcs.load(lib, egl) orelse return null;
+    var attr: EGLAttrib = 0;
+    // Mesa may not say, giving no device.
+    if (x.QueryDisplayAttribEXT(dpy, EGL_DEVICE_EXT, &attr) == EGL_FALSE or attr == 0) return null;
+    return x.nodeOf(@ptrFromInt(@as(usize, @bitCast(attr))));
+}
+
+/// A display on the GPU of `node`, or null if EGL has none (or cannot say).
+fn deviceDisplay(lib: *std.DynLib, egl: *const EglProcs, node: DrmNode) EGLDisplay {
+    const x = DeviceProcs.load(lib, egl) orelse return null;
+    var devices: [16]EGLDeviceEXT = undefined;
+    var count: EGLint = 0;
+    if (x.QueryDevicesEXT(devices.len, &devices, &count) == EGL_FALSE) return null;
+    for (devices[0..@intCast(count)]) |dev| {
+        const n = x.nodeOf(dev) orelse continue;
+        if (n.major == node.major and n.minor == node.minor) return x.GetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, dev, null);
+    }
+    return null;
+}
+
 /// A frame the OpenGL renderer is drawing straight into a window's buffer,
 /// given to a widget's GPU draw (`GpuDraw.direct`, with `.opengl`). The
 /// renderer's context is current, with `fbo` bound and drawn with rows top
@@ -301,6 +368,8 @@ pub const OpenGlRenderer = struct {
     dpy: EGLDisplay = null,
     surf: EGLSurface = null,
     ctx: EGLContext = null,
+    /// Its GPU's DRM render node, if EGL says.
+    drm: ?DrmNode = null,
     spirv_supported: bool = false,
     shape_prog: GLuint = 0,
     solid_prog: GLuint = 0,
@@ -409,12 +478,21 @@ pub const OpenGlRenderer = struct {
         if (egl.MakeCurrent(dpy, surf, surf, ctx) == EGL_FALSE) return error.EglMakeCurrentFailed;
 
         var r = try init(gpa, egl.GetProcAddress);
+        r.drm = displayNode(&egl_lib, &egl, dpy);
         r.egl_lib = egl_lib;
         r.egl = egl;
         r.dpy = dpy;
         r.surf = surf;
         r.ctx = ctx;
         return r;
+    }
+
+    /// Its EGL display and context, and GPU, for contexts sharing what is
+    /// made on them with its own (`OffscreenContext.initShared`); null if
+    /// it was made on a context of the app's (`init`).
+    pub fn sharedDisplay(r: *const OpenGlRenderer) ?SharedDisplay {
+        if (r.egl == null) return null;
+        return .{ .display = r.dpy, .context = r.ctx, .drm = r.drm };
     }
 
     pub fn init(gpa: std.mem.Allocator, get_proc: GetProcAddress) !OpenGlRenderer {
@@ -1511,6 +1589,8 @@ pub const OffscreenContext = struct {
     /// Fences, if EGL has them (for `Wait`, `createFence`, and a dmabuf's
     /// `ready_fd`).
     sync: ?SyncProcs = null,
+    /// Its GPU's DRM render node, if EGL says.
+    drm: ?DrmNode = null,
 
     pub const ubo_capacity: usize = 256;
 
@@ -1545,9 +1625,9 @@ pub const OffscreenContext = struct {
         blend: bool = false,
     };
 
-    /// A context of its own.
+    /// A context of its own. It is current on the calling thread.
     pub fn init(gpa: std.mem.Allocator) !OffscreenContext {
-        return initWith(gpa, EGL_NO_CONTEXT);
+        return initWith(gpa, null, EGL_NO_CONTEXT);
     }
 
     /// A context sharing what is made on it (textures, buffers) with
@@ -1555,22 +1635,41 @@ pub const OffscreenContext = struct {
     /// one thread at a time) what a scene drawn with `share` shows. It is
     /// current on the calling thread.
     pub fn initSharing(gpa: std.mem.Allocator, share: *const OffscreenContext) !OffscreenContext {
-        return initWith(gpa, share.ctx);
+        return initWith(gpa, null, share.ctx);
     }
 
-    fn initWith(gpa: std.mem.Allocator, share_ctx: EGLContext) !OffscreenContext {
+    /// A context sharing what is made on it with the OpenGL renderer's
+    /// (`OpenGlRenderer.sharedDisplay`). It is current on the calling thread.
+    pub fn initShared(gpa: std.mem.Allocator, shared: SharedDisplay) !OffscreenContext {
+        return initWith(gpa, null, shared.context);
+    }
+
+    /// A context of its own on the GPU of `node` (another API's, as the
+    /// Vulkan renderer's `SharedDevice.drm`), if EGL can choose one; or else
+    /// (or if `node` is null) on the default display's. It is current on the
+    /// calling thread.
+    pub fn initOnDevice(gpa: std.mem.Allocator, node: ?DrmNode) !OffscreenContext {
+        return initWith(gpa, node, EGL_NO_CONTEXT);
+    }
+
+    fn initWith(gpa: std.mem.Allocator, node: ?DrmNode, share_ctx: EGLContext) !OffscreenContext {
         var egl_lib = std.DynLib.open("libEGL.so.1") catch try std.DynLib.open("libEGL.so");
         errdefer egl_lib.close();
         const egl = try EglProcs.load(&egl_lib);
 
-        const dpy = egl.GetDisplay(EGL_DEFAULT_DISPLAY);
+        // A GPU's display has no surfaces: its contexts are made current
+        // without one.
+        const device_dpy: EGLDisplay = if (node) |n| deviceDisplay(&egl_lib, &egl, n) else null;
+        const surfaceless = device_dpy != null;
+        const dpy = if (surfaceless) device_dpy else egl.GetDisplay(EGL_DEFAULT_DISPLAY);
         if (dpy == EGL_NO_DISPLAY) return error.NoEglDisplay;
         if (egl.Initialize(dpy, null, null) == EGL_FALSE) return error.EglInitFailed;
+        const drm = displayNode(&egl_lib, &egl, dpy);
 
         if (egl.BindAPI(EGL_OPENGL_API) == EGL_FALSE) return error.EglBindApiFailed;
 
         const cfg_attribs = [_]EGLint{
-            EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
+            EGL_SURFACE_TYPE,    if (surfaceless) 0 else EGL_PBUFFER_BIT,
             EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
             EGL_RED_SIZE,        8,
             EGL_GREEN_SIZE,      8,
@@ -1586,7 +1685,7 @@ pub const OffscreenContext = struct {
         }
 
         const pbuf_attribs = [_]EGLint{ EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE };
-        const surf = egl.CreatePbufferSurface(dpy, config, &pbuf_attribs);
+        const surf = if (surfaceless) EGL_NO_SURFACE else egl.CreatePbufferSurface(dpy, config, &pbuf_attribs);
         errdefer if (surf != EGL_NO_SURFACE) {
             _ = egl.DestroySurface(dpy, surf);
         };
@@ -1629,6 +1728,7 @@ pub const OffscreenContext = struct {
             .spirv_supported = spirv_supported,
             .ubo = ubo[0],
             .sync = SyncProcs.load(&egl_lib, &egl, dpy),
+            .drm = drm,
         };
     }
 
@@ -1660,6 +1760,11 @@ pub const OffscreenContext = struct {
 
     pub fn makeCurrent(self: *const OffscreenContext) void {
         _ = self.egl.MakeCurrent(self.dpy, self.surf, self.surf, self.ctx);
+    }
+
+    /// The DRM render node of its GPU, or null if EGL cannot say.
+    pub fn drmNode(self: *const OffscreenContext) ?DrmNode {
+        return self.drm;
     }
 
     /// A fence after what was drawn with it so far, for a scene drawn on

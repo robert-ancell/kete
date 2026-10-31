@@ -3500,3 +3500,50 @@ test "OpenGlRenderer draws a window's frame round what it draws into a dmabuf" {
     try testing.expect(alpha(img.at(48, 66)) > alpha(img.at(48, 13)));
     try testing.expectEqual(@as(u32, 0), alpha(img.at(1, 1)));
 }
+
+test "the app is given the GPU device its windows are drawn with, from the start" {
+    const shared = try ui.SharedResources.createDefault(testing.allocator, testing.io);
+    defer shared.destroy();
+    const dev = shared.gpuDevice() orelse return error.SkipZigTest;
+    switch (dev) {
+        .vulkan => |d| {
+            // A context on it draws straight into the windows' frames.
+            var ctx = try gfx.VulkanContext.initShared(testing.allocator, d);
+            defer ctx.deinit();
+            try testing.expectEqual(d.device, ctx.device);
+        },
+        .opengl => |d| if (comptime builtin.os.tag == .linux) {
+            var ctx = try gfx.OpenGlContext.initShared(testing.allocator, d);
+            ctx.deinit();
+        },
+        .metal, .d3d11 => {},
+    }
+
+    // OpenGL on the same GPU, by its DRM node.
+    if (comptime builtin.os.tag == .linux) if (dev.drmNode()) |node| {
+        var gl = gfx.OpenGlContext.initOnDevice(testing.allocator, node) catch return;
+        defer gl.deinit();
+        const on = gl.drmNode() orelse return;
+        try testing.expectEqual(node, on);
+    };
+
+    // Drawn on the CPU, there is none.
+    shared.attachRenderer(shared.software_renderer.renderer(), false);
+    try testing.expect(shared.gpuDevice() == null);
+}
+
+test "the OpenGL renderer gives its display, for contexts sharing with it" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const shared = try ui.SharedResources.createDefault(testing.allocator, testing.io);
+    defer shared.destroy();
+    var gl = gfx.OpenGlRenderer.initDefault(testing.allocator) catch return error.SkipZigTest;
+    shared.attachRenderer(gl.renderer(), false);
+    defer gl.deinit();
+    // Attached with `attachRenderer`, it is a renderer of the app's.
+    try testing.expect(shared.gpuDevice() == null);
+    const d = gl.sharedDisplay().?;
+    var ctx = try gfx.OpenGlContext.initShared(testing.allocator, d);
+    defer ctx.deinit();
+    // The same GPU, if EGL says for both.
+    if (d.drm) |node| if (ctx.drmNode()) |on| try testing.expectEqual(node, on);
+}

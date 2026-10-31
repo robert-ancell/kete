@@ -48,6 +48,24 @@ pub const Viewport = struct {
     }
 };
 
+/// A GPU, as Linux knows it: the device number of its DRM render node
+/// (226:128 for `/dev/dri/renderD128`). Two APIs (Vulkan and OpenGL, say)
+/// are on the same GPU if they are on the same node.
+pub const DrmNode = struct {
+    major: u32,
+    minor: u32,
+
+    /// The node at `path` (`/dev/dri/renderD128`, say), or null if there is
+    /// none there.
+    pub fn ofPath(path: [*:0]const u8) ?DrmNode {
+        if (@import("builtin").os.tag != .linux) return null;
+        const linux = std.os.linux;
+        var stx: linux.Statx = undefined;
+        if (linux.errno(linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &stx)) != .SUCCESS) return null;
+        return .{ .major = stx.rdev_major, .minor = stx.rdev_minor };
+    }
+};
+
 /// Waits until `fd`, a sync file (as a `DmabufImage.ready_fd`), is
 /// signalled, and closes it.
 pub fn waitFd(fd: i32) void {

@@ -67,6 +67,39 @@ pub const MetalContext = metal.OffscreenContext;
 pub const D3D11Renderer = d3d11.D3D11Renderer;
 pub const D3D11Context = d3d11.OffscreenContext;
 pub const D3D11Target = renderer.D3D11Target;
+pub const DrmNode = renderer.DrmNode;
+
+/// The GPU device a renderer draws with (`ui.SharedResources.gpuDevice`), for
+/// an app to draw on too: with a context on it (`VulkanContext.initShared`,
+/// `OpenGlContext.initShared`, `MetalContext.initShared`,
+/// `D3D11Context.initShared`), so that what it draws goes into the windows'
+/// frames with no copy through the CPU; or with an API of its own on the same
+/// GPU (`drmNode`, `adapterLuid`).
+pub const GpuDevice = union(enum) {
+    vulkan: vulkan.SharedDevice,
+    opengl: opengl.SharedDisplay,
+    metal: metal.SharedDevice,
+    d3d11: d3d11.SharedDevice,
+
+    /// The GPU's DRM render node (on Linux), if its API says: for an OpenGL
+    /// context on it (`OpenGlContext.initOnDevice`).
+    pub fn drmNode(d: GpuDevice) ?DrmNode {
+        return switch (d) {
+            .vulkan => |v| v.drm,
+            .opengl => |o| o.drm,
+            .metal, .d3d11 => null,
+        };
+    }
+
+    /// The GPU's adapter (on Windows), if DXGI says: for a Direct3D device
+    /// on it.
+    pub fn adapterLuid(d: GpuDevice) ?d3d11.Luid {
+        return switch (d) {
+            .d3d11 => |x| x.luid,
+            else => null,
+        };
+    }
+};
 
 test {
     _ = geometry;
