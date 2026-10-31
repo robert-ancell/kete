@@ -3348,3 +3348,155 @@ test "OpenGlArea draws with the app's context once another context's work is don
     defer img.deinit();
     try testing.expectEqual(blue.toArgb(), img.at(20, 15));
 }
+
+/// A window whose buffer is a real dmabuf, from GBM: drawn into on the GPU
+/// (`beginDmabufFrame`), or mapped and drawn into on the CPU.
+const GbmWin = struct {
+    dev: *const window.wayland.DmaBufDevice,
+    buf: window.wayland.DmaBufDevice.Allocation,
+    width: u32,
+    height: u32,
+    /// The shadow's margin around the content, and the frame drawn in it.
+    margin: u32 = 0,
+    frame: ?gfx.renderer.WindowFrame = null,
+    map_data: ?*anyopaque = null,
+    cpu_frames: u32 = 0,
+    shown: u32 = 0,
+
+    const ar24: u32 = std.mem.readInt(u32, "AR24", .little);
+
+    fn init(dev: *const window.wayland.DmaBufDevice, width: u32, height: u32) !GbmWin {
+        return .{ .dev = dev, .buf = try dev.alloc(width, height, ar24), .width = width, .height = height };
+    }
+
+    fn deinit(w: *GbmWin) void {
+        _ = std.os.linux.close(w.buf.dmabuf_fd);
+        w.dev.gbm.bo_destroy(w.buf.bo);
+    }
+
+    /// The whole buffer, mapped (until `unmap`).
+    fn map(w: *GbmWin) !gfx.software.Image {
+        var stride: u32 = 0;
+        const ptr = w.dev.gbm.bo_map(w.buf.bo, 0, 0, w.width, w.height, window.wayland.DmaBufDevice.gbm_bo_transfer_read_write, &stride, &w.map_data) orelse return error.MapFailed;
+        const words: [*]u32 = @ptrCast(@alignCast(ptr));
+        return .{ .pixels = words[0 .. @as(usize, stride / 4) * w.height], .width = w.width, .height = w.height, .stride = stride / 4 };
+    }
+
+    fn unmap(w: *GbmWin) void {
+        w.dev.gbm.bo_unmap(w.buf.bo, w.map_data);
+        w.map_data = null;
+    }
+
+    /// The content, inside the margin.
+    fn content(w: *GbmWin, img: gfx.software.Image) gfx.software.Image {
+        const at = @as(usize, w.margin) * img.rowStride() + w.margin;
+        return .{ .pixels = img.pixels[at..], .width = w.width - 2 * w.margin, .height = w.height - 2 * w.margin, .stride = img.stride };
+    }
+
+    pub fn beginSoftwareFrame(w: *GbmWin) !gfx.software.Image {
+        w.cpu_frames += 1;
+        return w.content(try w.map());
+    }
+
+    pub fn beginDmabufFrame(w: *GbmWin) ?gfx.DmabufTarget {
+        return .{
+            .id = 1,
+            .fd = w.buf.dmabuf_fd,
+            .fourcc = ar24,
+            .modifier = w.buf.modifier,
+            .offset = w.buf.offset,
+            .stride = w.buf.stride,
+            .width = w.width,
+            .height = w.height,
+            .origin = .{ w.margin, w.margin },
+            .content = .{ w.width - 2 * w.margin, w.height - 2 * w.margin },
+            .cpu = .{ .ctx = w, .begin = cpuBegin, .end = cpuEnd },
+            .frame = w.frame,
+        };
+    }
+
+    fn cpuBegin(ctx: *anyopaque) anyerror!gfx.software.Image {
+        const w: *GbmWin = @ptrCast(@alignCast(ctx));
+        return w.content(try w.map());
+    }
+
+    fn cpuEnd(ctx: *anyopaque) void {
+        const w: *GbmWin = @ptrCast(@alignCast(ctx));
+        w.unmap();
+    }
+
+    pub fn showDamaged(w: *GbmWin, _: ?[]const gfx.Viewport) !void {
+        if (w.map_data != null) w.unmap();
+        w.shown += 1;
+    }
+};
+
+test "OpenGlRenderer draws straight into a dmabuf, with an OpenGlArea copied in on the GPU" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var dev = window.wayland.DmaBufDevice.open() orelse return error.SkipZigTest;
+    defer dev.close();
+    var gl = gfx.OpenGlRenderer.initDefault(testing.allocator) catch return error.SkipZigTest;
+    defer gl.deinit();
+    var win = GbmWin.init(&dev, 64, 48) catch return error.SkipZigTest;
+    defer win.deinit();
+
+    const u = try ui.WindowUi.createDefault(testing.allocator, testing.io);
+    defer u.destroy();
+    u.attachRenderer(gl.renderer(), false);
+    u.attachWindow(&win, null);
+    const build = struct {
+        fn f(cx: *Context) Widget {
+            return cx.make(ui.Row{ .children = cx.makeAll(.{
+                ui.SizedBox{ .width = 32 },
+                ui.Expanded{ .child = cx.make(ui.OpenGlArea(ClearScene){ .scene = .{}, .samples = 1, .clear_color = red, .min_width = 0, .min_height = 0 }) },
+            }) });
+        }
+    }.f;
+    u.frame(64, 48, 0, Root(build){});
+    try testing.expect(try u.present(&win, 0xff102030));
+    // Drawn on the GPU: it was never mapped for the CPU to draw.
+    try testing.expectEqual(@as(u32, 0), win.cpu_frames);
+
+    const img = try win.map();
+    defer win.unmap();
+    // The area on the right, the right way up; the window's clear on the left.
+    try testing.expectEqual(red.toArgb(), img.at(48, 2));
+    try testing.expectEqual(red.toArgb(), img.at(48, 45));
+    try testing.expect(img.at(8, 24) != red.toArgb());
+}
+
+test "OpenGlRenderer draws a window's frame round what it draws into a dmabuf" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var dev = window.wayland.DmaBufDevice.open() orelse return error.SkipZigTest;
+    defer dev.close();
+    var gl = gfx.OpenGlRenderer.initDefault(testing.allocator) catch return error.SkipZigTest;
+    defer gl.deinit();
+    var win = GbmWin.init(&dev, 96, 80) catch return error.SkipZigTest;
+    defer win.deinit();
+    win.margin = 16;
+    win.frame = .{ .radius = 8, .scale = 1 };
+
+    const u = try ui.WindowUi.createDefault(testing.allocator, testing.io);
+    defer u.destroy();
+    u.attachRenderer(gl.renderer(), false);
+    u.attachWindow(&win, null);
+    u.frame(64, 48, 0, ui.SizedBox{});
+    try testing.expect(try u.present(&win, 0xff102030));
+    try testing.expectEqual(@as(u32, 0), win.cpu_frames);
+
+    const img = try win.map();
+    defer win.unmap();
+    const alpha = struct {
+        fn f(px: u32) u32 {
+            return px >> 24;
+        }
+    }.f;
+    // The content's middle is the window's clear, its corner rounded off,
+    // and the shadow under it (below it more than above) fades out into
+    // the margin.
+    try testing.expectEqual(@as(u32, 0xff102030), img.at(48, 40));
+    try testing.expect(alpha(img.at(16, 16)) < 0xff);
+    try testing.expect(alpha(img.at(48, 66)) > 0);
+    try testing.expect(alpha(img.at(48, 66)) > alpha(img.at(48, 13)));
+    try testing.expectEqual(@as(u32, 0), alpha(img.at(1, 1)));
+}

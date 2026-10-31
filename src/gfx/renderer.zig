@@ -48,6 +48,19 @@ pub const Viewport = struct {
     }
 };
 
+/// Waits until `fd`, a sync file (as a `DmabufImage.ready_fd`), is
+/// signalled, and closes it.
+pub fn waitFd(fd: i32) void {
+    if (@import("builtin").os.tag != .linux) return;
+    const linux = std.os.linux;
+    var fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    while (true) {
+        const rc = linux.poll(&fds, 1, -1);
+        if (linux.errno(rc) != .INTR) break;
+    }
+    _ = linux.close(fd);
+}
+
 /// Where a custom GPU draw goes, in the frame's pixels.
 pub const GpuArea = struct {
     /// The widget's box (draw with it as the viewport).

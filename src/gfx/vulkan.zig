@@ -11,7 +11,6 @@
 //!     try ui.renderWith(vk.renderer(), &target, null);
 
 const std = @import("std");
-const builtin = @import("builtin");
 const shaders = @import("shaders.zig");
 const canvas_mod = @import("canvas.zig");
 const atlas_mod = @import("atlas.zig");
@@ -2816,7 +2815,7 @@ const Owned2DContext = struct {
             }
             return;
         }
-        waitFd(fd);
+        renderer_mod.waitFd(fd);
     }
 
     /// Forgets what the frame waits on, destroying the semaphores of sync files.
@@ -3107,18 +3106,6 @@ pub const DirectFrame = struct {
     /// it on the CPU then).
     wait: *const fn (ctx: *anyopaque, w: Wait) bool,
 };
-
-/// Waits until a sync file is signalled, and closes it.
-fn waitFd(fd: i32) void {
-    if (builtin.os.tag != .linux) return;
-    const linux = std.os.linux;
-    var fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
-    while (true) {
-        const rc = linux.poll(&fds, 1, -1);
-        if (linux.errno(rc) != .INTR) break;
-    }
-    _ = linux.close(fd);
-}
 
 /// The Vulkan format of a DRM fourcc a picture can come in.
 fn fourccFormat(fourcc: u32) ?u32 {

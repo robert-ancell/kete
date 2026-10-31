@@ -22,6 +22,8 @@ const Canvas = canvas_mod.Canvas;
 const Color = canvas_mod.Color;
 const Viewport = renderer_mod.Viewport;
 const DmabufImage = renderer_mod.DmabufImage;
+const DmabufTarget = renderer_mod.DmabufTarget;
+const Segment = renderer_mod.Segment;
 const GpuArea = renderer_mod.GpuArea;
 
 pub const GLenum = c_uint;
@@ -126,6 +128,85 @@ fn querySpirvSupport(
     return false;
 }
 
+/// Whether the current context is OpenGL `major`.`minor` or later, or has
+/// extension `name`.
+fn hasGlVersionOrExtension(get_int: ?GetIntegervFn, get_str: ?GetStringiFn, major: GLint, minor: GLint, name: []const u8) bool {
+    const gi = get_int orelse return false;
+    var have_major: GLint = 0;
+    var have_minor: GLint = 0;
+    gi(GL_MAJOR_VERSION, &have_major);
+    gi(GL_MINOR_VERSION, &have_minor);
+    if (have_major > major or (have_major == major and have_minor >= minor)) return true;
+    const gs = get_str orelse return false;
+    var num_ext: GLint = 0;
+    gi(GL_NUM_EXTENSIONS, &num_ext);
+    for (0..@intCast(@max(num_ext, 0))) |i| {
+        const ext = gs(GL_EXTENSIONS, @intCast(i)) orelse continue;
+        if (std.mem.eql(u8, std.mem.span(ext), name)) return true;
+    }
+    return false;
+}
+
+const GL_ZERO: GLenum = 0;
+const GL_ONE_MINUS_DST_ALPHA: GLenum = 0x0305;
+const GL_LOWER_LEFT: GLenum = 0x8CA1;
+const GL_UPPER_LEFT: GLenum = 0x8CA2;
+const GL_NEGATIVE_ONE_TO_ONE: GLenum = 0x935E;
+
+/// What drawing straight into window buffers (`renderDmabuf`) needs beyond
+/// 2D drawing: importing dmabufs as images (`EGL_EXT_image_dma_buf_import`,
+/// with modifiers if EGL has them) and textures of them
+/// (`GL_OES_EGL_image`), drawing with rows top down (`glClipControl`, from
+/// OpenGL 4.5), and clearing, copying and finishing.
+const DirectProcs = struct {
+    CreateImageKHR: *const fn (EGLDisplay, EGLContext, EGLenum, ?*anyopaque, [*]const EGLint) callconv(.c) EGLImageKHR,
+    DestroyImageKHR: *const fn (EGLDisplay, EGLImageKHR) callconv(.c) EGLBoolean,
+    EGLImageTargetTexture2DOES: *const fn (GLenum, EGLImageKHR) callconv(.c) void,
+    ClipControl: *const fn (GLenum, GLenum) callconv(.c) void,
+    ClearColor: *const fn (GLfloat, GLfloat, GLfloat, GLfloat) callconv(.c) void,
+    Clear: *const fn (GLbitfield) callconv(.c) void,
+    BlitFramebuffer: *const fn (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum) callconv(.c) void,
+    Finish: *const fn () callconv(.c) void,
+    /// Whether dmabufs can be imported with their modifiers.
+    modifiers: bool = false,
+
+    /// What the display and the current context have, or null if they
+    /// lack any of it.
+    fn load(lib: *std.DynLib, egl: *const EglProcs, dpy: EGLDisplay, gl: Procs) ?DirectProcs {
+        const extensions = eglExtensions(lib, dpy) orelse return null;
+        if (!hasExtension(extensions, "EGL_EXT_image_dma_buf_import")) return null;
+        if (!hasGlVersionOrExtension(gl.GetIntegerv, gl.GetStringi, 4, 5, "GL_ARB_clip_control")) return null;
+        var p: DirectProcs = undefined;
+        inline for (@typeInfo(DirectProcs).@"struct".field_names) |field_name| {
+            if (comptime std.mem.eql(u8, field_name, "modifiers")) continue;
+            const prefix = if (comptime std.mem.endsWith(u8, field_name, "KHR")) "egl" else "gl";
+            const sym = egl.GetProcAddress(prefix ++ field_name) orelse return null;
+            @field(p, field_name) = @ptrCast(@alignCast(sym));
+        }
+        p.modifiers = hasExtension(extensions, "EGL_EXT_image_dma_buf_import_modifiers");
+        return p;
+    }
+};
+
+/// A frame the OpenGL renderer is drawing straight into a window's buffer,
+/// given to a widget's GPU draw (`GpuDraw.direct`, with `.opengl`). The
+/// renderer's context is current, with `fbo` bound and drawn with rows top
+/// down (`glClipControl`'s upper left origin).
+pub const DirectFrame = struct {
+    /// The framebuffer of the window's buffer.
+    fbo: GLuint,
+    /// Where the frame's top left is in it (inside the shadow), and its size.
+    origin: [2]i32,
+    width: u32,
+    height: u32,
+    /// For draws on other contexts: copies the part of `src` (a picture of
+    /// `area`'s viewport) within `area` into the frame, or returns false if
+    /// it cannot be imported. It takes `src.ready_fd`, and leaves the
+    /// renderer's context current.
+    copy_ctx: *anyopaque,
+    copy_dmabuf: *const fn (ctx: *anyopaque, frame: *const DirectFrame, src: *const DmabufImage, area: GpuArea) anyerror!bool,
+};
+
 pub const Procs = struct {
     Enable: *const fn (GLenum) callconv(.c) void,
     Disable: *const fn (GLenum) callconv(.c) void,
@@ -206,6 +287,10 @@ pub const Target = struct {
     height: u32,
     /// OpenGL framebuffer object ID (0 for the default window framebuffer).
     fbo: GLuint = 0,
+    /// Its rows run top down (drawn with `glClipControl`'s upper left
+    /// origin), and where its top left is in the framebuffer.
+    top_down: bool = false,
+    origin: [2]i32 = .{ 0, 0 },
 };
 
 pub const OpenGlRenderer = struct {
@@ -238,6 +323,39 @@ pub const OpenGlRenderer = struct {
     fbo_w: u32 = 0,
     fbo_h: u32 = 0,
     pixel_scratch: std.ArrayList(u32) = .empty,
+    /// Drawing straight into window buffers (`renderDmabuf`), once it is
+    /// known whether it can (`direct_known`): the window buffers drawn
+    /// into, and pictures of other contexts copied in, by when each was
+    /// last used (`import_clock`); fences (for a picture's `ready_fd`); and
+    /// what draws a window's frame (`drawFrame`).
+    direct: ?DirectProcs = null,
+    direct_known: bool = false,
+    sync: ?SyncProcs = null,
+    targets: [max_imports]?Import = @splat(null),
+    sources: [max_imports]?Import = @splat(null),
+    import_clock: u64 = 0,
+    window_prog: GLuint = 0,
+    window_vao: GLuint = 0,
+    window_vbo: GLuint = 0,
+
+    const max_imports = 8;
+    /// Vertices of a window's frame: its margin's (shadow), and each
+    /// corner's twice (rounding, then shadow).
+    const frame_vertices = (4 + 4 * 2) * 6;
+
+    /// A dmabuf imported as a texture, with a framebuffer of it.
+    const Import = struct {
+        id: u64,
+        width: u32,
+        height: u32,
+        image: EGLImageKHR,
+        tex: GLuint,
+        fbo: GLuint,
+        used: u64 = 0,
+        /// For a window buffer: the shadow in its margin is drawn (it
+        /// stays, as the margin is not drawn again).
+        frame_drawn: bool = false,
+    };
 
     /// Initializes a self-contained headless EGL + OpenGL 3.3+/4.6 Core 2D
     /// renderer that renders `Canvas` batches into `*software.Image`.
@@ -351,6 +469,13 @@ pub const OpenGlRenderer = struct {
 
     pub fn deinit(r: *OpenGlRenderer) void {
         r.makeCurrent();
+        if (r.direct) |d| {
+            for (&r.targets) |*slot| if (slot.*) |*im| r.dropImport(d, im);
+            for (&r.sources) |*slot| if (slot.*) |*im| r.dropImport(d, im);
+        }
+        if (r.window_vbo != 0) r.gl.DeleteBuffers(1, &[1]GLuint{r.window_vbo});
+        if (r.window_vao != 0) r.gl.DeleteVertexArrays(1, &[1]GLuint{r.window_vao});
+        if (r.window_prog != 0) r.gl.DeleteProgram(r.window_prog);
         var it = r.images.valueIterator();
         while (it.next()) |tex| {
             const t = [1]GLuint{tex.*};
@@ -709,7 +834,7 @@ pub const OpenGlRenderer = struct {
     pub fn recordTarget(r: *OpenGlRenderer, c: *const Canvas, target: *const Target, damage: ?[]const Viewport) !void {
         if (target.width == 0 or target.height == 0) return;
         r.gl.BindFramebuffer(GL_FRAMEBUFFER, target.fbo);
-        r.gl.Viewport(0, 0, @intCast(target.width), @intCast(target.height));
+        r.gl.Viewport(target.origin[0], target.origin[1], @intCast(target.width), @intCast(target.height));
         r.gl.Disable(GL_DEPTH_TEST);
         r.gl.Disable(GL_CULL_FACE);
         r.gl.Enable(GL_SCISSOR_TEST);
@@ -777,20 +902,337 @@ pub const OpenGlRenderer = struct {
             if (damage) |dmg_list| {
                 for (dmg_list) |dmg| {
                     const sc = clip_vp.intersect(dmg) orelse continue;
-                    r.setGlScissor(target.height, sc);
+                    r.setGlScissor(target, sc);
                     r.gl.DrawArrays(GL_TRIANGLES, 0, count);
                 }
             } else {
-                r.setGlScissor(target.height, clip_vp);
+                r.setGlScissor(target, clip_vp);
                 r.gl.DrawArrays(GL_TRIANGLES, 0, count);
             }
         }
         r.gl.Disable(GL_SCISSOR_TEST);
     }
 
-    fn setGlScissor(r: *const OpenGlRenderer, target_height: u32, vp: Viewport) void {
-        const y_bottom = @as(i32, @intCast(target_height)) - (vp.y + @as(i32, @intCast(vp.height)));
-        r.gl.Scissor(vp.x, y_bottom, @intCast(vp.width), @intCast(vp.height));
+    fn setGlScissor(r: *const OpenGlRenderer, target: *const Target, vp: Viewport) void {
+        if (target.top_down) {
+            r.gl.Scissor(vp.x + target.origin[0], vp.y + target.origin[1], @intCast(vp.width), @intCast(vp.height));
+            return;
+        }
+        const y_bottom = @as(i32, @intCast(target.height)) - (vp.y + @as(i32, @intCast(vp.height)));
+        r.gl.Scissor(vp.x + target.origin[0], y_bottom + target.origin[1], @intCast(vp.width), @intCast(vp.height));
+    }
+
+    /// Renders a frame straight into a window's dmabuf on the GPU (see
+    /// `Renderer.renderDmabuf`): only for a renderer with its own EGL
+    /// context (`initDefault`) that can import dmabufs.
+    pub fn renderDmabuf(r: *OpenGlRenderer, canvases: []const *const Canvas, segments: []const Segment, t: *const DmabufTarget, clear: u32, clear_rects: []const Viewport, damage: []const Viewport) !void {
+        if (t.content[0] == 0 or t.content[1] == 0) return;
+        const d = r.directProcs() orelse return error.Unsupported;
+        // A frame needs its program (or it is drawn the CPU way).
+        if (t.frame != null and r.window_prog == 0) return error.Unsupported;
+        try r.prepare(canvases);
+        const im = try r.importDmabuf(d, &r.targets, .{ .id = t.id, .fd = t.fd, .fourcc = t.fourcc, .modifier = t.modifier, .offset = t.offset, .stride = t.stride, .width = t.width, .height = t.height });
+        const origin: [2]i32 = .{ @intCast(t.origin[0]), @intCast(t.origin[1]) };
+        // The buffer's first row is the top of the window, so it is drawn
+        // into top down.
+        d.ClipControl(GL_UPPER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
+        defer d.ClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
+        const target: Target = .{ .width = t.content[0], .height = t.content[1], .fbo = im.fbo, .top_down = true, .origin = origin };
+
+        if (clear_rects.len > 0) {
+            r.gl.BindFramebuffer(GL_FRAMEBUFFER, im.fbo);
+            r.gl.Enable(GL_SCISSOR_TEST);
+            const c = Color.argb(clear);
+            d.ClearColor(c.r, c.g, c.b, c.a);
+            const full: Viewport = .{ .width = t.content[0], .height = t.content[1] };
+            for (clear_rects) |cr| {
+                r.setGlScissor(&target, full.intersect(cr) orelse continue);
+                d.Clear(GL_COLOR_BUFFER_BIT);
+            }
+            r.gl.Disable(GL_SCISSOR_TEST);
+        }
+        var buf: [2][renderer_mod.max_uncovered]Viewport = undefined;
+        for (segments, 0..) |seg, i| switch (seg) {
+            .canvas => |c| {
+                // Not under a GPU draw that covers it (as `Renderer.render`).
+                const dmg = renderer_mod.uncovered(&buf, damage, segments[i + 1 ..]);
+                if (dmg.len == 0) continue;
+                try r.recordTarget(c, &target, dmg);
+            },
+            .gpu => |g| {
+                const area = g.area.scissor orelse g.area.viewport;
+                if (!renderer_mod.covers(damage, area)) continue;
+                if (g.direct) |direct| {
+                    // Drawn into this frame on the GPU: no copy through the CPU.
+                    const frame: DirectFrame = .{ .fbo = im.fbo, .origin = origin, .width = t.content[0], .height = t.content[1], .copy_ctx = r, .copy_dmabuf = copyDmabuf };
+                    r.gl.BindFramebuffer(GL_FRAMEBUFFER, im.fbo);
+                    const drawn = try direct(g.ctx, .opengl, &frame, g.area);
+                    // It may have drawn with a context of its own.
+                    r.makeCurrent();
+                    if (drawn) continue;
+                }
+                // Drawn on the CPU: what is under it is finished first, and
+                // what is over it drawn after.
+                d.Finish();
+                var img = try t.cpu.begin(t.cpu.ctx);
+                const drawn = g.f(g.ctx, @ptrCast(&img), g.area);
+                t.cpu.end(t.cpu.ctx);
+                r.makeCurrent();
+                try drawn;
+            },
+        };
+        if (t.frame) |frame| r.drawFrame(d, im, t, frame, damage);
+        // Drawn before the compositor shows it.
+        d.Finish();
+    }
+
+    /// What drawing straight into window buffers needs, or null if it
+    /// cannot (found out the first time).
+    fn directProcs(r: *OpenGlRenderer) ?DirectProcs {
+        if (r.direct_known) return r.direct;
+        r.direct_known = true;
+        const egl = r.egl orelse return null;
+        const lib = if (r.egl_lib) |*l| l else return null;
+        r.makeCurrent();
+        const d = DirectProcs.load(lib, &egl, r.dpy, r.gl) orelse return null;
+        r.sync = SyncProcs.load(lib, &egl, r.dpy);
+        r.window_prog = r.compileSpirvOrGlsl(&shaders.window_gl_spv, shaders.glsl_window_vs, shaders.glsl_window_fs) catch
+            r.compileProgram(shaders.glsl_window_vs, shaders.glsl_window_fs) catch 0;
+        if (r.window_prog != 0) {
+            var vao: [1]GLuint = undefined;
+            r.gl.GenVertexArrays(1, &vao);
+            r.window_vao = vao[0];
+            var vbo: [1]GLuint = undefined;
+            r.gl.GenBuffers(1, &vbo);
+            r.window_vbo = vbo[0];
+        }
+        r.direct = d;
+        return d;
+    }
+
+    /// A dmabuf to import (a window's buffer, or another context's picture).
+    const DmabufDesc = struct {
+        id: u64,
+        fd: i32,
+        fourcc: u32,
+        modifier: u64,
+        offset: u32,
+        stride: u32,
+        width: u32,
+        height: u32,
+    };
+
+    /// `desc` as a texture with a framebuffer, imported into `list` (made
+    /// again if its size changed, in the place of the one least recently
+    /// used if it is full).
+    fn importDmabuf(r: *OpenGlRenderer, d: DirectProcs, list: *[max_imports]?Import, desc: DmabufDesc) !*Import {
+        r.import_clock += 1;
+        for (list) |*slot| if (slot.*) |*im| if (im.id == desc.id and im.width == desc.width and im.height == desc.height) {
+            im.used = r.import_clock;
+            return im;
+        };
+        var pick: usize = 0;
+        var oldest: u64 = std.math.maxInt(u64);
+        for (list, 0..) |slot, i| {
+            const used = if (slot) |im| im.used else 0;
+            if (used < oldest) {
+                oldest = used;
+                pick = i;
+            }
+        }
+        if (list[pick]) |*old| r.dropImport(d, old);
+        list[pick] = null;
+
+        const invalid_modifier: u64 = 0x00ffffffffffffff;
+        const with_modifier = desc.modifier != invalid_modifier and (desc.modifier != 0 or d.modifiers);
+        if (with_modifier and !d.modifiers) return error.Unsupported;
+        var attribs: [17]EGLint = undefined;
+        var n: usize = 0;
+        for ([_]EGLint{
+            EGL_WIDTH,                     @intCast(desc.width),
+            EGL_HEIGHT,                    @intCast(desc.height),
+            EGL_LINUX_DRM_FOURCC_EXT,      @bitCast(desc.fourcc),
+            EGL_DMA_BUF_PLANE0_FD_EXT,     desc.fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT, @intCast(desc.offset),
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,  @intCast(desc.stride),
+        }) |a| {
+            attribs[n] = a;
+            n += 1;
+        }
+        if (with_modifier) {
+            for ([_]EGLint{
+                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, @bitCast(@as(u32, @truncate(desc.modifier))),
+                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, @bitCast(@as(u32, @truncate(desc.modifier >> 32))),
+            }) |a| {
+                attribs[n] = a;
+                n += 1;
+            }
+        }
+        attribs[n] = EGL_NONE;
+        const image = d.CreateImageKHR(r.dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, null, &attribs);
+        if (image == null) return error.EglImportFailed;
+
+        var tex: [1]GLuint = undefined;
+        r.gl.GenTextures(1, &tex);
+        r.gl.BindTexture(GL_TEXTURE_2D, tex[0]);
+        d.EGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+        r.gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        r.gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        var fbo: [1]GLuint = undefined;
+        r.gl.GenFramebuffers(1, &fbo);
+        r.gl.BindFramebuffer(GL_FRAMEBUFFER, fbo[0]);
+        r.gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex[0], 0);
+        list[pick] = .{ .id = desc.id, .width = desc.width, .height = desc.height, .image = image, .tex = tex[0], .fbo = fbo[0], .used = r.import_clock };
+        return &list[pick].?;
+    }
+
+    fn dropImport(r: *OpenGlRenderer, d: DirectProcs, im: *Import) void {
+        r.gl.DeleteFramebuffers(1, &[1]GLuint{im.fbo});
+        r.gl.DeleteTextures(1, &[1]GLuint{im.tex});
+        _ = d.DestroyImageKHR(r.dpy, im.image);
+    }
+
+    /// `DirectFrame.copy_dmabuf`: blits the picture in (turning it the
+    /// right way up).
+    fn copyDmabuf(ctx: *anyopaque, frame: *const DirectFrame, src: *const DmabufImage, area: GpuArea) anyerror!bool {
+        const r: *OpenGlRenderer = @ptrCast(@alignCast(ctx));
+        r.makeCurrent();
+        if (src.ready_fd >= 0) r.waitSyncFile(src.ready_fd);
+        const d = r.direct orelse return false;
+        const s = r.importDmabuf(d, &r.sources, .{ .id = src.id, .fd = src.fd, .fourcc = src.fourcc, .modifier = src.modifier, .offset = src.offset, .stride = src.stride, .width = src.width, .height = src.height }) catch return false;
+        const vp = area.viewport;
+        const clipped = if (area.scissor) |c| vp.intersect(c) orelse return true else vp;
+        const sc = (Viewport{ .width = frame.width, .height = frame.height }).intersect(clipped) orelse return true;
+        const lx = sc.x - vp.x;
+        const ly = sc.y - vp.y;
+        const w: i32 = @intCast(sc.width);
+        const h: i32 = @intCast(sc.height);
+        const sh: i32 = @intCast(src.height);
+        const src_y0 = if (src.bottom_up) sh - ly else ly;
+        const src_y1 = if (src.bottom_up) sh - (ly + h) else ly + h;
+        const dx = sc.x + frame.origin[0];
+        const dy = sc.y + frame.origin[1];
+        r.gl.Disable(GL_SCISSOR_TEST);
+        r.gl.BindFramebuffer(GL_READ_FRAMEBUFFER, s.fbo);
+        r.gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, frame.fbo);
+        d.BlitFramebuffer(lx, src_y0, lx + w, src_y1, dx, dy, dx + w, dy + h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        r.gl.BindFramebuffer(GL_FRAMEBUFFER, frame.fbo);
+        return true;
+    }
+
+    /// Takes `fd`, a sync file signalled once a picture is drawn, and has
+    /// what is drawn next wait for it on the GPU; or, if it cannot, waits
+    /// for it here.
+    fn waitSyncFile(r: *OpenGlRenderer, fd: i32) void {
+        if (r.sync) |x| if (x.WaitSyncKHR) |wait| if (x.DupNativeFenceFDANDROID != null) {
+            const attribs = [_]EGLint{ EGL_SYNC_NATIVE_FENCE_FD_ANDROID, fd, EGL_NONE };
+            const sync = x.CreateSyncKHR(r.dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, &attribs);
+            // Made, the fence has the fd.
+            if (sync != null) {
+                _ = wait(r.dpy, sync, 0);
+                _ = x.DestroySyncKHR(r.dpy, sync);
+                return;
+            }
+        };
+        renderer_mod.waitFd(fd);
+    }
+
+    /// Draws the window's frame around the content of `im`: the shadow in
+    /// the margin (once for each buffer, as it stays), and each corner,
+    /// where it was repainted, rounded with the shadow under it. As the
+    /// Vulkan renderer's `drawFrame`, with rows top down.
+    fn drawFrame(r: *OpenGlRenderer, d: DirectProcs, im: *Import, t: *const DmabufTarget, frame: renderer_mod.WindowFrame, damage: []const Viewport) void {
+        const bw: f32 = @floatFromInt(t.width);
+        const bh: f32 = @floatFromInt(t.height);
+        const m: f32 = @floatFromInt(t.origin[0]);
+        const cw: f32 = @floatFromInt(t.content[0]);
+        const ch: f32 = @floatFromInt(t.content[1]);
+        const radius = frame.radius;
+        const box = [4]f32{ m + cw / 2, m + ch / 2, @max(cw / 2 - radius, 0), @max(ch / 2 - radius, 0) };
+        // The corners' squares, in the content's pixels.
+        const corner: u32 = @min(@as(u32, @intFromFloat(@ceil(radius))) + 1, @min(t.content[0] / 2, t.content[1] / 2));
+        const corners = [4]Viewport{
+            .{ .x = 0, .y = 0, .width = corner, .height = corner },
+            .{ .x = @intCast(t.content[0] - corner), .y = 0, .width = corner, .height = corner },
+            .{ .x = 0, .y = @intCast(t.content[1] - corner), .width = corner, .height = corner },
+            .{ .x = @intCast(t.content[0] - corner), .y = @intCast(t.content[1] - corner), .width = corner, .height = corner },
+        };
+        // The margin around the content, in the buffer's pixels.
+        const om: u32 = t.origin[0];
+        const margin = [4]Viewport{
+            .{ .x = 0, .y = 0, .width = t.width, .height = om },
+            .{ .x = 0, .y = @intCast(om + t.content[1]), .width = t.width, .height = t.height - om - t.content[1] },
+            .{ .x = 0, .y = @intCast(om), .width = om, .height = t.content[1] },
+            .{ .x = @intCast(om + t.content[0]), .y = @intCast(om), .width = t.width - om - t.content[0], .height = t.content[1] },
+        };
+        var vertices: [frame_vertices * shaders.window_floats]f32 = undefined;
+        var n: usize = 0;
+        const quad = struct {
+            fn f(out: []f32, at: *usize, v: Viewport, w: f32, h: f32, b: [4]f32, params: [4]f32) void {
+                const x0: f32 = @floatFromInt(v.x);
+                const y0: f32 = @floatFromInt(v.y);
+                const x1 = x0 + @as(f32, @floatFromInt(v.width));
+                const y1 = y0 + @as(f32, @floatFromInt(v.height));
+                for ([6][2]f32{ .{ x0, y0 }, .{ x1, y0 }, .{ x0, y1 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } }) |p| {
+                    const o = out[at.* * shaders.window_floats ..][0..shaders.window_floats];
+                    // Clip y up, as OpenGL's (the top row is +1 here).
+                    o.* = .{ p[0] / w * 2 - 1, 1 - p[1] / h * 2, p[0], p[1], b[0], b[1], b[2], b[3], params[0], params[1], params[2], params[3] };
+                    at.* += 1;
+                }
+            }
+        }.f;
+        const shadow_params = [4]f32{ radius, frame.scale, 1, 0 };
+        const mask_params = [4]f32{ radius, frame.scale, 0, 0 };
+        for (margin) |v| quad(&vertices, &n, v, bw, bh, box, shadow_params);
+        for (corners) |v| {
+            const bv: Viewport = .{ .x = v.x + @as(i32, @intCast(om)), .y = v.y + @as(i32, @intCast(om)), .width = v.width, .height = v.height };
+            quad(&vertices, &n, bv, bw, bh, box, mask_params);
+            quad(&vertices, &n, bv, bw, bh, box, shadow_params);
+        }
+
+        r.gl.BindFramebuffer(GL_FRAMEBUFFER, im.fbo);
+        r.gl.Viewport(0, 0, @intCast(t.width), @intCast(t.height));
+        r.gl.UseProgram(r.window_prog);
+        r.gl.BindVertexArray(r.window_vao);
+        r.gl.BindBuffer(GL_ARRAY_BUFFER, r.window_vbo);
+        r.gl.BufferData(GL_ARRAY_BUFFER, @intCast(n * shaders.window_floats * 4), &vertices, GL_STREAM_DRAW);
+        for (shaders.window_layout.attributes) |attr| {
+            r.gl.EnableVertexAttribArray(attr.location);
+            r.gl.VertexAttribPointer(attr.location, @intCast(attr.components), GL_FLOAT, GL_FALSE, @intCast(shaders.window_layout.vertex_stride), @ptrFromInt(attr.offset));
+        }
+        r.gl.Enable(GL_SCISSOR_TEST);
+        r.gl.Enable(GL_BLEND);
+        // Under what is there: its alpha's remainder of the shadow.
+        const under = struct {
+            fn f(gl: Procs) void {
+                gl.BlendFuncSeparate(GL_ONE_MINUS_DST_ALPHA, GL_ONE, GL_ONE_MINUS_DST_ALPHA, GL_ONE);
+            }
+        }.f;
+        if (!im.frame_drawn) {
+            // The margin, cleared, then its shadow.
+            d.ClearColor(0, 0, 0, 0);
+            for (margin) |v| if (v.width > 0 and v.height > 0) {
+                r.gl.Scissor(v.x, v.y, @intCast(v.width), @intCast(v.height));
+                d.Clear(GL_COLOR_BUFFER_BIT);
+            };
+            r.gl.Scissor(0, 0, @intCast(t.width), @intCast(t.height));
+            under(r.gl);
+            r.gl.DrawArrays(GL_TRIANGLES, 0, 4 * 6);
+            im.frame_drawn = true;
+        }
+        // Each corner where it was repainted: rounded (what is there times
+        // its coverage), then the shadow under.
+        for (corners, 0..) |c, i| for (damage) |dmg| {
+            const part = c.intersect(dmg) orelse continue;
+            r.gl.Scissor(part.x + @as(i32, @intCast(om)), part.y + @as(i32, @intCast(om)), @intCast(part.width), @intCast(part.height));
+            const first: GLint = @intCast(4 * 6 + i * 12);
+            r.gl.BlendFuncSeparate(GL_ZERO, GL_SRC_ALPHA, GL_ZERO, GL_SRC_ALPHA);
+            r.gl.DrawArrays(GL_TRIANGLES, first, 6);
+            under(r.gl);
+            r.gl.DrawArrays(GL_TRIANGLES, first + 6, 6);
+        };
+        r.gl.Disable(GL_SCISSOR_TEST);
+        r.gl.Disable(GL_BLEND);
     }
 };
 
@@ -854,6 +1296,26 @@ const EglProcs = struct {
 
 const EGLImageKHR = ?*anyopaque;
 const EGL_GL_RENDERBUFFER_KHR: EGLenum = 0x30B9;
+const EGL_LINUX_DMA_BUF_EXT: EGLenum = 0x3270;
+const EGL_LINUX_DRM_FOURCC_EXT: EGLint = 0x3271;
+const EGL_DMA_BUF_PLANE0_FD_EXT: EGLint = 0x3272;
+const EGL_DMA_BUF_PLANE0_OFFSET_EXT: EGLint = 0x3273;
+const EGL_DMA_BUF_PLANE0_PITCH_EXT: EGLint = 0x3274;
+const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: EGLint = 0x3443;
+const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: EGLint = 0x3444;
+
+/// The display's EGL extensions, or null if they cannot be had.
+fn eglExtensions(lib: *std.DynLib, dpy: EGLDisplay) ?[]const u8 {
+    const query = lib.lookup(*const fn (EGLDisplay, EGLint) callconv(.c) ?[*:0]const u8, "eglQueryString") orelse return null;
+    return std.mem.span(query(dpy, EGL_EXTENSIONS) orelse return null);
+}
+
+/// Whether `name` is in `list`, a space separated list of extensions.
+fn hasExtension(list: []const u8, name: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, list, ' ');
+    while (it.next()) |e| if (std.mem.eql(u8, e, name)) return true;
+    return false;
+}
 
 const EGLSyncKHR = ?*anyopaque;
 const EGLTimeKHR = u64;
@@ -885,16 +1347,8 @@ const SyncProcs = struct {
 
     /// What `dpy` has, or null without fences.
     fn load(lib: *std.DynLib, egl: *const EglProcs, dpy: EGLDisplay) ?SyncProcs {
-        const query = lib.lookup(*const fn (EGLDisplay, EGLint) callconv(.c) ?[*:0]const u8, "eglQueryString") orelse return null;
-        const extensions = std.mem.span(query(dpy, EGL_EXTENSIONS) orelse return null);
-        const has = struct {
-            fn f(list: []const u8, name: []const u8) bool {
-                var it = std.mem.tokenizeScalar(u8, list, ' ');
-                while (it.next()) |e| if (std.mem.eql(u8, e, name)) return true;
-                return false;
-            }
-        }.f;
-        if (!has(extensions, "EGL_KHR_fence_sync")) return null;
+        const extensions = eglExtensions(lib, dpy) orelse return null;
+        if (!hasExtension(extensions, "EGL_KHR_fence_sync")) return null;
         var p: SyncProcs = .{
             .CreateSyncKHR = @ptrCast(@alignCast(egl.GetProcAddress("eglCreateSyncKHR") orelse return null)),
             .DestroySyncKHR = @ptrCast(@alignCast(egl.GetProcAddress("eglDestroySyncKHR") orelse return null)),
@@ -902,8 +1356,8 @@ const SyncProcs = struct {
             .WaitSyncKHR = null,
             .DupNativeFenceFDANDROID = null,
         };
-        if (has(extensions, "EGL_KHR_wait_sync")) p.WaitSyncKHR = @ptrCast(@alignCast(egl.GetProcAddress("eglWaitSyncKHR")));
-        if (has(extensions, "EGL_ANDROID_native_fence_sync")) p.DupNativeFenceFDANDROID = @ptrCast(@alignCast(egl.GetProcAddress("eglDupNativeFenceFDANDROID")));
+        if (hasExtension(extensions, "EGL_KHR_wait_sync")) p.WaitSyncKHR = @ptrCast(@alignCast(egl.GetProcAddress("eglWaitSyncKHR")));
+        if (hasExtension(extensions, "EGL_ANDROID_native_fence_sync")) p.DupNativeFenceFDANDROID = @ptrCast(@alignCast(egl.GetProcAddress("eglDupNativeFenceFDANDROID")));
         return p;
     }
 };

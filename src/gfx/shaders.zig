@@ -92,6 +92,7 @@ pub const shape_gl_spv align(4) = @embedFile("shape_gl.spv").*;
 pub const solid_gl_spv align(4) = @embedFile("solid_gl.spv").*;
 pub const text_gl_spv align(4) = @embedFile("text_gl.spv").*;
 pub const image_gl_spv align(4) = @embedFile("image_gl.spv").*;
+pub const window_gl_spv align(4) = @embedFile("window_gl.spv").*;
 
 // --- GLSL 330 fallback shaders (from src/gfx/shaders/*.vert / *.frag) -------
 
@@ -102,6 +103,8 @@ pub const glsl_solid_fs: [:0]const u8 = @embedFile("shaders/solid.frag");
 pub const glsl_text_vs: [:0]const u8 = @embedFile("shaders/text.vert");
 pub const glsl_text_fs: [:0]const u8 = @embedFile("shaders/text.frag");
 pub const glsl_image_fs: [:0]const u8 = @embedFile("shaders/image.frag");
+pub const glsl_window_vs: [:0]const u8 = @embedFile("shaders/window.vert");
+pub const glsl_window_fs: [:0]const u8 = @embedFile("shaders/window.frag");
 
 // --- Metal Shading Language shaders (src/gfx/shaders/canvas.metal) -----------
 
@@ -134,7 +137,7 @@ test "vertex layouts match float counts and SPIR-V / GLSL shaders are valid" {
     for ([_][]const u8{ &shape_spv, &solid_spv, &text_spv, &image_spv }) |spv| {
         try std.testing.expect(spv.len > 0 and spv.len % 4 == 0);
     }
-    for ([_][:0]const u8{ glsl_shape_vs, glsl_shape_fs, glsl_solid_vs, glsl_solid_fs, glsl_text_vs, glsl_text_fs, glsl_image_fs }) |src| {
+    for ([_][:0]const u8{ glsl_shape_vs, glsl_shape_fs, glsl_solid_vs, glsl_solid_fs, glsl_text_vs, glsl_text_fs, glsl_image_fs, glsl_window_vs, glsl_window_fs }) |src| {
         try std.testing.expect(std.mem.startsWith(u8, src, "#version 330 core\n") or std.mem.startsWith(u8, src, "#version 330 core\r\n"));
     }
     for ([_][]const u8{ "shape_vs", "shape_fs", "solid_vs", "solid_fs", "text_vs", "text_fs", "image_fs" }) |entry| {
