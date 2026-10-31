@@ -664,8 +664,9 @@ pub const OffscreenContext = struct {
     gpa: std.mem.Allocator,
     device: Id,
     queue: Id,
-    /// Whether the device and queue are its own (not the renderer's).
-    owned: bool,
+    /// Whether the device, and the queue, are its own (not the renderer's).
+    owns_device: bool,
+    owns_queue: bool,
     depth_on: Id = null,
     depth_off: Id = null,
     /// What a scene is drawn in: the multisampled colour (if more than one
@@ -723,18 +724,29 @@ pub const OffscreenContext = struct {
             objc.release(device);
             return error.NoMetalQueue;
         }
-        return initWith(gpa, device, queue, true);
+        return initWith(gpa, device, queue, true, true);
     }
 
     /// On a renderer's GPU (`MetalRenderer.sharedDevice`), so that scenes
     /// are drawn straight into its frames.
     pub fn initShared(gpa: std.mem.Allocator, shared: SharedDevice) !OffscreenContext {
         if (builtin.os.tag != .macos) return error.Unsupported;
-        return initWith(gpa, shared.device, shared.queue, false);
+        return initWith(gpa, shared.device, shared.queue, false, false);
     }
 
-    fn initWith(gpa: std.mem.Allocator, device: Id, queue: Id, owned: bool) !OffscreenContext {
-        var self: OffscreenContext = .{ .gpa = gpa, .device = device, .queue = queue, .owned = owned };
+    /// On a renderer's GPU, as `initShared`, with a command queue of its
+    /// own: for work of the app's on another thread, which is then not in
+    /// the renderer's queue's order (between its frames). What a scene waits
+    /// for from it is an `MTLEvent` or `MTLSharedEvent` it signals (`Wait`).
+    pub fn initSharedOwnQueue(gpa: std.mem.Allocator, shared: SharedDevice) !OffscreenContext {
+        if (builtin.os.tag != .macos) return error.Unsupported;
+        const queue = msg(Id, shared.device, "newCommandQueue", .{}) orelse return error.NoMetalQueue;
+        errdefer objc.release(queue);
+        return initWith(gpa, shared.device, queue, false, true);
+    }
+
+    fn initWith(gpa: std.mem.Allocator, device: Id, queue: Id, owns_device: bool, owns_queue: bool) !OffscreenContext {
+        var self: OffscreenContext = .{ .gpa = gpa, .device = device, .queue = queue, .owns_device = owns_device, .owns_queue = owns_queue };
         errdefer self.deinit();
         self.depth_on = self.depthState(1, true); // Less
         self.depth_off = self.depthState(7, false); // Always
@@ -746,10 +758,8 @@ pub const OffscreenContext = struct {
         if (self.device == null) return;
         self.waitIdle();
         for ([_]Id{ self.depth_on, self.depth_off, self.msaa_tex, self.depth_tex, self.resolve.tex }) |o| objc.release(o);
-        if (self.owned) {
-            objc.release(self.queue);
-            objc.release(self.device);
-        }
+        if (self.owns_queue) objc.release(self.queue);
+        if (self.owns_device) objc.release(self.device);
         self.device = null;
     }
 
@@ -1027,4 +1037,15 @@ test "regions are Metal's, a pixel rectangle's origin and size" {
     try std.testing.expectEqual(@as(u64, 1), reg.size.depth);
     try std.testing.expectEqual(@as(usize, 48), @sizeOf(Region));
     if (builtin.os.tag != .macos) try std.testing.expectError(error.Unsupported, MetalRenderer.initDefault(std.testing.allocator));
+}
+
+test "a context on the renderer's GPU may have a command queue of its own" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var r = MetalRenderer.initDefault(std.testing.allocator) catch return error.SkipZigTest;
+    defer r.deinit();
+    const shared = r.sharedDevice();
+    var ctx = try OffscreenContext.initSharedOwnQueue(std.testing.allocator, shared);
+    defer ctx.deinit();
+    try std.testing.expect(ctx.device == shared.device);
+    try std.testing.expect(ctx.queue != shared.queue);
 }

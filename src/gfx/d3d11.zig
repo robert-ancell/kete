@@ -385,9 +385,12 @@ const create_bgra_support: u32 = 0x20;
 const sdk_version: u32 = 7;
 const feature_levels = [_]u32{ 0xb100, 0xb000 }; // 11_1, 11_0
 
+/// A device, and its immediate context.
+pub const DeviceAndContext = struct { device: Obj, context: Obj };
+
 /// A device and its immediate context: on the system's GPU, or (`warp`) on
 /// WARP, Direct3D's own on the CPU (for tests).
-pub fn createDevice(warp: bool) !struct { device: Obj, context: Obj } {
+pub fn createDevice(warp: bool) !DeviceAndContext {
     if (builtin.os.tag != .windows) return error.Unsupported;
     const create = w32.proc(*const CreateDeviceFn, "d3d11.dll", "D3D11CreateDevice") orelse return error.NoD3D11;
     var device: ?Obj = null;
@@ -397,6 +400,47 @@ pub fn createDevice(warp: bool) !struct { device: Obj, context: Obj } {
     if (!w32.succeeded(hr)) hr = create(null, if (warp) driver_warp else driver_hardware, null, create_bgra_support, feature_levels[1..].ptr, 1, sdk_version, &device, null, &context);
     if (!w32.succeeded(hr)) return error.NoD3D11Device;
     return .{ .device = device orelse return error.NoD3D11Device, .context = context orelse return error.NoD3D11Device };
+}
+
+const driver_unknown: u32 = 0;
+const iid_dxgi_factory1 = w32.GUID.parse("770aae78-f26f-4dba-a829-253c83d1b387");
+const dxgi_error_not_found: HRESULT = @bitCast(@as(u32, 0x887A0002));
+const CreateDxgiFactory1Fn = fn (*const w32.GUID, *?Obj) callconv(cc) HRESULT;
+const EnumAdapters1 = fn (Obj, u32, *?Obj) callconv(cc) HRESULT;
+
+/// A device of its own on the adapter `luid` (another device's, as
+/// `SharedDevice.luid`), or on the system's default one if `luid` is null
+/// or no adapter has it.
+pub fn createDeviceOn(luid: ?Luid) !DeviceAndContext {
+    if (builtin.os.tag != .windows) return error.Unsupported;
+    const want = luid orelse return createDevice(false);
+    const adapter = findAdapter(want) orelse return createDevice(false);
+    defer w32.release(adapter);
+    const create = w32.proc(*const CreateDeviceFn, "d3d11.dll", "D3D11CreateDevice") orelse return error.NoD3D11;
+    var device: ?Obj = null;
+    var context: ?Obj = null;
+    // With an adapter, the driver type is its.
+    var hr = create(adapter, driver_unknown, null, create_bgra_support, &feature_levels, feature_levels.len, sdk_version, &device, null, &context);
+    if (!w32.succeeded(hr)) hr = create(adapter, driver_unknown, null, create_bgra_support, feature_levels[1..].ptr, 1, sdk_version, &device, null, &context);
+    if (!w32.succeeded(hr)) return error.NoD3D11Device;
+    return .{ .device = device orelse return error.NoD3D11Device, .context = context orelse return error.NoD3D11Device };
+}
+
+/// The adapter whose LUID is `luid` (to release), or null.
+fn findAdapter(luid: Luid) ?Obj {
+    const create_factory = w32.proc(*const CreateDxgiFactory1Fn, "dxgi.dll", "CreateDXGIFactory1") orelse return null;
+    var factory: ?Obj = null;
+    if (!w32.succeeded(create_factory(&iid_dxgi_factory1, &factory))) return null;
+    defer w32.release(factory);
+    var i: u32 = 0;
+    while (true) : (i += 1) {
+        var adapter: ?Obj = null;
+        const hr = w32.call(factory.?, 12, EnumAdapters1, .{ i, &adapter });
+        if (hr == dxgi_error_not_found or !w32.succeeded(hr)) return null;
+        var desc: AdapterDesc = undefined;
+        if (w32.succeeded(w32.call(adapter.?, 8, GetDesc, .{&desc})) and desc.AdapterLuid.low == luid.low and desc.AdapterLuid.high == luid.high) return adapter;
+        w32.release(adapter);
+    }
 }
 
 /// The GPU (and its context) of a `D3D11Renderer`, to draw scenes on.
@@ -1182,6 +1226,39 @@ test "a frame drawn only where it changed keeps the rest" {
 
 // --- 3D scenes ---------------------------------------------------------------------
 
+/// A texture another device can open by `handle` (see
+/// `OffscreenContext.createSharedTexture`).
+pub const SharedTexture = struct {
+    texture: Obj,
+    handle: w32.HANDLE,
+};
+
+/// A fence another device can open by `handle` (see
+/// `OffscreenContext.createSharedFence`).
+pub const SharedFence = struct {
+    fence: Obj,
+    handle: w32.HANDLE,
+};
+
+const misc_shared: u32 = 0x2;
+const misc_shared_nthandle: u32 = 0x800;
+const dxgi_shared_resource_read_write: u32 = 0x80000000 | 0x1;
+const generic_all: u32 = 0x10000000;
+const fence_flag_shared: u32 = 0x2;
+const iid_dxgi_resource1 = w32.GUID.parse("30961379-4609-4a41-998e-54fe567ee0c1");
+const iid_device1 = w32.GUID.parse("a04bfb29-08ef-43d6-a49c-a9bdbdcbe686");
+const iid_device5 = w32.GUID.parse("8ffde202-a0e7-45df-9e01-e837801b5ea0");
+const iid_fence = w32.GUID.parse("affde9d1-1df7-4bb7-8a34-0f46251dab80");
+/// `IDXGIResource1::CreateSharedHandle` (slot 13) and
+/// `ID3D11Fence::CreateSharedHandle` (slot 7); `ID3D11Device1::OpenSharedResource1`
+/// (slot 48); `ID3D11Device5`'s `OpenSharedFence` and `CreateFence` (slots
+/// 67 and 68); and `ID3D11DeviceContext4::Signal` (slot 147).
+const CreateSharedHandle = fn (Obj, ?*const anyopaque, u32, ?[*:0]const u16, *?w32.HANDLE) callconv(cc) HRESULT;
+const OpenSharedResource1 = fn (Obj, w32.HANDLE, *const w32.GUID, *?Obj) callconv(cc) HRESULT;
+const OpenSharedFence = fn (Obj, w32.HANDLE, *const w32.GUID, *?Obj) callconv(cc) HRESULT;
+const CreateFence = fn (Obj, u64, u32, *const w32.GUID, *?Obj) callconv(cc) HRESULT;
+const FenceSignal = fn (Obj, Obj, u64) callconv(cc) HRESULT;
+
 /// GPU work that a scene waits for before it is drawn (as its `wait`).
 pub const Wait = union(enum) {
     /// Done once `fence`, an `ID3D11Fence` of the scene's device (one shared
@@ -1308,6 +1385,82 @@ pub const OffscreenContext = struct {
     pub fn initShared(gpa: std.mem.Allocator, shared: SharedDevice) !OffscreenContext {
         if (builtin.os.tag != .windows) return error.Unsupported;
         return initWith(gpa, shared.device, shared.context, false);
+    }
+
+    /// A device of its own on the adapter `luid` (the renderer's:
+    /// `SharedDevice.luid`), or the default one if it is null: for work on
+    /// another thread, as the renderer's immediate context is not to be
+    /// used off its thread. What it draws reaches the renderer's device
+    /// through a shared texture (`createSharedTexture`, opened there with
+    /// `openSharedTexture`), and the renderer's scenes wait for it on a
+    /// shared fence (`createSharedFence`, `signalFence`).
+    pub fn initOnAdapter(gpa: std.mem.Allocator, luid: ?Luid) !OffscreenContext {
+        const dev = try createDeviceOn(luid);
+        return initWith(gpa, dev.device, dev.context, true);
+    }
+
+    /// A texture `width` by `height` (BGRA8, drawn into and sampled), and
+    /// an NT handle by which another device opens it (`openSharedTexture`).
+    /// The texture is released, and the handle closed (`CloseHandle`), by
+    /// the caller.
+    pub fn createSharedTexture(self: *const OffscreenContext, width: u32, height: u32) !SharedTexture {
+        const tex = try Device.createTexture2D(self.device, .{
+            .Width = width,
+            .Height = height,
+            .Format = format_bgra8,
+            .BindFlags = bind_render_target | bind_shader_resource,
+            .MiscFlags = misc_shared | misc_shared_nthandle,
+        }, null);
+        errdefer w32.release(tex);
+        const res = w32.query(tex, &iid_dxgi_resource1) orelse return error.D3D11SharingUnsupported;
+        defer w32.release(res);
+        var handle: ?w32.HANDLE = null;
+        if (!w32.succeeded(w32.call(res, 13, CreateSharedHandle, .{ null, dxgi_shared_resource_read_write, null, &handle }))) return error.D3D11SharingFailed;
+        return .{ .texture = tex, .handle = handle orelse return error.D3D11SharingFailed };
+    }
+
+    /// The texture another device shared (`createSharedTexture`), on this
+    /// context's device (to release).
+    pub fn openSharedTexture(self: *const OffscreenContext, handle: w32.HANDLE) !Obj {
+        const dev1 = w32.query(self.device, &iid_device1) orelse return error.D3D11SharingUnsupported;
+        defer w32.release(dev1);
+        var tex: ?Obj = null;
+        if (!w32.succeeded(w32.call(dev1, 48, OpenSharedResource1, .{ handle, &iid_texture2d, &tex }))) return error.D3D11SharingFailed;
+        return tex orelse error.D3D11SharingFailed;
+    }
+
+    /// A fence at `initial_value`, and an NT handle by which another device
+    /// opens it (`openSharedFence`), to wait for what this one signals
+    /// (`signalFence`): a scene's `Wait.fence`. It needs Windows 10 1703 or
+    /// later. The fence is released, and the handle closed, by the caller.
+    pub fn createSharedFence(self: *const OffscreenContext, initial_value: u64) !SharedFence {
+        const dev5 = w32.query(self.device, &iid_device5) orelse return error.D3D11FenceUnsupported;
+        defer w32.release(dev5);
+        var fence: ?Obj = null;
+        if (!w32.succeeded(w32.call(dev5, 68, CreateFence, .{ initial_value, fence_flag_shared, &iid_fence, &fence }))) return error.D3D11FenceFailed;
+        errdefer w32.release(fence);
+        var handle: ?w32.HANDLE = null;
+        if (!w32.succeeded(w32.call(fence.?, 7, CreateSharedHandle, .{ null, generic_all, null, &handle }))) return error.D3D11SharingFailed;
+        return .{ .fence = fence.?, .handle = handle orelse return error.D3D11SharingFailed };
+    }
+
+    /// The fence another device shared (`createSharedFence`), on this
+    /// context's device (to release).
+    pub fn openSharedFence(self: *const OffscreenContext, handle: w32.HANDLE) !Obj {
+        const dev5 = w32.query(self.device, &iid_device5) orelse return error.D3D11FenceUnsupported;
+        defer w32.release(dev5);
+        var fence: ?Obj = null;
+        if (!w32.succeeded(w32.call(dev5, 67, OpenSharedFence, .{ handle, &iid_fence, &fence }))) return error.D3D11SharingFailed;
+        return fence orelse error.D3D11SharingFailed;
+    }
+
+    /// Sets `fence` to `value` once the GPU has done what this context was
+    /// given so far (and sends it to the GPU).
+    pub fn signalFence(self: *const OffscreenContext, fence: Obj, value: u64) !void {
+        const ctx4 = w32.query(self.context, &iid_device_context4) orelse return error.D3D11FenceUnsupported;
+        defer w32.release(ctx4);
+        if (!w32.succeeded(w32.call(ctx4, 147, FenceSignal, .{ fence, value }))) return error.D3D11SignalFailed;
+        Context.flush(self.context);
     }
 
     fn initWith(gpa: std.mem.Allocator, device: Obj, context: Obj, owned: bool) !OffscreenContext {
@@ -1535,3 +1688,41 @@ pub const OffscreenContext = struct {
         }
     }
 };
+
+test "a device of the app's on the renderer's adapter shares textures and fences with it" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var r = D3D11Renderer.initWarp(std.testing.allocator) catch return error.SkipZigTest;
+    defer r.deinit();
+    const shared = r.sharedDevice();
+    var ui_ctx = try OffscreenContext.initShared(std.testing.allocator, shared);
+    defer ui_ctx.deinit();
+    // On another thread, as an app's work would be.
+    var app = OffscreenContext.initOnAdapter(std.testing.allocator, shared.luid) catch return error.SkipZigTest;
+    defer app.deinit();
+
+    const tex = try app.createSharedTexture(16, 16);
+    defer w32.release(tex.texture);
+    defer _ = w32.CloseHandle(tex.handle);
+    const opened = try ui_ctx.openSharedTexture(tex.handle);
+    w32.release(opened);
+
+    const fence = app.createSharedFence(0) catch |e| switch (e) {
+        // Before Windows 10 1703.
+        error.D3D11FenceUnsupported => return,
+        else => return e,
+    };
+    defer w32.release(fence.fence);
+    defer _ = w32.CloseHandle(fence.handle);
+    const ui_fence = try ui_ctx.openSharedFence(fence.handle);
+    defer w32.release(ui_fence);
+    try app.signalFence(fence.fence, 1);
+
+    // A scene on the renderer's device waits for it, and is drawn.
+    const Scene = struct {
+        fn render(_: void, _: *OffscreenContext) !void {}
+    };
+    var pixels: [16 * 16]u32 = undefined;
+    var img: software.Image = .{ .pixels = &pixels, .width = 16, .height = 16 };
+    try ui_ctx.renderToImage(&img, .{ .viewport = .{ .width = 16, .height = 16 } }, canvas_mod.Color.rgb(0x00ff00), 1, .{ .fence = .{ .fence = ui_fence, .value = 1 } }, {}, Scene.render);
+    try std.testing.expectEqual(@as(u32, 0xff00ff00), pixels[8 * 16 + 8]);
+}

@@ -491,6 +491,9 @@ pub const VulkanRenderer = struct {
             .queue_family = ctx.queue_family,
             .timelines = ctx.timelines != null,
             .drm = ctx.drm,
+            .queue_lock = &ctx.queue_lock,
+            .app_queue = ctx.app_queue,
+            .app_queue_lock = if (ctx.app_queue != null) &ctx.app_queue_lock else null,
         };
     }
 
@@ -1098,7 +1101,7 @@ const VkCommandBufferBeginInfo = extern struct {
     pInheritanceInfo: ?*const anyopaque = null,
 };
 
-const VkSubmitInfo = extern struct {
+pub const VkSubmitInfo = extern struct {
     sType: VkStructureType = .submit_info,
     pNext: ?*const anyopaque = null,
     waitSemaphoreCount: u32 = 0,
@@ -1564,6 +1567,10 @@ pub const ContextProcs = struct {
     QueueSubmit: *const fn (VkQueue, u32, [*]const VkSubmitInfo, VkFence) callconv(.c) VkResult,
     QueueWaitIdle: *const fn (VkQueue) callconv(.c) VkResult,
     DeviceWaitIdle: *const fn (VkDevice) callconv(.c) VkResult,
+    CreateFence: *const fn (VkDevice, *const VkFenceCreateInfo, ?*const anyopaque, *VkFence) callconv(.c) VkResult,
+    DestroyFence: *const fn (VkDevice, VkFence, ?*const anyopaque) callconv(.c) void,
+    WaitForFences: *const fn (VkDevice, u32, [*]const VkFence, u32, u64) callconv(.c) VkResult,
+    ResetFences: *const fn (VkDevice, u32, [*]const VkFence) callconv(.c) VkResult,
     CreateRenderPass: *const fn (VkDevice, *const VkRenderPassCreateInfo, ?*const anyopaque, *VkRenderPass) callconv(.c) VkResult,
     DestroyRenderPass: *const fn (VkDevice, VkRenderPass, ?*const anyopaque) callconv(.c) void,
     CreateFramebuffer: *const fn (VkDevice, *const VkFramebufferCreateInfo, ?*const anyopaque, *VkFramebuffer) callconv(.c) VkResult,
@@ -1625,6 +1632,41 @@ pub const ContextProcs = struct {
     }
 };
 
+/// The lock of a queue that several threads submit to: Vulkan has each
+/// submission (and wait for the queue to be idle) hold it. It is held for
+/// a call, not for the GPU's work, so it yields while it waits for it.
+pub const QueueLock = struct {
+    state: std.atomic.Mutex = .unlocked,
+
+    pub fn lock(l: *QueueLock) void {
+        while (!l.state.tryLock()) std.Thread.yield() catch {};
+    }
+
+    pub fn unlock(l: *QueueLock) void {
+        l.state.unlock();
+    }
+};
+
+/// Submits `submits` to `queue` holding `lock`, then waits for them on
+/// `fence` (unsignalled, and left so) without it.
+fn submitAndWait(vk: *const ContextProcs, device: VkDevice, queue: VkQueue, lock: *QueueLock, submits: []const VkSubmitInfo, fence: VkFence) !void {
+    lock.lock();
+    const rc = vk.QueueSubmit(queue, @intCast(submits.len), submits.ptr, fence);
+    lock.unlock();
+    if (rc != .success) return error.VkQueueSubmitFailed;
+    const fences = [1]VkFence{fence};
+    const waited = vk.WaitForFences(device, 1, &fences, VK_TRUE, std.math.maxInt(u64));
+    _ = vk.ResetFences(device, 1, &fences);
+    if (waited != .success) return error.VkWaitForFencesFailed;
+}
+
+/// Waits until `queue` has done all it was given, holding `lock`.
+fn waitIdleLocked(vk: *const ContextProcs, queue: VkQueue, lock: *QueueLock) void {
+    lock.lock();
+    defer lock.unlock();
+    _ = vk.QueueWaitIdle(queue);
+}
+
 const Owned2DContext = struct {
     const GpuTexture = struct {
         img: VkImage,
@@ -1676,6 +1718,14 @@ const Owned2DContext = struct {
     staging_map: []u32 = &.{},
 
     queue_family: u32 = 0,
+    /// The renderer's queue's lock (as other threads may submit to it: see
+    /// `SharedDevice`), and a fence to wait for what it submits.
+    queue_lock: QueueLock = .{},
+    idle_fence: VkFence = VK_NULL_HANDLE,
+    /// A second queue for the app's contexts (`SharedDevice.app_queue`), if
+    /// the GPU has one, and its lock.
+    app_queue: ?VkQueue = null,
+    app_queue_lock: QueueLock = .{},
     /// Drawing straight into window buffers (`renderDirect`), when the
     /// device can import dmabufs: a render pass that keeps what is there,
     /// a fence to wait for a frame, and the buffers imported.
@@ -1784,6 +1834,8 @@ const Owned2DContext = struct {
 
         var chosen_phys: ?VkPhysicalDevice = null;
         var chosen_qfam: u32 = 0;
+        // A second queue for the app's contexts, if the GPU has one.
+        var queue_count: u32 = 1;
         outer: for (phys_devs[0..count]) |pd| {
             var qf_count: u32 = 0;
             inst_procs.GetPhysicalDeviceQueueFamilyProperties(pd, &qf_count, null);
@@ -1794,6 +1846,7 @@ const Owned2DContext = struct {
                 if ((qf.queueFlags & 0x00000001) != 0) {
                     chosen_phys = pd;
                     chosen_qfam = @intCast(qi);
+                    queue_count = @min(qf.queueCount, 2);
                     break :outer;
                 }
             }
@@ -1813,9 +1866,10 @@ const Owned2DContext = struct {
         }
         const host_mt = host_mem_type orelse return error.NoSuitableVulkanMemoryType;
 
-        const prio = [1]f32{1.0};
+        const prio = [2]f32{ 1.0, 1.0 };
         const q_info = [1]VkDeviceQueueCreateInfo{.{
             .queueFamilyIndex = chosen_qfam,
+            .queueCount = queue_count,
             .pQueuePriorities = &prio,
         }};
         // With dmabuf import if it can, to draw straight into window buffers.
@@ -1836,6 +1890,12 @@ const Owned2DContext = struct {
         const vk = try ContextProcs.load(device, inst_procs.GetDeviceProcAddr);
         var queue: VkQueue = undefined;
         vk.GetDeviceQueue(device, chosen_qfam, 0, &queue);
+        var app_queue: ?VkQueue = null;
+        if (queue_count > 1) {
+            var q: VkQueue = undefined;
+            vk.GetDeviceQueue(device, chosen_qfam, 1, &q);
+            app_queue = q;
+        }
 
         const self = try gpa.create(Owned2DContext);
         self.* = .{
@@ -1850,8 +1910,10 @@ const Owned2DContext = struct {
             .vk = vk,
             .queue = queue,
             .queue_family = chosen_qfam,
+            .app_queue = app_queue,
         };
         errdefer self.destroy();
+        if (self.vk.CreateFence(device, &.{}, null, &self.idle_fence) != .success) return error.VkCreateFenceFailed;
         if (extensions.timelines) self.timelines = loadProcs(TimelineProcs, device, inst_procs.GetDeviceProcAddr);
         self.drm = drmNodeOf(get_inst_proc, instance, inst_procs, phys_dev);
         if (extensions.sync_fd) self.sync_fd = loadProcs(SyncFdProcs, device, inst_procs.GetDeviceProcAddr);
@@ -2033,6 +2095,7 @@ const Owned2DContext = struct {
         }
         self.retired_sources.deinit(self.gpa);
         self.clearFrameWaits();
+        if (self.idle_fence != VK_NULL_HANDLE) self.vk.DestroyFence(self.device, self.idle_fence, null);
         if (self.dmabuf) |d| if (self.fence != VK_NULL_HANDLE) d.DestroyFence(self.device, self.fence, null);
         self.destroyFrame();
         if (self.direct_pass != VK_NULL_HANDLE) self.vk.DestroyRenderPass(self.device, self.direct_pass, null);
@@ -2246,8 +2309,7 @@ const Owned2DContext = struct {
             if (self.vk.EndCommandBuffer(self.upload_cmd) != .success) return error.VkEndCommandBufferFailed;
             const cmds = [1]VkCommandBuffer{self.upload_cmd};
             const submits = [1]VkSubmitInfo{.{ .pCommandBuffers = &cmds }};
-            if (self.vk.QueueSubmit(self.queue, 1, &submits, VK_NULL_HANDLE) != .success) return error.VkQueueSubmitFailed;
-            _ = self.vk.QueueWaitIdle(self.queue);
+            try submitAndWait(&self.vk, self.device, self.queue, &self.queue_lock, &submits, self.idle_fence);
             self.atlas_initialized = true;
         }
         return self.atlas_set;
@@ -2344,8 +2406,7 @@ const Owned2DContext = struct {
         if (self.vk.EndCommandBuffer(self.upload_cmd) != .success) return error.VkEndCommandBufferFailed;
         const cmds = [1]VkCommandBuffer{self.upload_cmd};
         const submits = [1]VkSubmitInfo{.{ .pCommandBuffers = &cmds }};
-        if (self.vk.QueueSubmit(self.queue, 1, &submits, VK_NULL_HANDLE) != .success) return error.VkQueueSubmitFailed;
-        _ = self.vk.QueueWaitIdle(self.queue);
+        try submitAndWait(&self.vk, self.device, self.queue, &self.queue_lock, &submits, self.idle_fence);
 
         try self.textures.put(self.gpa, id, .{ .img = img, .mem = mem, .view = view, .set = set });
         return set;
@@ -2354,7 +2415,8 @@ const Owned2DContext = struct {
     fn releaseImageHook(raw: ?*anyopaque, id: u64) void {
         const self: *Owned2DContext = @ptrCast(@alignCast(raw.?));
         if (self.textures.fetchRemove(id)) |kv| {
-            _ = self.vk.DeviceWaitIdle(self.device);
+            // Its queue may be another thread's too: only that is waited for.
+            waitIdleLocked(&self.vk, self.queue, &self.queue_lock);
             const t = kv.value;
             if (t.view != VK_NULL_HANDLE) self.vk.DestroyImageView(self.device, t.view, null);
             if (t.img != VK_NULL_HANDLE) self.vk.DestroyImage(self.device, t.img, null);
@@ -2637,7 +2699,10 @@ const Owned2DContext = struct {
         // After the GPU work the frame's draws wait for (`DirectFrame.wait`).
         var submits = [1]VkSubmitInfo{.{ .pCommandBuffers = &cmds }};
         self.frame_waits.apply(&submits[0]);
-        if (self.vk.QueueSubmit(self.queue, 1, &submits, self.fence) != .success) return error.VkQueueSubmitFailed;
+        self.queue_lock.lock();
+        const submitted = self.vk.QueueSubmit(self.queue, 1, &submits, self.fence);
+        self.queue_lock.unlock();
+        if (submitted != .success) return error.VkQueueSubmitFailed;
         const fences = [1]VkFence{self.fence};
         const waited = d.WaitForFences(self.device, 1, &fences, 1, std.time.ns_per_s);
         _ = d.ResetFences(self.device, 1, &fences);
@@ -3083,8 +3148,7 @@ const Owned2DContext = struct {
         if (self.vk.EndCommandBuffer(self.cmd) != .success) return error.VkEndCommandBufferFailed;
         const cmds = [1]VkCommandBuffer{self.cmd};
         const submits = [1]VkSubmitInfo{.{ .pCommandBuffers = &cmds }};
-        if (self.vk.QueueSubmit(self.queue, 1, &submits, VK_NULL_HANDLE) != .success) return error.VkQueueSubmitFailed;
-        _ = self.vk.QueueWaitIdle(self.queue);
+        try submitAndWait(&self.vk, self.device, self.queue, &self.queue_lock, &submits, self.idle_fence);
 
         for (regions) |reg| {
             const sc = full_vp.intersect(reg) orelse continue;
@@ -3124,6 +3188,12 @@ pub const SharedDevice = struct {
     /// The GPU's DRM render node, if Vulkan says: for drawing on the same
     /// GPU with OpenGL (`OpenGlContext.initOnDevice`).
     drm: ?DrmNode = null,
+    /// `queue`'s lock, which a context on it takes to submit (from any
+    /// thread); and a second queue for the app's contexts, if the GPU has
+    /// one, so that what they submit does not wait for the renderer's lock.
+    queue_lock: ?*QueueLock = null,
+    app_queue: ?VkQueue = null,
+    app_queue_lock: ?*QueueLock = null,
 };
 
 /// A frame being drawn straight into a window buffer on the 2D renderer's
@@ -3246,6 +3316,12 @@ pub const OffscreenContext = struct {
     readback_map: []u32 = &.{},
     /// It is on another's device (`initShared`), which it does not destroy.
     shared: bool = false,
+    /// Its queue's lock (another's, or its own: `own_lock`), which every
+    /// submission holds, as several threads may submit to the queue; and a
+    /// fence to wait for what it submits.
+    queue_lock: *QueueLock = undefined,
+    own_lock: ?*QueueLock = null,
+    idle_fence: VkFence = VK_NULL_HANDLE,
     /// Making and waiting on timeline semaphores, if the device can.
     timelines: ?TimelineProcs = null,
 
@@ -3322,14 +3398,19 @@ pub const OffscreenContext = struct {
             .timelines = if (extensions.timelines) loadProcs(TimelineProcs, device, inst_procs.GetDeviceProcAddr) else null,
         };
         errdefer self.deinit();
-        try self.initObjects(chosen_qfam);
+        try self.initObjects(chosen_qfam, null);
         return self;
     }
 
     /// A context on the 2D renderer's device (`VulkanRenderer.sharedDevice`),
     /// so that what it draws can go straight into the renderer's frames
     /// (`renderToFrame`). It does not own the device, which must outlive it.
+    /// It submits to the device's queue for the app's (`SharedDevice.app_queue`)
+    /// if there is one, or else to the renderer's, holding its lock, so it
+    /// may be used on another thread. (A context is used on one thread at a
+    /// time: for drawing on two, make two.)
     pub fn initShared(gpa: std.mem.Allocator, dev: SharedDevice) !OffscreenContext {
+        const queue, const lock = if (dev.app_queue) |q| .{ q, dev.app_queue_lock } else .{ dev.queue, dev.queue_lock };
         var self: OffscreenContext = .{
             .gpa = gpa,
             .vk_lib = undefined,
@@ -3339,17 +3420,28 @@ pub const OffscreenContext = struct {
             .mem_props = dev.mem_props,
             .device = dev.device,
             .vk = dev.vk,
-            .queue = dev.queue,
+            .queue = queue,
             .shared = true,
             .timelines = if (dev.timelines) loadProcs(TimelineProcs, dev.device, dev.inst_procs.GetDeviceProcAddr) else null,
         };
         errdefer self.deinit();
-        try self.initObjects(dev.queue_family);
+        try self.initObjects(dev.queue_family, lock);
         return self;
     }
 
-    /// Makes the command buffer, render passes, uniforms and samplers.
-    fn initObjects(self: *OffscreenContext, queue_family: u32) !void {
+    /// Makes the queue's lock (if it has none: `lock`), the fence, the
+    /// command buffer, render passes, uniforms and samplers.
+    fn initObjects(self: *OffscreenContext, queue_family: u32, lock: ?*QueueLock) !void {
+        if (lock) |l| {
+            self.queue_lock = l;
+        } else {
+            const own = try self.gpa.create(QueueLock);
+            own.* = .{};
+            self.own_lock = own;
+            self.queue_lock = own;
+        }
+        if (self.vk.CreateFence(self.device, &.{}, null, &self.idle_fence) != .success) return error.VkCreateFenceFailed;
+
         const pool_info: VkCommandPoolCreateInfo = .{ .queueFamilyIndex = queue_family };
         if (self.vk.CreateCommandPool(self.device, &pool_info, null, &self.cmd_pool) != .success) return error.VkCreateCommandPoolFailed;
 
@@ -3496,7 +3588,12 @@ pub const OffscreenContext = struct {
     }
 
     pub fn deinit(self: *OffscreenContext) void {
-        _ = self.vk.DeviceWaitIdle(self.device);
+        // On another's device, only its own queue is waited for (another
+        // thread may be submitting to the device's others).
+        if (self.shared) {
+            if (self.idle_fence != VK_NULL_HANDLE) self.waitIdle();
+        } else _ = self.vk.DeviceWaitIdle(self.device);
+        if (self.idle_fence != VK_NULL_HANDLE) self.vk.DestroyFence(self.device, self.idle_fence, null);
         self.destroyTargets();
         if (self.ubo_map.len > 0) self.vk.UnmapMemory(self.device, self.ubo_mem);
         if (self.ubo_buf != VK_NULL_HANDLE) self.vk.DestroyBuffer(self.device, self.ubo_buf, null);
@@ -3507,10 +3604,25 @@ pub const OffscreenContext = struct {
             if (rp != VK_NULL_HANDLE) self.vk.DestroyRenderPass(self.device, rp, null);
         }
         if (self.cmd_pool != VK_NULL_HANDLE) self.vk.DestroyCommandPool(self.device, self.cmd_pool, null);
+        if (self.own_lock) |l| self.gpa.destroy(l);
         if (self.shared) return;
         self.vk.DestroyDevice(self.device, null);
         self.inst_procs.DestroyInstance(self.instance, null);
         self.vk_lib.close();
+    }
+
+    /// Submits work of the app's to its queue, holding the queue's lock: the
+    /// way to submit to it from any thread (Vulkan's own `vkQueueSubmit`
+    /// would race with the renderer's, or another context's, on it).
+    pub fn submit(self: *const OffscreenContext, submits: []const VkSubmitInfo, fence: VkFence) !void {
+        self.queue_lock.lock();
+        defer self.queue_lock.unlock();
+        if (self.vk.QueueSubmit(self.queue, @intCast(submits.len), submits.ptr, fence) != .success) return error.VkQueueSubmitFailed;
+    }
+
+    /// Waits until its queue has done all it was given (by any thread).
+    pub fn waitIdle(self: *const OffscreenContext) void {
+        waitIdleLocked(&self.vk, self.queue, self.queue_lock);
     }
 
     /// Whether it can make timeline semaphores (`createTimeline`), for
@@ -3988,8 +4100,7 @@ pub const OffscreenContext = struct {
         const cmds = [1]VkCommandBuffer{self.cmd};
         var submits = [1]VkSubmitInfo{.{ .pCommandBuffers = &cmds }};
         waits.apply(&submits[0]);
-        if (self.vk.QueueSubmit(self.queue, 1, &submits, VK_NULL_HANDLE) != .success) return error.VkQueueSubmitFailed;
-        _ = self.vk.QueueWaitIdle(self.queue);
+        try submitAndWait(&self.vk, self.device, self.queue, self.queue_lock, &submits, self.idle_fence);
 
         const local_x: usize = @intCast(sc.x - vp.x);
         const local_y: usize = @intCast(sc.y - vp.y);

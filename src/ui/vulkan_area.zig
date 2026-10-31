@@ -73,9 +73,8 @@ pub fn VulkanArea(comptime Scene: type) type {
 
             pub fn deinit(st: *State) void {
                 const c = st.ctx() orelse return;
-                // Its own is idle before what the scene made on it goes (the app's
-                // is the app's to wait for).
-                if (st.own_ctx != null) _ = c.vk.DeviceWaitIdle(c.device);
+                // Its queue is idle before what the scene made on it goes.
+                c.waitIdle();
                 if (HasState) {
                     if (st.scene_state) |*ss| {
                         if (@hasDecl(Scene.State, "deinit")) {

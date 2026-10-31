@@ -3547,3 +3547,33 @@ test "the OpenGL renderer gives its display, for contexts sharing with it" {
     // The same GPU, if EGL says for both.
     if (d.drm) |node| if (ctx.drmNode()) |on| try testing.expectEqual(node, on);
 }
+
+fn submitMany(ctx: *const gfx.VulkanContext, count: usize) void {
+    const no_cmds = [0]gfx.vulkan.VkCommandBuffer{};
+    const submits = [1]gfx.vulkan.VkSubmitInfo{.{ .commandBufferCount = 0, .pCommandBuffers = &no_cmds }};
+    for (0..count) |_| ctx.submit(&submits, gfx.vulkan.VK_NULL_HANDLE) catch return;
+    ctx.waitIdle();
+}
+
+test "the app submits to the renderer's device from another thread while windows are drawn" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const u = try ui.WindowUi.createDefault(testing.allocator, testing.io);
+    defer u.destroy();
+    const dev = switch (u.shared.gpuDevice() orelse return error.SkipZigTest) {
+        .vulkan => |d| d,
+        else => return error.SkipZigTest,
+    };
+    // A context of the app's on it, for its thread.
+    var app_ctx = try gfx.VulkanContext.initShared(testing.allocator, dev);
+    defer app_ctx.deinit();
+
+    const thread = try std.Thread.spawn(.{}, submitMany, .{ &app_ctx, 2000 });
+    // Meanwhile frames, and a scene, are drawn on the renderer's device.
+    for (0..20) |i| {
+        u.frame(40, 30, @intCast(i), ui.VulkanArea(ClearScene){ .scene = .{}, .samples = 1, .clear_color = red, .key = i });
+        const img = try Image.init(u, 40, 30);
+        defer img.deinit();
+        try testing.expectEqual(red.toArgb(), img.at(20, 15));
+    }
+    thread.join();
+}
