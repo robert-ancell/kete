@@ -44,40 +44,62 @@ pub fn VulkanArea(comptime Scene: type) type {
         key: ?u64 = null,
         /// A widget drawn over the area.
         child: ?Widget = null,
+        /// A context of the app's to draw the scene with, instead of one the
+        /// area makes and owns: so that the scene can use what the app made
+        /// on it (its textures and buffers, say). It must outlive the area.
+        context: ?*gfx.VulkanContext = null,
+        /// GPU work of the app's done elsewhere (on another thread, say) that
+        /// the scene waits for before it is drawn: drawing a picture it
+        /// shows, say. A new picture is a new `wait`, which draws the scene
+        /// again.
+        wait: ?gfx.vulkan.Wait = null,
 
         pub const State = struct {
             gpa: ?std.mem.Allocator = null,
-            vk_ctx: ?gfx.VulkanContext = null,
+            /// The context drawn with: the app's (`context`), or its own.
+            app_ctx: ?*gfx.VulkanContext = null,
+            own_ctx: ?gfx.VulkanContext = null,
+            /// The app's context it was made for (null for its own).
+            made_for: ?*gfx.VulkanContext = null,
             scene_state: if (HasState) ?Scene.State else void = if (HasState) null else {},
             init_failed: bool = false,
             dragging: bool = false,
             last_pos: Point = .{ 0, 0 },
 
+            fn ctx(st: *State) ?*gfx.VulkanContext {
+                if (st.app_ctx) |c| return c;
+                return if (st.own_ctx) |*c| c else null;
+            }
+
             pub fn deinit(st: *State) void {
-                if (st.vk_ctx) |*ctx| {
-                    _ = ctx.vk.DeviceWaitIdle(ctx.device);
-                    if (HasState) {
-                        if (st.scene_state) |*ss| {
-                            if (@hasDecl(Scene.State, "deinit")) {
-                                const params = @typeInfo(@TypeOf(Scene.State.deinit)).@"fn".param_types;
-                                if (params.len == 3) {
-                                    ss.deinit(ctx, st.gpa.?);
-                                } else if (params.len == 2) {
-                                    ss.deinit(ctx);
-                                } else {
-                                    ss.deinit();
-                                }
+                const c = st.ctx() orelse return;
+                // Its own is idle before what the scene made on it goes (the app's
+                // is the app's to wait for).
+                if (st.own_ctx != null) _ = c.vk.DeviceWaitIdle(c.device);
+                if (HasState) {
+                    if (st.scene_state) |*ss| {
+                        if (@hasDecl(Scene.State, "deinit")) {
+                            const params = @typeInfo(@TypeOf(Scene.State.deinit)).@"fn".param_types;
+                            if (params.len == 3) {
+                                ss.deinit(c, st.gpa.?);
+                            } else if (params.len == 2) {
+                                ss.deinit(c);
+                            } else {
+                                ss.deinit();
                             }
                         }
                     }
-                    ctx.deinit();
-                    st.vk_ctx = null;
                 }
+                if (st.own_ctx) |*own| own.deinit();
+                st.own_ctx = null;
+                st.app_ctx = null;
+                if (HasState) st.scene_state = null;
             }
         };
 
         const DrawPayload = struct {
             vk_ctx: *gfx.VulkanContext,
+            wait: ?gfx.vulkan.Wait,
             scene: Scene,
             scene_state: if (HasState) *Scene.State else void,
             clear_color: gfx.Color,
@@ -136,42 +158,55 @@ pub fn VulkanArea(comptime Scene: type) type {
             const t = n.theme();
             const bg = self.clear_color orelse t.surface_container;
 
-            if (!st.init_failed and st.vk_ctx == null) {
+            // Given another context of the app's (or none): what the scene
+            // made on the last one goes, and it is made again on this.
+            if (self.context != st.made_for) {
+                st.deinit();
+                st.init_failed = false;
+                st.made_for = self.context;
+            }
+            if (!st.init_failed and st.ctx() == null) {
                 st.gpa = n.ui.gpa;
-                // On the UI's Vulkan renderer's device if it has one, so that
-                // the scene is drawn straight into its frames; or else on a
-                // device of its own, and copied in.
-                const shared: ?gfx.VulkanContext = if (sharedDevice(n)) |dev| gfx.VulkanContext.initShared(n.ui.gpa, dev) catch null else null;
-                if (if (shared) |ctx| ctx else gfx.VulkanContext.init(n.ui.gpa)) |ctx| {
-                    st.vk_ctx = ctx;
-                    if (HasState) {
-                        const params = @typeInfo(@TypeOf(Scene.State.init)).@"fn".param_types;
-                        const init_res = if (params.len == 2)
-                            Scene.State.init(&st.vk_ctx.?, n.ui.gpa)
-                        else
-                            Scene.State.init(&st.vk_ctx.?);
-                        if (init_res) |ss| {
-                            st.scene_state = ss;
-                        } else |_| {
-                            st.vk_ctx.?.deinit();
-                            st.vk_ctx = null;
-                            st.init_failed = true;
-                        }
+                if (self.context) |app| {
+                    st.app_ctx = app;
+                } else {
+                    // On the UI's Vulkan renderer's device if it has one, so
+                    // that the scene is drawn straight into its frames; or
+                    // else on a device of its own, and copied in.
+                    const shared: ?gfx.VulkanContext = if (sharedDevice(n)) |dev| gfx.VulkanContext.initShared(n.ui.gpa, dev) catch null else null;
+                    if (if (shared) |c| c else gfx.VulkanContext.init(n.ui.gpa)) |c| {
+                        st.own_ctx = c;
+                    } else |_| {
+                        st.init_failed = true;
                     }
-                } else |_| {
-                    st.init_failed = true;
                 }
+                if (HasState) if (st.ctx()) |c| {
+                    const params = @typeInfo(@TypeOf(Scene.State.init)).@"fn".param_types;
+                    const init_res = if (params.len == 2)
+                        Scene.State.init(c, n.ui.gpa)
+                    else
+                        Scene.State.init(c);
+                    if (init_res) |ss| {
+                        st.scene_state = ss;
+                    } else |_| {
+                        if (st.own_ctx) |*own| own.deinit();
+                        st.own_ctx = null;
+                        st.app_ctx = null;
+                        st.init_failed = true;
+                    }
+                };
             }
 
-            if (st.vk_ctx == null) {
+            const ctx = st.ctx() orelse {
                 const c = p.canvas();
                 c.fillRect(.{ .x = 0, .y = 0, .w = n.size.w, .h = n.size.h }, bg);
                 return;
-            }
+            };
 
             const payload = n.ui.arena().create(DrawPayload) catch return;
             payload.* = .{
-                .vk_ctx = &st.vk_ctx.?,
+                .vk_ctx = ctx,
+                .wait = self.wait,
                 .scene = self.scene,
                 .scene_state = if (HasState) &st.scene_state.? else {},
                 .clear_color = bg,
@@ -183,6 +218,7 @@ pub fn VulkanArea(comptime Scene: type) type {
                 hasher.update(std.mem.asBytes(&self.scene));
                 hasher.update(std.mem.asBytes(&bg));
                 hasher.update(&.{self.samples});
+                std.hash.autoHashStrat(&hasher, self.wait, .Shallow);
                 break :blk hasher.final();
             };
 
@@ -202,11 +238,11 @@ pub fn VulkanArea(comptime Scene: type) type {
         fn drawDirect(payload: *const DrawPayload, backend: gfx.RenderBackend, frame: *const anyopaque, area: gfx.GpuArea) anyerror!bool {
             if (backend != .vulkan) return false;
             const f: *const gfx.vulkan.DirectFrame = @ptrCast(@alignCast(frame));
-            return payload.vk_ctx.renderToFrame(f, area, payload.clear_color, payload.samples, payload, renderScene);
+            return payload.vk_ctx.renderToFrame(f, area, payload.clear_color, payload.samples, payload.wait, payload, renderScene);
         }
 
         fn drawGpu(payload: *const DrawPayload, target: *gfx.software.Image, area: gfx.GpuArea) anyerror!void {
-            try payload.vk_ctx.renderToImage(target, area, payload.clear_color, payload.samples, payload, renderScene);
+            try payload.vk_ctx.renderToImage(target, area, payload.clear_color, payload.samples, payload.wait, payload, renderScene);
         }
 
         fn renderScene(payload: *const DrawPayload, ctx: *gfx.VulkanContext) anyerror!void {

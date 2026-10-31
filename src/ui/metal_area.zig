@@ -46,40 +46,60 @@ pub fn MetalArea(comptime Scene: type) type {
         key: ?u64 = null,
         /// A widget drawn over the area.
         child: ?Widget = null,
+        /// A context of the app's to draw the scene with, instead of one the
+        /// area makes and owns: so that the scene can use what the app made
+        /// on it (its textures and buffers, say). It must outlive the area.
+        context: ?*gfx.MetalContext = null,
+        /// GPU work of the app's done elsewhere (on another thread, say) that
+        /// the scene waits for before it is drawn: drawing a picture it
+        /// shows, say. A new picture is a new `wait`, which draws the scene
+        /// again.
+        wait: ?gfx.metal.Wait = null,
 
         pub const State = struct {
             gpa: ?std.mem.Allocator = null,
-            mtl_ctx: ?gfx.MetalContext = null,
+            /// The context drawn with: the app's (`context`), or its own.
+            app_ctx: ?*gfx.MetalContext = null,
+            own_ctx: ?gfx.MetalContext = null,
+            /// The app's context it was made for (null for its own).
+            made_for: ?*gfx.MetalContext = null,
             scene_state: if (HasState) ?Scene.State else void = if (HasState) null else {},
             init_failed: bool = false,
             dragging: bool = false,
             last_pos: Point = .{ 0, 0 },
 
+            fn ctx(st: *State) ?*gfx.MetalContext {
+                if (st.app_ctx) |c| return c;
+                return if (st.own_ctx) |*c| c else null;
+            }
+
             pub fn deinit(st: *State) void {
-                if (st.mtl_ctx) |*ctx| {
-                    ctx.waitIdle();
-                    if (HasState) {
-                        if (st.scene_state) |*ss| {
-                            if (@hasDecl(Scene.State, "deinit")) {
-                                const params = @typeInfo(@TypeOf(Scene.State.deinit)).@"fn".param_types;
-                                if (params.len == 3) {
-                                    ss.deinit(ctx, st.gpa.?);
-                                } else if (params.len == 2) {
-                                    ss.deinit(ctx);
-                                } else {
-                                    ss.deinit();
-                                }
+                const c = st.ctx() orelse return;
+                c.waitIdle();
+                if (HasState) {
+                    if (st.scene_state) |*ss| {
+                        if (@hasDecl(Scene.State, "deinit")) {
+                            const params = @typeInfo(@TypeOf(Scene.State.deinit)).@"fn".param_types;
+                            if (params.len == 3) {
+                                ss.deinit(c, st.gpa.?);
+                            } else if (params.len == 2) {
+                                ss.deinit(c);
+                            } else {
+                                ss.deinit();
                             }
                         }
                     }
-                    ctx.deinit();
-                    st.mtl_ctx = null;
                 }
+                if (st.own_ctx) |*own| own.deinit();
+                st.own_ctx = null;
+                st.app_ctx = null;
+                if (HasState) st.scene_state = null;
             }
         };
 
         const DrawPayload = struct {
             mtl_ctx: *gfx.MetalContext,
+            wait: ?gfx.metal.Wait,
             scene: Scene,
             scene_state: if (HasState) *Scene.State else void,
             clear_color: gfx.Color,
@@ -138,42 +158,55 @@ pub fn MetalArea(comptime Scene: type) type {
             const t = n.theme();
             const bg = self.clear_color orelse t.surface_container;
 
-            if (!st.init_failed and st.mtl_ctx == null) {
+            // Given another context of the app's (or none): what the scene
+            // made on the last one goes, and it is made again on this.
+            if (self.context != st.made_for) {
+                st.deinit();
+                st.init_failed = false;
+                st.made_for = self.context;
+            }
+            if (!st.init_failed and st.ctx() == null) {
                 st.gpa = n.ui.gpa;
-                // On the UI's Metal renderer's device if it has one, so that
-                // the scene is drawn straight into its frames; or else on a
-                // device of its own, and copied in.
-                const shared: ?gfx.MetalContext = if (sharedDevice(n)) |dev| gfx.MetalContext.initShared(n.ui.gpa, dev) catch null else null;
-                if (if (shared) |ctx| ctx else gfx.MetalContext.init(n.ui.gpa)) |ctx| {
-                    st.mtl_ctx = ctx;
-                    if (HasState) {
-                        const params = @typeInfo(@TypeOf(Scene.State.init)).@"fn".param_types;
-                        const init_res = if (params.len == 2)
-                            Scene.State.init(&st.mtl_ctx.?, n.ui.gpa)
-                        else
-                            Scene.State.init(&st.mtl_ctx.?);
-                        if (init_res) |ss| {
-                            st.scene_state = ss;
-                        } else |_| {
-                            st.mtl_ctx.?.deinit();
-                            st.mtl_ctx = null;
-                            st.init_failed = true;
-                        }
+                if (self.context) |app| {
+                    st.app_ctx = app;
+                } else {
+                    // On the UI's Metal renderer's device if it has one, so
+                    // that the scene is drawn straight into its frames; or
+                    // else on a device of its own, and copied in.
+                    const shared: ?gfx.MetalContext = if (sharedDevice(n)) |dev| gfx.MetalContext.initShared(n.ui.gpa, dev) catch null else null;
+                    if (if (shared) |c| c else gfx.MetalContext.init(n.ui.gpa)) |c| {
+                        st.own_ctx = c;
+                    } else |_| {
+                        st.init_failed = true;
                     }
-                } else |_| {
-                    st.init_failed = true;
                 }
+                if (HasState) if (st.ctx()) |c| {
+                    const params = @typeInfo(@TypeOf(Scene.State.init)).@"fn".param_types;
+                    const init_res = if (params.len == 2)
+                        Scene.State.init(c, n.ui.gpa)
+                    else
+                        Scene.State.init(c);
+                    if (init_res) |ss| {
+                        st.scene_state = ss;
+                    } else |_| {
+                        if (st.own_ctx) |*own| own.deinit();
+                        st.own_ctx = null;
+                        st.app_ctx = null;
+                        st.init_failed = true;
+                    }
+                };
             }
 
-            if (st.mtl_ctx == null) {
+            const ctx = st.ctx() orelse {
                 const c = p.canvas();
                 c.fillRect(.{ .x = 0, .y = 0, .w = n.size.w, .h = n.size.h }, bg);
                 return;
-            }
+            };
 
             const payload = n.ui.arena().create(DrawPayload) catch return;
             payload.* = .{
-                .mtl_ctx = &st.mtl_ctx.?,
+                .mtl_ctx = ctx,
+                .wait = self.wait,
                 .scene = self.scene,
                 .scene_state = if (HasState) &st.scene_state.? else {},
                 .clear_color = bg,
@@ -185,6 +218,7 @@ pub fn MetalArea(comptime Scene: type) type {
                 hasher.update(std.mem.asBytes(&self.scene));
                 hasher.update(std.mem.asBytes(&bg));
                 hasher.update(&.{self.samples});
+                std.hash.autoHashStrat(&hasher, self.wait, .Shallow);
                 break :blk hasher.final();
             };
 
@@ -204,11 +238,11 @@ pub fn MetalArea(comptime Scene: type) type {
         fn drawDirect(payload: *const DrawPayload, backend: gfx.RenderBackend, frame: *const anyopaque, area: gfx.GpuArea) anyerror!bool {
             if (backend != .metal) return false;
             const f: *const gfx.metal.DirectFrame = @ptrCast(@alignCast(frame));
-            return payload.mtl_ctx.renderToFrame(f, area, payload.clear_color, payload.samples, payload, renderScene);
+            return payload.mtl_ctx.renderToFrame(f, area, payload.clear_color, payload.samples, payload.wait, payload, renderScene);
         }
 
         fn drawGpu(payload: *const DrawPayload, target: *gfx.software.Image, area: gfx.GpuArea) anyerror!void {
-            try payload.mtl_ctx.renderToImage(target, area, payload.clear_color, payload.samples, payload, renderScene);
+            try payload.mtl_ctx.renderToImage(target, area, payload.clear_color, payload.samples, payload.wait, payload, renderScene);
         }
 
         fn renderScene(payload: *const DrawPayload, ctx: *gfx.MetalContext) anyerror!void {

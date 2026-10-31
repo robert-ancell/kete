@@ -855,6 +855,59 @@ const EglProcs = struct {
 const EGLImageKHR = ?*anyopaque;
 const EGL_GL_RENDERBUFFER_KHR: EGLenum = 0x30B9;
 
+const EGLSyncKHR = ?*anyopaque;
+const EGLTimeKHR = u64;
+const EGL_EXTENSIONS: EGLint = 0x3055;
+const EGL_SYNC_FENCE_KHR: EGLenum = 0x30F9;
+const EGL_SYNC_NATIVE_FENCE_ANDROID: EGLenum = 0x3144;
+const EGL_SYNC_NATIVE_FENCE_FD_ANDROID: EGLint = 0x3145;
+const EGL_NO_NATIVE_FENCE_FD_ANDROID: EGLint = -1;
+const EGL_SYNC_FLUSH_COMMANDS_BIT_KHR: EGLint = 0x0001;
+const EGL_FOREVER_KHR: EGLTimeKHR = std.math.maxInt(u64);
+
+/// GPU work that a scene waits for before it is drawn (as its `wait`): done
+/// once `sync`, an EGL fence on the same display, is signalled. It is made
+/// after the work, on the context that did it (`OffscreenContext.createFence`),
+/// and must stay until the scene has been drawn.
+pub const Wait = struct {
+    sync: ?*anyopaque,
+};
+
+/// EGL fences (`EGL_KHR_fence_sync`), waited for on the GPU if EGL can
+/// (`EGL_KHR_wait_sync`), and given as sync files if it can
+/// (`EGL_ANDROID_native_fence_sync`).
+const SyncProcs = struct {
+    CreateSyncKHR: *const fn (EGLDisplay, EGLenum, ?[*]const EGLint) callconv(.c) EGLSyncKHR,
+    DestroySyncKHR: *const fn (EGLDisplay, EGLSyncKHR) callconv(.c) EGLBoolean,
+    ClientWaitSyncKHR: *const fn (EGLDisplay, EGLSyncKHR, EGLint, EGLTimeKHR) callconv(.c) EGLint,
+    WaitSyncKHR: ?*const fn (EGLDisplay, EGLSyncKHR, EGLint) callconv(.c) EGLint,
+    DupNativeFenceFDANDROID: ?*const fn (EGLDisplay, EGLSyncKHR) callconv(.c) EGLint,
+
+    /// What `dpy` has, or null without fences.
+    fn load(lib: *std.DynLib, egl: *const EglProcs, dpy: EGLDisplay) ?SyncProcs {
+        const query = lib.lookup(*const fn (EGLDisplay, EGLint) callconv(.c) ?[*:0]const u8, "eglQueryString") orelse return null;
+        const extensions = std.mem.span(query(dpy, EGL_EXTENSIONS) orelse return null);
+        const has = struct {
+            fn f(list: []const u8, name: []const u8) bool {
+                var it = std.mem.tokenizeScalar(u8, list, ' ');
+                while (it.next()) |e| if (std.mem.eql(u8, e, name)) return true;
+                return false;
+            }
+        }.f;
+        if (!has(extensions, "EGL_KHR_fence_sync")) return null;
+        var p: SyncProcs = .{
+            .CreateSyncKHR = @ptrCast(@alignCast(egl.GetProcAddress("eglCreateSyncKHR") orelse return null)),
+            .DestroySyncKHR = @ptrCast(@alignCast(egl.GetProcAddress("eglDestroySyncKHR") orelse return null)),
+            .ClientWaitSyncKHR = @ptrCast(@alignCast(egl.GetProcAddress("eglClientWaitSyncKHR") orelse return null)),
+            .WaitSyncKHR = null,
+            .DupNativeFenceFDANDROID = null,
+        };
+        if (has(extensions, "EGL_KHR_wait_sync")) p.WaitSyncKHR = @ptrCast(@alignCast(egl.GetProcAddress("eglWaitSyncKHR")));
+        if (has(extensions, "EGL_ANDROID_native_fence_sync")) p.DupNativeFenceFDANDROID = @ptrCast(@alignCast(egl.GetProcAddress("eglDupNativeFenceFDANDROID")));
+        return p;
+    }
+};
+
 /// Exporting a renderbuffer as a dmabuf (`EGL_KHR_gl_renderbuffer_image`,
 /// `EGL_MESA_image_dma_buf_export`), if EGL has them.
 const ExportProcs = struct {
@@ -898,6 +951,7 @@ pub const ContextProcs = struct {
     FramebufferRenderbuffer: *const fn (GLenum, GLenum, GLenum, GLuint) callconv(.c) void,
     BlitFramebuffer: *const fn (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum) callconv(.c) void,
     Finish: *const fn () callconv(.c) void,
+    Flush: *const fn () callconv(.c) void,
     ReadPixels: *const fn (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, *anyopaque) callconv(.c) void,
     GenBuffers: *const fn (GLsizei, [*]GLuint) callconv(.c) void,
     DeleteBuffers: *const fn (GLsizei, [*]const GLuint) callconv(.c) void,
@@ -1000,6 +1054,9 @@ pub const OffscreenContext = struct {
     exported: ?DmabufImage = null,
     export_id: u64 = 0,
     export_failed: bool = false,
+    /// Fences, if EGL has them (for `Wait`, `createFence`, and a dmabuf's
+    /// `ready_fd`).
+    sync: ?SyncProcs = null,
 
     pub const ubo_capacity: usize = 256;
 
@@ -1034,7 +1091,20 @@ pub const OffscreenContext = struct {
         blend: bool = false,
     };
 
+    /// A context of its own.
     pub fn init(gpa: std.mem.Allocator) !OffscreenContext {
+        return initWith(gpa, EGL_NO_CONTEXT);
+    }
+
+    /// A context sharing what is made on it (textures, buffers) with
+    /// `share`'s: for drawing on another thread (a context is current on
+    /// one thread at a time) what a scene drawn with `share` shows. It is
+    /// current on the calling thread.
+    pub fn initSharing(gpa: std.mem.Allocator, share: *const OffscreenContext) !OffscreenContext {
+        return initWith(gpa, share.ctx);
+    }
+
+    fn initWith(gpa: std.mem.Allocator, share_ctx: EGLContext) !OffscreenContext {
         var egl_lib = std.DynLib.open("libEGL.so.1") catch try std.DynLib.open("libEGL.so");
         errdefer egl_lib.close();
         const egl = try EglProcs.load(&egl_lib);
@@ -1077,7 +1147,7 @@ pub const OffscreenContext = struct {
                 EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
                 EGL_NONE,
             };
-            ctx = egl.CreateContext(dpy, config, EGL_NO_CONTEXT, &ctx_attribs);
+            ctx = egl.CreateContext(dpy, config, share_ctx, &ctx_attribs);
             if (ctx != EGL_NO_CONTEXT) break;
         }
         if (ctx == EGL_NO_CONTEXT) return error.EglCreateContextFailed;
@@ -1104,6 +1174,7 @@ pub const OffscreenContext = struct {
             .gl = gl,
             .spirv_supported = spirv_supported,
             .ubo = ubo[0],
+            .sync = SyncProcs.load(&egl_lib, &egl, dpy),
         };
     }
 
@@ -1135,6 +1206,49 @@ pub const OffscreenContext = struct {
 
     pub fn makeCurrent(self: *const OffscreenContext) void {
         _ = self.egl.MakeCurrent(self.dpy, self.surf, self.surf, self.ctx);
+    }
+
+    /// A fence after what was drawn with it so far, for a scene drawn on
+    /// another context to wait for (its `wait`). The context must be the
+    /// calling thread's. Destroy it (`destroyFence`) once the scene has
+    /// been drawn.
+    pub fn createFence(self: *const OffscreenContext) !Wait {
+        const x = self.sync orelse return error.Unsupported;
+        self.makeCurrent();
+        const sync = x.CreateSyncKHR(self.dpy, EGL_SYNC_FENCE_KHR, null);
+        if (sync == null) return error.EglCreateSyncFailed;
+        // Sent to the GPU, so that another context's wait for it ends.
+        self.gl.Flush();
+        return .{ .sync = sync };
+    }
+
+    pub fn destroyFence(self: *const OffscreenContext, w: Wait) void {
+        if (self.sync) |x| _ = x.DestroySyncKHR(self.dpy, w.sync);
+    }
+
+    /// Has what is drawn next wait for `w`: on the GPU if EGL can, or else
+    /// here.
+    fn waitFor(self: *const OffscreenContext, w: Wait) !void {
+        const x = self.sync orelse return error.Unsupported;
+        if (x.WaitSyncKHR) |wait| {
+            if (wait(self.dpy, w.sync, 0) != EGL_FALSE) return;
+        }
+        _ = x.ClientWaitSyncKHR(self.dpy, w.sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER_KHR);
+    }
+
+    /// A sync file signalled once what was drawn so far is done, or -1 if
+    /// EGL cannot make one.
+    fn fenceFd(self: *const OffscreenContext) i32 {
+        const x = self.sync orelse return -1;
+        const dup = x.DupNativeFenceFDANDROID orelse return -1;
+        const attribs = [_]EGLint{ EGL_SYNC_NATIVE_FENCE_FD_ANDROID, EGL_NO_NATIVE_FENCE_FD_ANDROID, EGL_NONE };
+        const sync = x.CreateSyncKHR(self.dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, &attribs);
+        if (sync == null) return -1;
+        defer _ = x.DestroySyncKHR(self.dpy, sync);
+        // The fence has a sync file once it is sent to the GPU.
+        self.gl.Flush();
+        const fd = dup(self.dpy, sync);
+        return if (fd >= 0) fd else -1;
     }
 
     /// Returns true when the active OpenGL context supports SPIR-V shaders
@@ -1388,10 +1502,11 @@ pub const OffscreenContext = struct {
         self.fbo_samples = clamped_samples;
     }
 
-    /// Draws the scene over a clear in the multisampled framebuffer, and
-    /// resolves it into `resolve_color_rb`.
-    fn drawResolved(self: *OffscreenContext, vp: Viewport, clear_color: ?Color, samples: u8, user_ctx: anytype, comptime render_fn: anytype) !void {
+    /// Draws the scene over a clear in the multisampled framebuffer, once
+    /// `wait` (if given) is done, and resolves it into `resolve_color_rb`.
+    fn drawResolved(self: *OffscreenContext, vp: Viewport, clear_color: ?Color, samples: u8, wait: ?Wait, user_ctx: anytype, comptime render_fn: anytype) !void {
         self.makeCurrent();
+        if (wait) |w| try self.waitFor(w);
         self.ensureFbo(vp.width, vp.height, samples);
         self.width = vp.width;
         self.height = vp.height;
@@ -1432,17 +1547,19 @@ pub const OffscreenContext = struct {
     /// exported as a dmabuf (bottom row first) for the 2D renderer to copy
     /// into its frame; null if it cannot be exported (draw it with
     /// `renderToImage`).
-    pub fn renderToDmabuf(self: *OffscreenContext, area: GpuArea, clear_color: ?Color, samples: u8, user_ctx: anytype, comptime render_fn: anytype) !?DmabufImage {
+    pub fn renderToDmabuf(self: *OffscreenContext, area: GpuArea, clear_color: ?Color, samples: u8, wait: ?Wait, user_ctx: anytype, comptime render_fn: anytype) !?DmabufImage {
         if (self.export_failed) return null;
         const vp = area.viewport;
         if (vp.width == 0 or vp.height == 0) return null;
-        try self.drawResolved(vp, clear_color, samples, user_ctx, render_fn);
-        const image = self.exportResolved() orelse {
+        try self.drawResolved(vp, clear_color, samples, wait, user_ctx, render_fn);
+        var image = self.exportResolved() orelse {
             self.export_failed = true;
             return null;
         };
-        // The 2D renderer reads it once the GPU has drawn it.
-        self.gl.Finish();
+        // The 2D renderer reads it once the GPU has drawn it: it waits for
+        // the sync file (on its GPU, if it can), or else it is drawn here.
+        image.ready_fd = self.fenceFd();
+        if (image.ready_fd < 0) self.gl.Finish();
         return image;
     }
 
@@ -1494,12 +1611,15 @@ pub const OffscreenContext = struct {
         self.export_image = null;
     }
 
+    /// Draws the scene over `area`'s viewport into `target` on the CPU,
+    /// within its scissor, once `wait` (if given) is done.
     pub fn renderToImage(
         self: *OffscreenContext,
         target: *software.Image,
         area: GpuArea,
         clear_color: ?Color,
         samples: u8,
+        wait: ?Wait,
         user_ctx: anytype,
         comptime render_fn: anytype,
     ) !void {
@@ -1508,7 +1628,7 @@ pub const OffscreenContext = struct {
         const full: Viewport = .{ .width = target.width, .height = target.height };
         const sc = full.intersect(if (area.scissor) |s| vp.intersect(s) orelse return else vp) orelse return;
 
-        try self.drawResolved(vp, clear_color, samples, user_ctx, render_fn);
+        try self.drawResolved(vp, clear_color, samples, wait, user_ctx, render_fn);
 
         self.gl.BindFramebuffer(GL_FRAMEBUFFER, self.resolve_fbo);
         const local_x: GLint = sc.x - vp.x;
@@ -1756,4 +1876,21 @@ test "OpenGlRenderer.initDefault renders 2D Canvas shapes and images into softwa
     try std.testing.expectEqual(@as(u32, 0xff112233), img.pixels[2 * w + 2]);
     try std.testing.expectEqual(@as(u32, 0xffff0000), img.pixels[25 * w + 30]);
     try std.testing.expectEqual(@as(u32, 0xff00ff00), img.pixels[20 * w + 70]);
+}
+
+test "OpenGlContext gives an exported scene with a sync file signalled once it is drawn" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var ctx = OffscreenContext.init(std.testing.allocator) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const Scene = struct {
+        fn render(_: void, _: *OffscreenContext) !void {}
+    };
+    const area: GpuArea = .{ .viewport = .{ .width = 8, .height = 8 } };
+    const image = (try ctx.renderToDmabuf(area, Color.rgb(0xff0000), 1, null, {}, Scene.render)) orelse return error.SkipZigTest;
+    // Without EGL_ANDROID_native_fence_sync it was drawn before it was given.
+    if (image.ready_fd < 0) return;
+    const linux = std.os.linux;
+    defer _ = linux.close(image.ready_fd);
+    var fds = [1]linux.pollfd{.{ .fd = image.ready_fd, .events = linux.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 1), linux.poll(&fds, 1, 5000));
 }

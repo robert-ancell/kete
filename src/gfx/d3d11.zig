@@ -422,6 +422,7 @@ const iid_dxgi_device = w32.GUID.parse("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
 const iid_dxgi_factory2 = w32.GUID.parse("50c83a1c-e072-4c48-87b0-3630fa36a6d0");
 const iid_swap_chain2 = w32.GUID.parse("a8be2ac4-199f-4946-b331-79599fb98de7");
 const iid_texture2d = w32.GUID.parse("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
+const iid_device_context4 = w32.GUID.parse("917600da-f58c-4c33-98d8-3e15b390fa24");
 
 const SwapChainDesc1 = extern struct {
     Width: u32,
@@ -1145,6 +1146,46 @@ test "a frame drawn only where it changed keeps the rest" {
 
 // --- 3D scenes ---------------------------------------------------------------------
 
+/// GPU work that a scene waits for before it is drawn (as its `wait`).
+pub const Wait = union(enum) {
+    /// Done once `fence`, an `ID3D11Fence` of the scene's device (one shared
+    /// with another device, opened with `ID3D11Device5::OpenSharedFence`,
+    /// say), reaches `value`. It needs Windows 10 1703 or later.
+    fence: struct { fence: Obj, value: u64 },
+    /// Holding `mutex`, the `IDXGIKeyedMutex` of a texture shared with
+    /// another device: acquired with `acquire_key` before the scene is
+    /// drawn, and released with `release_key` after it.
+    keyed_mutex: struct { mutex: Obj, acquire_key: u64, release_key: u64 },
+};
+
+/// `ID3D11DeviceContext4::Wait` (slot 148), and `IDXGIKeyedMutex`'s
+/// `AcquireSync` and `ReleaseSync` (slots 8 and 9).
+const FenceWait = fn (Obj, Obj, u64) callconv(cc) HRESULT;
+const AcquireSync = fn (Obj, u64, u32) callconv(cc) HRESULT;
+const ReleaseSync = fn (Obj, u64) callconv(cc) HRESULT;
+
+/// Has `context` wait for `w` before what it draws next: queued on the GPU
+/// for a fence, or acquired now for a keyed mutex (to be released with
+/// `endWait`).
+fn beginWait(context: Obj, w: Wait) !void {
+    switch (w) {
+        .fence => |f| {
+            const ctx4 = w32.query(context, &iid_device_context4) orelse return error.D3D11FenceUnsupported;
+            defer w32.release(ctx4);
+            if (!w32.succeeded(w32.call(ctx4, 148, FenceWait, .{ f.fence, f.value }))) return error.D3D11WaitFailed;
+        },
+        .keyed_mutex => |k| if (!w32.succeeded(w32.call(k.mutex, 8, AcquireSync, .{ k.acquire_key, 0xffffffff }))) return error.D3D11AcquireSyncFailed,
+    }
+}
+
+/// Lets go of what `beginWait` acquired.
+fn endWait(w: Wait) void {
+    switch (w) {
+        .fence => {},
+        .keyed_mutex => |k| _ = w32.call(k.mutex, 9, ReleaseSync, .{k.release_key}),
+    }
+}
+
 /// Draws 3D scenes with Direct3D 11 (for `D3D11Area`): into a multisampled
 /// colour texture with depth, resolved and copied into the renderer's frame
 /// on the GPU (`renderToFrame`), or into an image on the CPU
@@ -1396,9 +1437,11 @@ pub const OffscreenContext = struct {
     }
 
     /// Draws the scene (`width` by `height`) over `clear_color` into
-    /// `resolve`.
-    fn encodeScene(self: *OffscreenContext, width: u32, height: u32, clear_color: ?canvas_mod.Color, samples: u8, user_ctx: anytype, comptime render_fn: anytype) !void {
+    /// `resolve`, once `wait` (if given) is done.
+    fn encodeScene(self: *OffscreenContext, width: u32, height: u32, clear_color: ?canvas_mod.Color, samples: u8, wait: ?Wait, user_ctx: anytype, comptime render_fn: anytype) !void {
         try self.ensureTargets(width, height, samples);
+        if (wait) |w| try beginWait(self.context, w);
+        defer if (wait) |w| endWait(w);
         self.width = width;
         self.height = height;
         const c = self.context;
@@ -1413,28 +1456,28 @@ pub const OffscreenContext = struct {
     }
 
     /// Draws the scene over `area`'s viewport into `frame` on the GPU,
-    /// within its scissor; false if `frame` is on another GPU (draw with
-    /// `renderToImage`).
-    pub fn renderToFrame(self: *OffscreenContext, frame: *const DirectFrame, area: GpuArea, clear_color: ?canvas_mod.Color, samples: u8, user_ctx: anytype, comptime render_fn: anytype) !bool {
+    /// within its scissor, once `wait` (if given) is done; false if `frame`
+    /// is on another GPU (draw with `renderToImage`).
+    pub fn renderToFrame(self: *OffscreenContext, frame: *const DirectFrame, area: GpuArea, clear_color: ?canvas_mod.Color, samples: u8, wait: ?Wait, user_ctx: anytype, comptime render_fn: anytype) !bool {
         if (frame.device != self.device) return false;
         const vp = area.viewport;
         if (vp.width == 0 or vp.height == 0) return true;
         const full: Viewport = .{ .width = frame.width, .height = frame.height };
         const sc = full.intersect(if (area.scissor) |s| vp.intersect(s) orelse return true else vp) orelse return true;
-        try self.encodeScene(vp.width, vp.height, clear_color, samples, user_ctx, render_fn);
+        try self.encodeScene(vp.width, vp.height, clear_color, samples, wait, user_ctx, render_fn);
         const box = boxOf(.{ .x = sc.x - vp.x, .y = sc.y - vp.y, .width = sc.width, .height = sc.height });
         Context.copySubresourceRegion(self.context, frame.texture, @intCast(sc.x), @intCast(sc.y), self.resolve.?, &box);
         return true;
     }
 
     /// Draws the scene over `area`'s viewport into `target` on the CPU,
-    /// within its scissor.
-    pub fn renderToImage(self: *OffscreenContext, target: *software.Image, area: GpuArea, clear_color: ?canvas_mod.Color, samples: u8, user_ctx: anytype, comptime render_fn: anytype) !void {
+    /// within its scissor, once `wait` (if given) is done.
+    pub fn renderToImage(self: *OffscreenContext, target: *software.Image, area: GpuArea, clear_color: ?canvas_mod.Color, samples: u8, wait: ?Wait, user_ctx: anytype, comptime render_fn: anytype) !void {
         const vp = area.viewport;
         if (vp.width == 0 or vp.height == 0) return;
         const full: Viewport = .{ .width = target.width, .height = target.height };
         const sc = full.intersect(if (area.scissor) |s| vp.intersect(s) orelse return else vp) orelse return;
-        try self.encodeScene(vp.width, vp.height, clear_color, samples, user_ctx, render_fn);
+        try self.encodeScene(vp.width, vp.height, clear_color, samples, wait, user_ctx, render_fn);
         if (self.staging == null or self.staging_w < vp.width or self.staging_h < vp.height) {
             w32.release(self.staging);
             self.staging = null;

@@ -11,6 +11,7 @@
 //!     try ui.renderWith(vk.renderer(), &target, null);
 
 const std = @import("std");
+const builtin = @import("builtin");
 const shaders = @import("shaders.zig");
 const canvas_mod = @import("canvas.zig");
 const atlas_mod = @import("atlas.zig");
@@ -57,6 +58,7 @@ pub const VkDescriptorPool = u64;
 pub const VkDescriptorSet = u64;
 pub const VkSampler = u64;
 pub const VkFence = u64;
+pub const VkSemaphore = u64;
 
 pub const VK_NULL_HANDLE: u64 = 0;
 
@@ -95,6 +97,13 @@ pub const VkStructureType = enum(u32) {
     render_pass_begin_info = 43,
     image_memory_barrier = 45,
     fence_create_info = 8,
+    semaphore_create_info = 9,
+    import_semaphore_fd_info_khr = 1000079000,
+    physical_device_timeline_semaphore_features = 1000207000,
+    semaphore_type_create_info = 1000207002,
+    timeline_semaphore_submit_info = 1000207003,
+    semaphore_wait_info = 1000207004,
+    semaphore_signal_info = 1000207005,
     external_memory_image_create_info = 1000072001,
     import_memory_fd_info_khr = 1000074000,
     memory_fd_properties_khr = 1000074001,
@@ -478,6 +487,7 @@ pub const VulkanRenderer = struct {
             .vk = ctx.vk,
             .queue = ctx.queue,
             .queue_family = ctx.queue_family,
+            .timelines = ctx.timelines != null,
         };
     }
 
@@ -650,6 +660,7 @@ pub const VK_SHADER_STAGE_FRAGMENT_BIT: VkFlags = 0x00000010;
 pub const VK_SHADER_STAGE_ALL_GRAPHICS: VkFlags = 0x0000001F;
 
 pub const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: VkFlags = 0x00000001;
+pub const VK_PIPELINE_STAGE_ALL_COMMANDS_BIT: VkFlags = 0x00010000;
 pub const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: VkFlags = 0x00002000;
 pub const VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT: VkFlags = 0x00000080;
 pub const VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: VkFlags = 0x00000400;
@@ -698,6 +709,184 @@ const dmabuf_extensions = [_][*:0]const u8{
     "VK_EXT_external_memory_dma_buf",
     "VK_KHR_image_format_list",
     "VK_EXT_image_drm_format_modifier",
+};
+
+/// Device extensions for waiting on GPU work done elsewhere: on timeline
+/// semaphores (`Wait`), and on sync files another API signals when it has
+/// drawn a picture (`DmabufImage.ready_fd`). Each is turned on when the
+/// device has it.
+const timeline_extension: [*:0]const u8 = "VK_KHR_timeline_semaphore";
+const sync_fd_extension: [*:0]const u8 = "VK_KHR_external_semaphore_fd";
+const VK_SEMAPHORE_TYPE_TIMELINE: u32 = 1;
+const VK_SEMAPHORE_IMPORT_TEMPORARY_BIT: VkFlags = 0x00000001;
+const VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT: u32 = 0x00000010;
+
+const VkSemaphoreCreateInfo = extern struct {
+    sType: VkStructureType = .semaphore_create_info,
+    pNext: ?*const anyopaque = null,
+    flags: VkFlags = 0,
+};
+
+const VkSemaphoreTypeCreateInfo = extern struct {
+    sType: VkStructureType = .semaphore_type_create_info,
+    pNext: ?*const anyopaque = null,
+    semaphoreType: u32 = VK_SEMAPHORE_TYPE_TIMELINE,
+    initialValue: u64 = 0,
+};
+
+const VkTimelineSemaphoreSubmitInfo = extern struct {
+    sType: VkStructureType = .timeline_semaphore_submit_info,
+    pNext: ?*const anyopaque = null,
+    waitSemaphoreValueCount: u32 = 0,
+    pWaitSemaphoreValues: ?[*]const u64 = null,
+    signalSemaphoreValueCount: u32 = 0,
+    pSignalSemaphoreValues: ?[*]const u64 = null,
+};
+
+const VkSemaphoreWaitInfo = extern struct {
+    sType: VkStructureType = .semaphore_wait_info,
+    pNext: ?*const anyopaque = null,
+    flags: VkFlags = 0,
+    semaphoreCount: u32 = 1,
+    pSemaphores: [*]const VkSemaphore,
+    pValues: [*]const u64,
+};
+
+const VkSemaphoreSignalInfo = extern struct {
+    sType: VkStructureType = .semaphore_signal_info,
+    pNext: ?*const anyopaque = null,
+    semaphore: VkSemaphore,
+    value: u64,
+};
+
+const VkPhysicalDeviceTimelineSemaphoreFeatures = extern struct {
+    sType: VkStructureType = .physical_device_timeline_semaphore_features,
+    pNext: ?*anyopaque = null,
+    timelineSemaphore: VkBool32 = VK_TRUE,
+};
+
+const VkImportSemaphoreFdInfoKHR = extern struct {
+    sType: VkStructureType = .import_semaphore_fd_info_khr,
+    pNext: ?*const anyopaque = null,
+    semaphore: VkSemaphore,
+    flags: VkFlags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+    handleType: u32 = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+    fd: c_int,
+};
+
+/// GPU work that a scene waits for before it is drawn (as its `wait`): done
+/// once `semaphore`, a timeline semaphore on the scene's device
+/// (`OffscreenContext.createTimeline`), reaches `value`.
+pub const Wait = struct {
+    semaphore: VkSemaphore,
+    value: u64,
+};
+
+/// What making, signalling and waiting on timeline semaphores needs
+/// (`VK_KHR_timeline_semaphore`).
+const TimelineProcs = struct {
+    CreateSemaphore: *const fn (VkDevice, *const VkSemaphoreCreateInfo, ?*const anyopaque, *VkSemaphore) callconv(.c) VkResult,
+    DestroySemaphore: *const fn (VkDevice, VkSemaphore, ?*const anyopaque) callconv(.c) void,
+    SignalSemaphoreKHR: *const fn (VkDevice, *const VkSemaphoreSignalInfo) callconv(.c) VkResult,
+    WaitSemaphoresKHR: *const fn (VkDevice, *const VkSemaphoreWaitInfo, u64) callconv(.c) VkResult,
+};
+
+/// What waiting on a sync file needs (`VK_KHR_external_semaphore_fd`).
+const SyncFdProcs = struct {
+    CreateSemaphore: *const fn (VkDevice, *const VkSemaphoreCreateInfo, ?*const anyopaque, *VkSemaphore) callconv(.c) VkResult,
+    DestroySemaphore: *const fn (VkDevice, VkSemaphore, ?*const anyopaque) callconv(.c) void,
+    ImportSemaphoreFdKHR: *const fn (VkDevice, *const VkImportSemaphoreFdInfoKHR) callconv(.c) VkResult,
+};
+
+/// The procs of `T` (its fields named as Vulkan's, without `vk`), or null
+/// if the device lacks any of them.
+fn loadProcs(comptime T: type, device: VkDevice, get_proc: GetDeviceProcAddr) ?T {
+    var p: T = undefined;
+    inline for (@typeInfo(T).@"struct".field_names) |field_name| {
+        const sym = get_proc(device, "vk" ++ field_name) orelse return null;
+        @field(p, field_name) = @ptrCast(@alignCast(sym));
+    }
+    return p;
+}
+
+/// The semaphores a submission waits on: the values of those that are
+/// timelines (ignored for the others), and whether each is the
+/// submitter's to destroy once the submission is done (a sync file's).
+const SubmitWaits = struct {
+    const max = 8;
+    semaphores: [max]VkSemaphore = undefined,
+    values: [max]u64 = undefined,
+    stages: [max]VkFlags = undefined,
+    owned: [max]bool = undefined,
+    len: u32 = 0,
+    timeline: VkTimelineSemaphoreSubmitInfo = .{},
+
+    /// False if there are as many as it holds.
+    fn add(w: *SubmitWaits, semaphore: VkSemaphore, value: u64, owned: bool) bool {
+        if (w.len == max) return false;
+        w.semaphores[w.len] = semaphore;
+        w.values[w.len] = value;
+        w.stages[w.len] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        w.owned[w.len] = owned;
+        w.len += 1;
+        return true;
+    }
+
+    /// Makes `info` wait on them. It points into `w`, which must stay put
+    /// until `info` is submitted.
+    fn apply(w: *SubmitWaits, info: *VkSubmitInfo) void {
+        if (w.len == 0) return;
+        w.timeline = .{ .waitSemaphoreValueCount = w.len, .pWaitSemaphoreValues = &w.values };
+        info.pNext = &w.timeline;
+        info.waitSemaphoreCount = w.len;
+        info.pWaitSemaphores = &w.semaphores;
+        info.pWaitDstStageMask = &w.stages[0];
+    }
+
+    /// Forgets them, destroying those that are its own.
+    fn clear(w: *SubmitWaits, device: VkDevice, destroy: ?*const fn (VkDevice, VkSemaphore, ?*const anyopaque) callconv(.c) void) void {
+        for (w.semaphores[0..w.len], w.owned[0..w.len]) |sem, owned| {
+            if (owned) if (destroy) |d| d(device, sem, null);
+        }
+        w.len = 0;
+    }
+};
+
+/// The device extensions to turn on: those required, and those for waits
+/// (`timeline_extension`, `sync_fd_extension`) if the device has them.
+const DeviceExtensions = struct {
+    names: [12][*:0]const u8 = undefined,
+    len: u32 = 0,
+    timelines: bool = false,
+    sync_fd: bool = false,
+    timeline_features: VkPhysicalDeviceTimelineSemaphoreFeatures = .{},
+
+    fn init(procs: InstanceProcs, phys: VkPhysicalDevice, required: []const [*:0]const u8) DeviceExtensions {
+        var x: DeviceExtensions = .{};
+        for (required) |name| x.append(name);
+        // A device with the extension has the feature (the Vulkan spec's
+        // feature requirements), so it need not be asked.
+        x.timelines = Owned2DContext.hasExtensions(procs, phys, &.{timeline_extension});
+        if (x.timelines) x.append(timeline_extension);
+        x.sync_fd = Owned2DContext.hasExtensions(procs, phys, &.{sync_fd_extension});
+        if (x.sync_fd) x.append(sync_fd_extension);
+        return x;
+    }
+
+    fn append(x: *DeviceExtensions, name: [*:0]const u8) void {
+        x.names[x.len] = name;
+        x.len += 1;
+    }
+
+    /// The device to make, with one queue (`q_info`). It points into `x`.
+    fn createInfo(x: *const DeviceExtensions, q_info: [*]const VkDeviceQueueCreateInfo) VkDeviceCreateInfo {
+        return .{
+            .pNext = if (x.timelines) &x.timeline_features else null,
+            .pQueueCreateInfos = q_info,
+            .enabledExtensionCount = x.len,
+            .ppEnabledExtensionNames = if (x.len > 0) &x.names else null,
+        };
+    }
 };
 
 const VkExtensionProperties = extern struct {
@@ -1463,6 +1652,12 @@ const Owned2DContext = struct {
     import_clock: u64 = 0,
     /// Pictures drawn on other APIs (OpenGL), imported to copy in.
     sources: [max_imports]?SourceImport = @splat(null),
+    /// Waiting on GPU work done elsewhere, if the device can: on timeline
+    /// semaphores (`DirectFrame.wait`), and on sync files (a picture's
+    /// `ready_fd`); and what the frame being drawn waits on.
+    timelines: ?TimelineProcs = null,
+    sync_fd: ?SyncFdProcs = null,
+    frame_waits: SubmitWaits = .{},
     retired_sources: std.ArrayList(RetiredSource) = .empty,
     /// Drawing a window's frame (`drawFrame`): the shader, pipelines that
     /// round its corners (`mask`) and put its shadow under it (`under`),
@@ -1590,12 +1785,15 @@ const Owned2DContext = struct {
         // With dmabuf import if it can, to draw straight into window buffers.
         var with_dmabuf = hasExtensions(inst_procs, phys_dev, &dmabuf_extensions);
         var device: VkDevice = undefined;
+        var extensions: DeviceExtensions = undefined;
         if (with_dmabuf) {
-            const dev_info: VkDeviceCreateInfo = .{ .pQueueCreateInfos = &q_info, .enabledExtensionCount = dmabuf_extensions.len, .ppEnabledExtensionNames = &dmabuf_extensions };
+            extensions = .init(inst_procs, phys_dev, &dmabuf_extensions);
+            const dev_info = extensions.createInfo(&q_info);
             if (inst_procs.CreateDevice(phys_dev, &dev_info, null, &device) != .success) with_dmabuf = false;
         }
         if (!with_dmabuf) {
-            const dev_info: VkDeviceCreateInfo = .{ .pQueueCreateInfos = &q_info };
+            extensions = .init(inst_procs, phys_dev, &.{});
+            const dev_info = extensions.createInfo(&q_info);
             if (inst_procs.CreateDevice(phys_dev, &dev_info, null, &device) != .success) return error.VkCreateDeviceFailed;
         }
 
@@ -1618,6 +1816,8 @@ const Owned2DContext = struct {
             .queue_family = chosen_qfam,
         };
         errdefer self.destroy();
+        if (extensions.timelines) self.timelines = loadProcs(TimelineProcs, device, inst_procs.GetDeviceProcAddr);
+        if (extensions.sync_fd) self.sync_fd = loadProcs(SyncFdProcs, device, inst_procs.GetDeviceProcAddr);
         if (with_dmabuf) self.initDirect(inst_procs.GetDeviceProcAddr);
 
         const pool_info: VkCommandPoolCreateInfo = .{ .queueFamilyIndex = chosen_qfam };
@@ -1795,6 +1995,7 @@ const Owned2DContext = struct {
             self.vk.FreeMemory(self.device, src.mem, null);
         }
         self.retired_sources.deinit(self.gpa);
+        self.clearFrameWaits();
         if (self.dmabuf) |d| if (self.fence != VK_NULL_HANDLE) d.DestroyFence(self.device, self.fence, null);
         self.destroyFrame();
         if (self.direct_pass != VK_NULL_HANDLE) self.vk.DestroyRenderPass(self.device, self.direct_pass, null);
@@ -2396,11 +2597,14 @@ const Owned2DContext = struct {
         self.vk.CmdPipelineBarrier(self.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, null, 0, null, 1, &release);
         if (self.vk.EndCommandBuffer(self.cmd) != .success) return error.VkEndCommandBufferFailed;
         const cmds = [1]VkCommandBuffer{self.cmd};
-        const submits = [1]VkSubmitInfo{.{ .pCommandBuffers = &cmds }};
+        // After the GPU work the frame's draws wait for (`DirectFrame.wait`).
+        var submits = [1]VkSubmitInfo{.{ .pCommandBuffers = &cmds }};
+        self.frame_waits.apply(&submits[0]);
         if (self.vk.QueueSubmit(self.queue, 1, &submits, self.fence) != .success) return error.VkQueueSubmitFailed;
         const fences = [1]VkFence{self.fence};
         const waited = d.WaitForFences(self.device, 1, &fences, 1, std.time.ns_per_s);
         _ = d.ResetFences(self.device, 1, &fences);
+        self.clearFrameWaits();
         for (self.retired_sources.items) |src| {
             self.vk.DestroyImage(self.device, src.img, null);
             self.vk.FreeMemory(self.device, src.mem, null);
@@ -2418,6 +2622,8 @@ const Owned2DContext = struct {
         if (t.frame != null and self.frame_map.len == 0) return error.Unsupported;
         const im = try self.importTarget(t);
         const origin: [2]i32 = .{ @intCast(t.origin[0]), @intCast(t.origin[1]) };
+        // Waits of a frame that failed before it was submitted.
+        self.clearFrameWaits();
         try self.beginDirect(im, t);
         if (clear_rects.len > 0) {
             const color: [4]f32 = .{
@@ -2454,7 +2660,7 @@ const Owned2DContext = struct {
                     // Recorded into this frame (outside the render pass), on
                     // this device: no copy through the CPU.
                     self.vk.CmdEndRenderPass(self.cmd);
-                    const frame: DirectFrame = .{ .device = self.device, .cmd = self.cmd, .image = im.img, .origin = origin, .width = t.content[0], .height = t.content[1], .copy_ctx = self, .copy_dmabuf = copyDmabuf };
+                    const frame: DirectFrame = .{ .device = self.device, .cmd = self.cmd, .image = im.img, .origin = origin, .width = t.content[0], .height = t.content[1], .copy_ctx = self, .copy_dmabuf = copyDmabuf, .wait = frameWait };
                     const drawn = try direct(g.ctx, .vulkan, &frame, g.area);
                     self.beginDirectPass(im, t);
                     if (drawn) continue;
@@ -2549,6 +2755,7 @@ const Owned2DContext = struct {
     /// format, and turning it the right way up).
     fn copyDmabuf(ctx: *anyopaque, frame: *const DirectFrame, src: *const DmabufImage, area: GpuArea) anyerror!bool {
         const self: *Owned2DContext = @ptrCast(@alignCast(ctx));
+        if (src.ready_fd >= 0) self.waitSyncFile(src.ready_fd);
         const s = self.importSource(src) catch return false;
         const vp = area.viewport;
         const clipped = if (area.scissor) |c| vp.intersect(c) orelse return true else vp;
@@ -2584,6 +2791,37 @@ const Owned2DContext = struct {
         };
         self.vk.CmdPipelineBarrier(frame.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, null, 0, null, 2, &after);
         return true;
+    }
+
+    /// `DirectFrame.wait`: the frame's submission waits for `w`; false if
+    /// it cannot (the device has no timeline semaphores, or the frame
+    /// waits on as many as it can).
+    fn frameWait(ctx: *anyopaque, w: Wait) bool {
+        const self: *Owned2DContext = @ptrCast(@alignCast(ctx));
+        if (self.timelines == null) return false;
+        return self.frame_waits.add(w.semaphore, w.value, false);
+    }
+
+    /// Takes `fd`, a sync file signalled when a picture another API drew
+    /// is done, and has the frame's submission wait for it on the GPU; or,
+    /// if it cannot, waits for it here.
+    fn waitSyncFile(self: *Owned2DContext, fd: i32) void {
+        if (self.sync_fd) |x| import: {
+            var sem: VkSemaphore = VK_NULL_HANDLE;
+            if (x.CreateSemaphore(self.device, &.{}, null, &sem) != .success) break :import;
+            // Imported, the semaphore has the fd.
+            if (x.ImportSemaphoreFdKHR(self.device, &.{ .semaphore = sem, .fd = fd }) != .success or !self.frame_waits.add(sem, 0, true)) {
+                x.DestroySemaphore(self.device, sem, null);
+                break :import;
+            }
+            return;
+        }
+        waitFd(fd);
+    }
+
+    /// Forgets what the frame waits on, destroying the semaphores of sync files.
+    fn clearFrameWaits(self: *Owned2DContext) void {
+        self.frame_waits.clear(self.device, if (self.sync_fd) |x| x.DestroySemaphore else null);
     }
 
     /// Makes what the window's frame is drawn with (`drawFrame`): its
@@ -2844,6 +3082,8 @@ pub const SharedDevice = struct {
     vk: ContextProcs,
     queue: VkQueue,
     queue_family: u32,
+    /// Whether the device has timeline semaphores turned on.
+    timelines: bool = false,
 };
 
 /// A frame being drawn straight into a window buffer on the 2D renderer's
@@ -2862,7 +3102,23 @@ pub const DirectFrame = struct {
     /// it cannot be imported.
     copy_ctx: *anyopaque,
     copy_dmabuf: *const fn (ctx: *anyopaque, frame: *const DirectFrame, src: *const DmabufImage, area: GpuArea) anyerror!bool,
+    /// Has the frame's submission wait for `w` (on its device) before what
+    /// is drawn into it runs, with `copy_ctx`; false if it cannot (wait for
+    /// it on the CPU then).
+    wait: *const fn (ctx: *anyopaque, w: Wait) bool,
 };
+
+/// Waits until a sync file is signalled, and closes it.
+fn waitFd(fd: i32) void {
+    if (builtin.os.tag != .linux) return;
+    const linux = std.os.linux;
+    var fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    while (true) {
+        const rc = linux.poll(&fds, 1, -1);
+        if (linux.errno(rc) != .INTR) break;
+    }
+    _ = linux.close(fd);
+}
 
 /// The Vulkan format of a DRM fourcc a picture can come in.
 fn fourccFormat(fourcc: u32) ?u32 {
@@ -2962,6 +3218,8 @@ pub const OffscreenContext = struct {
     readback_map: []u32 = &.{},
     /// It is on another's device (`initShared`), which it does not destroy.
     shared: bool = false,
+    /// Making and waiting on timeline semaphores, if the device can.
+    timelines: ?TimelineProcs = null,
 
     pub fn init(gpa: std.mem.Allocator) !OffscreenContext {
         var vk_lib = std.DynLib.open("libvulkan.so.1") catch try std.DynLib.open("libvulkan.so");
@@ -3013,7 +3271,9 @@ pub const OffscreenContext = struct {
             .queueFamilyIndex = chosen_qfam,
             .pQueuePriorities = &prio,
         }};
-        const dev_info: VkDeviceCreateInfo = .{ .pQueueCreateInfos = &q_info };
+        // With timeline semaphores if it has them, to wait for work of the app's.
+        const extensions: DeviceExtensions = .init(inst_procs, phys_dev, &.{});
+        const dev_info = extensions.createInfo(&q_info);
         var device: VkDevice = undefined;
         if (inst_procs.CreateDevice(phys_dev, &dev_info, null, &device) != .success) return error.VkCreateDeviceFailed;
 
@@ -3031,6 +3291,7 @@ pub const OffscreenContext = struct {
             .device = device,
             .vk = vk,
             .queue = queue,
+            .timelines = if (extensions.timelines) loadProcs(TimelineProcs, device, inst_procs.GetDeviceProcAddr) else null,
         };
         errdefer self.deinit();
         try self.initObjects(chosen_qfam);
@@ -3052,6 +3313,7 @@ pub const OffscreenContext = struct {
             .vk = dev.vk,
             .queue = dev.queue,
             .shared = true,
+            .timelines = if (dev.timelines) loadProcs(TimelineProcs, dev.device, dev.inst_procs.GetDeviceProcAddr) else null,
         };
         errdefer self.deinit();
         try self.initObjects(dev.queue_family);
@@ -3221,6 +3483,41 @@ pub const OffscreenContext = struct {
         self.vk.DestroyDevice(self.device, null);
         self.inst_procs.DestroyInstance(self.instance, null);
         self.vk_lib.close();
+    }
+
+    /// Whether it can make timeline semaphores (`createTimeline`), for
+    /// scenes to wait for GPU work done elsewhere (`Wait`).
+    pub fn supportsTimelines(self: *const OffscreenContext) bool {
+        return self.timelines != null;
+    }
+
+    /// Makes a timeline semaphore on its device starting at `initial_value`,
+    /// for work on the GPU to signal and scenes to wait for (`Wait`).
+    pub fn createTimeline(self: *const OffscreenContext, initial_value: u64) !VkSemaphore {
+        const t = self.timelines orelse return error.Unsupported;
+        const type_info: VkSemaphoreTypeCreateInfo = .{ .initialValue = initial_value };
+        var sem: VkSemaphore = VK_NULL_HANDLE;
+        if (t.CreateSemaphore(self.device, &.{ .pNext = &type_info }, null, &sem) != .success) return error.VkCreateSemaphoreFailed;
+        return sem;
+    }
+
+    pub fn destroyTimeline(self: *const OffscreenContext, semaphore: VkSemaphore) void {
+        if (self.timelines) |t| t.DestroySemaphore(self.device, semaphore, null);
+    }
+
+    /// Sets `semaphore` to `value` from the CPU. (Work on the GPU signals it
+    /// in its submission instead.)
+    pub fn signalTimeline(self: *const OffscreenContext, semaphore: VkSemaphore, value: u64) !void {
+        const t = self.timelines orelse return error.Unsupported;
+        if (t.SignalSemaphoreKHR(self.device, &.{ .semaphore = semaphore, .value = value }) != .success) return error.VkSignalSemaphoreFailed;
+    }
+
+    /// Waits on the CPU until `w` is done.
+    pub fn waitTimeline(self: *const OffscreenContext, w: Wait) !void {
+        const t = self.timelines orelse return error.Unsupported;
+        const sems = [1]VkSemaphore{w.semaphore};
+        const values = [1]u64{w.value};
+        if (t.WaitSemaphoresKHR(self.device, &.{ .pSemaphores = &sems, .pValues = &values }, std.math.maxInt(u64)) != .success) return error.VkWaitSemaphoresFailed;
     }
 
     pub fn aspect(self: *const OffscreenContext) f32 {
@@ -3572,12 +3869,15 @@ pub const OffscreenContext = struct {
         self.fb_sample_idx = s_idx;
     }
 
+    /// Draws the scene over `area`'s viewport into `target` on the CPU,
+    /// within its scissor, once `wait` (if given) is done.
     pub fn renderToImage(
         self: *OffscreenContext,
         target: *software.Image,
         area: GpuArea,
         clear_color: ?Color,
         samples: u8,
+        wait: ?Wait,
         user_ctx: anytype,
         comptime render_fn: anytype,
     ) !void {
@@ -3585,6 +3885,11 @@ pub const OffscreenContext = struct {
         if (vp.width == 0 or vp.height == 0) return;
         const full: Viewport = .{ .width = target.width, .height = target.height };
         const sc = full.intersect(if (area.scissor) |s| vp.intersect(s) orelse return else vp) orelse return;
+        var waits: SubmitWaits = .{};
+        if (wait) |w| {
+            if (self.timelines == null) return error.Unsupported;
+            _ = waits.add(w.semaphore, w.value, false);
+        }
 
         try self.ensureTargets(vp.width, vp.height, samples);
         self.width = vp.width;
@@ -3653,7 +3958,8 @@ pub const OffscreenContext = struct {
         if (self.vk.EndCommandBuffer(self.cmd) != .success) return error.VkEndCommandBufferFailed;
 
         const cmds = [1]VkCommandBuffer{self.cmd};
-        const submits = [1]VkSubmitInfo{.{ .pCommandBuffers = &cmds }};
+        var submits = [1]VkSubmitInfo{.{ .pCommandBuffers = &cmds }};
+        waits.apply(&submits[0]);
         if (self.vk.QueueSubmit(self.queue, 1, &submits, VK_NULL_HANDLE) != .success) return error.VkQueueSubmitFailed;
         _ = self.vk.QueueWaitIdle(self.queue);
 
@@ -3678,10 +3984,13 @@ pub const OffscreenContext = struct {
         area: GpuArea,
         clear_color: ?Color,
         samples: u8,
+        wait: ?Wait,
         user_ctx: anytype,
         comptime render_fn: anytype,
     ) !bool {
         if (frame.device != self.device) return false;
+        // The frame's submission waits for it, or else the CPU does.
+        if (wait) |w| if (!frame.wait(frame.copy_ctx, w)) try self.waitTimeline(w);
         const vp = area.viewport;
         if (vp.width == 0 or vp.height == 0) return true;
         const clipped = if (area.scissor) |s| vp.intersect(s) orelse return true else vp;

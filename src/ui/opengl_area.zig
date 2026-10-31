@@ -44,44 +44,65 @@ pub fn OpenGlArea(comptime Scene: type) type {
         key: ?u64 = null,
         /// A widget drawn over the area.
         child: ?Widget = null,
+        /// A context of the app's to draw the scene with, instead of one the
+        /// area makes and owns: so that the scene can use what the app made
+        /// on it (its textures and buffers, say). It must outlive the area.
+        context: ?*gfx.OpenGlContext = null,
+        /// GPU work of the app's done elsewhere (on another thread, say) that
+        /// the scene waits for before it is drawn: drawing a picture it
+        /// shows, say. A new picture is a new `wait`, which draws the scene
+        /// again.
+        wait: ?gfx.opengl.Wait = null,
 
         pub const State = struct {
             gpa: ?std.mem.Allocator = null,
-            gl_ctx: ?gfx.OpenGlContext = null,
+            /// The context drawn with: the app's (`context`), or its own.
+            app_ctx: ?*gfx.OpenGlContext = null,
+            own_ctx: ?gfx.OpenGlContext = null,
+            /// The app's context it was made for (null for its own).
+            made_for: ?*gfx.OpenGlContext = null,
             scene_state: if (HasState) ?Scene.State else void = if (HasState) null else {},
             init_failed: bool = false,
             dragging: bool = false,
             last_pos: Point = .{ 0, 0 },
 
             pub fn supportsSpirv(st: *const State) bool {
-                return if (st.gl_ctx) |*ctx| ctx.supportsSpirv() else false;
+                const c = st.app_ctx orelse if (st.own_ctx) |*own| own else return false;
+                return c.supportsSpirv();
+            }
+
+            fn ctx(st: *State) ?*gfx.OpenGlContext {
+                if (st.app_ctx) |c| return c;
+                return if (st.own_ctx) |*c| c else null;
             }
 
             pub fn deinit(st: *State) void {
-                if (st.gl_ctx) |*ctx| {
-                    ctx.makeCurrent();
-                    if (HasState) {
-                        if (st.scene_state) |*ss| {
-                            if (@hasDecl(Scene.State, "deinit")) {
-                                const params = @typeInfo(@TypeOf(Scene.State.deinit)).@"fn".param_types;
-                                if (params.len == 3) {
-                                    ss.deinit(ctx, st.gpa.?);
-                                } else if (params.len == 2) {
-                                    ss.deinit(ctx);
-                                } else {
-                                    ss.deinit();
-                                }
+                const c = st.ctx() orelse return;
+                c.makeCurrent();
+                if (HasState) {
+                    if (st.scene_state) |*ss| {
+                        if (@hasDecl(Scene.State, "deinit")) {
+                            const params = @typeInfo(@TypeOf(Scene.State.deinit)).@"fn".param_types;
+                            if (params.len == 3) {
+                                ss.deinit(c, st.gpa.?);
+                            } else if (params.len == 2) {
+                                ss.deinit(c);
+                            } else {
+                                ss.deinit();
                             }
                         }
                     }
-                    ctx.deinit();
-                    st.gl_ctx = null;
                 }
+                if (st.own_ctx) |*own| own.deinit();
+                st.own_ctx = null;
+                st.app_ctx = null;
+                if (HasState) st.scene_state = null;
             }
         };
 
         const DrawPayload = struct {
             gl_ctx: *gfx.OpenGlContext,
+            wait: ?gfx.opengl.Wait,
             scene: Scene,
             scene_state: if (HasState) *Scene.State else void,
             clear_color: gfx.Color,
@@ -140,38 +161,49 @@ pub fn OpenGlArea(comptime Scene: type) type {
             const t = n.theme();
             const bg = self.clear_color orelse t.surface_container;
 
-            if (!st.init_failed and st.gl_ctx == null) {
+            // Given another context of the app's (or none): what the scene
+            // made on the last one goes, and it is made again on this.
+            if (self.context != st.made_for) {
+                st.deinit();
+                st.init_failed = false;
+                st.made_for = self.context;
+            }
+            if (!st.init_failed and st.ctx() == null) {
                 st.gpa = n.ui.gpa;
-                if (gfx.OpenGlContext.init(n.ui.gpa)) |ctx| {
-                    st.gl_ctx = ctx;
-                    if (HasState) {
-                        const params = @typeInfo(@TypeOf(Scene.State.init)).@"fn".param_types;
-                        const init_res = if (params.len == 2)
-                            Scene.State.init(&st.gl_ctx.?, n.ui.gpa)
-                        else
-                            Scene.State.init(&st.gl_ctx.?);
-                        if (init_res) |ss| {
-                            st.scene_state = ss;
-                        } else |_| {
-                            st.gl_ctx.?.deinit();
-                            st.gl_ctx = null;
-                            st.init_failed = true;
-                        }
-                    }
+                if (self.context) |app| {
+                    st.app_ctx = app;
+                } else if (gfx.OpenGlContext.init(n.ui.gpa)) |c| {
+                    st.own_ctx = c;
                 } else |_| {
                     st.init_failed = true;
                 }
+                if (HasState) if (st.ctx()) |c| {
+                    const params = @typeInfo(@TypeOf(Scene.State.init)).@"fn".param_types;
+                    const init_res = if (params.len == 2)
+                        Scene.State.init(c, n.ui.gpa)
+                    else
+                        Scene.State.init(c);
+                    if (init_res) |ss| {
+                        st.scene_state = ss;
+                    } else |_| {
+                        if (st.own_ctx) |*own| own.deinit();
+                        st.own_ctx = null;
+                        st.app_ctx = null;
+                        st.init_failed = true;
+                    }
+                };
             }
 
-            if (st.gl_ctx == null) {
+            const ctx = st.ctx() orelse {
                 const c = p.canvas();
                 c.fillRect(.{ .x = 0, .y = 0, .w = n.size.w, .h = n.size.h }, bg);
                 return;
-            }
+            };
 
             const payload = n.ui.arena().create(DrawPayload) catch return;
             payload.* = .{
-                .gl_ctx = &st.gl_ctx.?,
+                .gl_ctx = ctx,
+                .wait = self.wait,
                 .scene = self.scene,
                 .scene_state = if (HasState) &st.scene_state.? else {},
                 .clear_color = bg,
@@ -183,6 +215,7 @@ pub fn OpenGlArea(comptime Scene: type) type {
                 hasher.update(std.mem.asBytes(&self.scene));
                 hasher.update(std.mem.asBytes(&bg));
                 hasher.update(&.{self.samples});
+                std.hash.autoHashStrat(&hasher, self.wait, .Shallow);
                 break :blk hasher.final();
             };
 
@@ -197,12 +230,12 @@ pub fn OpenGlArea(comptime Scene: type) type {
         fn drawDirect(payload: *const DrawPayload, backend: gfx.RenderBackend, frame: *const anyopaque, area: gfx.GpuArea) anyerror!bool {
             if (backend != .vulkan) return false;
             const f: *const gfx.vulkan.DirectFrame = @ptrCast(@alignCast(frame));
-            const picture = (try payload.gl_ctx.renderToDmabuf(area, payload.clear_color, payload.samples, payload, renderScene)) orelse return false;
+            const picture = (try payload.gl_ctx.renderToDmabuf(area, payload.clear_color, payload.samples, payload.wait, payload, renderScene)) orelse return false;
             return f.copy_dmabuf(f.copy_ctx, f, &picture, area);
         }
 
         fn drawGpu(payload: *const DrawPayload, target: *gfx.software.Image, area: gfx.GpuArea) anyerror!void {
-            try payload.gl_ctx.renderToImage(target, area, payload.clear_color, payload.samples, payload, renderScene);
+            try payload.gl_ctx.renderToImage(target, area, payload.clear_color, payload.samples, payload.wait, payload, renderScene);
         }
 
         fn renderScene(payload: *const DrawPayload, ctx: *gfx.OpenGlContext) anyerror!void {

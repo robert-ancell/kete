@@ -652,6 +652,14 @@ pub const DirectFrame = struct {
 ///     ctx.bindVertexBuffer(s.vbo);
 ///     ctx.bindIndexBuffer16(s.ibo);
 ///     ctx.drawIndexed(36);
+/// GPU work that a scene waits for before it is drawn (as its `wait`): done
+/// once `event`, an `MTLEvent` or `MTLSharedEvent` of the scene's device
+/// (signalled by a command buffer of the app's, say), reaches `value`.
+pub const Wait = struct {
+    event: Id,
+    value: u64,
+};
+
 pub const OffscreenContext = struct {
     gpa: std.mem.Allocator,
     device: Id,
@@ -935,9 +943,10 @@ pub const OffscreenContext = struct {
     }
 
     /// Encodes into `cmd` the scene drawn over `clear_color`, resolved
-    /// into `resolve` (`width` by `height`).
-    fn encodeScene(self: *OffscreenContext, cmd: Id, width: u32, height: u32, clear_color: ?Color, samples: u8, user_ctx: anytype, comptime render_fn: anytype) !void {
+    /// into `resolve` (`width` by `height`), once `wait` (if given) is done.
+    fn encodeScene(self: *OffscreenContext, cmd: Id, width: u32, height: u32, clear_color: ?Color, samples: u8, wait: ?Wait, user_ctx: anytype, comptime render_fn: anytype) !void {
         try self.ensureTargets(width, height, samples);
+        if (wait) |w| msg(void, cmd, "encodeWaitForEvent:value:", .{ w.event, w.value });
         self.width = width;
         self.height = height;
         const pass = msg(Id, objc.class("MTLRenderPassDescriptor"), "renderPassDescriptor", .{});
@@ -971,15 +980,15 @@ pub const OffscreenContext = struct {
     }
 
     /// Draws the scene over `area`'s viewport into `frame` on the GPU,
-    /// within its scissor; false if `frame` is on another GPU (draw with
-    /// `renderToImage`).
-    pub fn renderToFrame(self: *OffscreenContext, frame: *const DirectFrame, area: GpuArea, clear_color: ?Color, samples: u8, user_ctx: anytype, comptime render_fn: anytype) !bool {
+    /// within its scissor, once `wait` (if given) is done; false if `frame`
+    /// is on another GPU (draw with `renderToImage`).
+    pub fn renderToFrame(self: *OffscreenContext, frame: *const DirectFrame, area: GpuArea, clear_color: ?Color, samples: u8, wait: ?Wait, user_ctx: anytype, comptime render_fn: anytype) !bool {
         if (frame.device != self.device) return false;
         const vp = area.viewport;
         if (vp.width == 0 or vp.height == 0) return true;
         const full: Viewport = .{ .width = frame.width, .height = frame.height };
         const sc = full.intersect(if (area.scissor) |s| vp.intersect(s) orelse return true else vp) orelse return true;
-        try self.encodeScene(frame.cmd, vp.width, vp.height, clear_color, samples, user_ctx, render_fn);
+        try self.encodeScene(frame.cmd, vp.width, vp.height, clear_color, samples, wait, user_ctx, render_fn);
         const blit = msg(Id, frame.cmd, "blitCommandEncoder", .{});
         msg(void, blit, "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:", .{
             self.resolve.tex,                                                 @as(u64, 0),                                    @as(u64, 0),
@@ -991,8 +1000,8 @@ pub const OffscreenContext = struct {
     }
 
     /// Draws the scene over `area`'s viewport into `target` on the CPU,
-    /// within its scissor.
-    pub fn renderToImage(self: *OffscreenContext, target: *software.Image, area: GpuArea, clear_color: ?Color, samples: u8, user_ctx: anytype, comptime render_fn: anytype) !void {
+    /// within its scissor, once `wait` (if given) is done.
+    pub fn renderToImage(self: *OffscreenContext, target: *software.Image, area: GpuArea, clear_color: ?Color, samples: u8, wait: ?Wait, user_ctx: anytype, comptime render_fn: anytype) !void {
         const vp = area.viewport;
         if (vp.width == 0 or vp.height == 0) return;
         const full: Viewport = .{ .width = target.width, .height = target.height };
@@ -1000,7 +1009,7 @@ pub const OffscreenContext = struct {
         const pool = objc.push();
         defer objc.pop(pool);
         const cmd = msg(Id, self.queue, "commandBuffer", .{}) orelse return error.MetalCommandBufferFailed;
-        try self.encodeScene(cmd, vp.width, vp.height, clear_color, samples, user_ctx, render_fn);
+        try self.encodeScene(cmd, vp.width, vp.height, clear_color, samples, wait, user_ctx, render_fn);
         MetalRenderer.finishForCpu(cmd, &self.resolve);
         const stride = target.rowStride();
         const at = @as(usize, @intCast(sc.y)) * stride + @as(usize, @intCast(sc.x));

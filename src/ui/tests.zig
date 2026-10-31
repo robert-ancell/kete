@@ -3260,3 +3260,91 @@ test "text running up, left or down is the upright text turned, and as big turne
         try testing.expect(lit > 40);
     }
 }
+
+/// A scene that draws nothing: the area shows its clear colour.
+const ClearScene = struct {
+    pub fn render(_: *const ClearScene, _: anytype) !void {}
+};
+
+fn signalTimelineLater(io: std.Io, ctx: *const gfx.VulkanContext, sem: gfx.vulkan.VkSemaphore, value: u64) void {
+    io.sleep(.fromMilliseconds(50), .awake) catch {};
+    ctx.signalTimeline(sem, value) catch {};
+}
+
+test "VulkanArea draws with the app's context once the app's work is done" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var app_ctx = gfx.VulkanContext.init(testing.allocator) catch return error.SkipZigTest;
+    defer app_ctx.deinit();
+    if (!app_ctx.supportsTimelines()) return error.SkipZigTest;
+    const sem = try app_ctx.createTimeline(0);
+    defer app_ctx.destroyTimeline(sem);
+
+    const u = try ui.WindowUi.createDefault(testing.allocator, testing.io);
+    defer u.destroy();
+    u.attachRenderer(u.shared.software_renderer.renderer(), false);
+    u.frame(40, 30, 0, ui.VulkanArea(ClearScene){
+        .scene = .{},
+        .samples = 1,
+        .clear_color = red,
+        .context = &app_ctx,
+        .wait = .{ .semaphore = sem, .value = 1 },
+    });
+
+    // Drawn once another thread says the work it waits for is done (50ms on).
+    const start = std.Io.Clock.awake.now(testing.io);
+    const thread = try std.Thread.spawn(.{}, signalTimelineLater, .{ testing.io, &app_ctx, sem, 1 });
+    const img = try Image.init(u, 40, 30);
+    defer img.deinit();
+    const waited = start.durationTo(std.Io.Clock.awake.now(testing.io));
+    thread.join();
+    try testing.expect(waited.toMilliseconds() >= 40);
+    try testing.expectEqual(red.toArgb(), img.at(20, 15));
+
+    // The app's context is still the app's once the area is gone.
+    u.frame(40, 30, 0, ui.SizedBox{});
+    const other = try app_ctx.createTimeline(0);
+    app_ctx.destroyTimeline(other);
+}
+
+const FenceFromSibling = struct {
+    share: *const gfx.OpenGlContext,
+    fence: ?gfx.opengl.Wait = null,
+    sibling: ?gfx.OpenGlContext = null,
+
+    /// Makes a context sharing `share`'s on this thread, and a fence after
+    /// its work, as an app drawing on another thread would.
+    fn run(f: *FenceFromSibling) void {
+        var sibling = gfx.OpenGlContext.initSharing(testing.allocator, f.share) catch return;
+        sibling.gl.ClearColor(0, 1, 0, 1);
+        f.fence = sibling.createFence() catch null;
+        f.sibling = sibling;
+    }
+};
+
+test "OpenGlArea draws with the app's context once another context's work is done" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var app_ctx = gfx.OpenGlContext.init(testing.allocator) catch return error.SkipZigTest;
+    defer app_ctx.deinit();
+
+    var job: FenceFromSibling = .{ .share = &app_ctx };
+    const thread = try std.Thread.spawn(.{}, FenceFromSibling.run, .{&job});
+    thread.join();
+    var sibling = job.sibling orelse return error.SkipZigTest;
+    defer sibling.deinit();
+    const fence = job.fence orelse return error.SkipZigTest;
+    defer sibling.destroyFence(fence);
+
+    const u = try ui.WindowUi.createDefault(testing.allocator, testing.io);
+    defer u.destroy();
+    u.attachRenderer(u.shared.software_renderer.renderer(), false);
+    u.frame(40, 30, 0, ui.OpenGlArea(ClearScene){
+        .scene = .{},
+        .samples = 1,
+        .clear_color = blue,
+        .context = &app_ctx,
+        .wait = fence,
+    });
+    const img = try Image.init(u, 40, 30);
+    defer img.deinit();
+    try testing.expectEqual(blue.toArgb(), img.at(20, 15));
+}

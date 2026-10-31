@@ -135,6 +135,10 @@ pub const DmabufImage = struct {
     height: u32,
     /// Its first row is the bottom of the picture (as OpenGL's are).
     bottom_up: bool = false,
+    /// A sync file signalled once the picture is drawn, or -1 if it is
+    /// drawn already. Whoever is given the picture to copy in
+    /// (`vulkan.DirectFrame.copy_dmabuf`) takes it, and closes it.
+    ready_fd: i32 = -1,
 };
 
 /// A window's Core Animation layer (a `CAMetalLayer`) that the GPU draws
