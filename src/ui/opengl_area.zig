@@ -47,6 +47,10 @@ pub fn OpenGlArea(comptime Scene: type) type {
         /// A context of the app's to draw the scene with, instead of one the
         /// area makes and owns: so that the scene can use what the app made
         /// on it (its textures and buffers, say). It must outlive the area.
+        /// It is made current on the UI's thread to draw the scene, so it is
+        /// not to be current on another then (if it is, the scene is not
+        /// drawn): for drawing on another thread, make a context sharing
+        /// with it (`OpenGlContext.initSharing`).
         context: ?*gfx.OpenGlContext = null,
         /// GPU work of the app's done elsewhere (on another thread, say) that
         /// the scene waits for before it is drawn: drawing a picture it
@@ -78,8 +82,10 @@ pub fn OpenGlArea(comptime Scene: type) type {
 
             pub fn deinit(st: *State) void {
                 const c = st.ctx() orelse return;
-                c.makeCurrent();
-                if (HasState) {
+                // If the context is another thread's, what the scene made on
+                // it is left to go with it (rather than deleted in another).
+                const current = if (c.makeCurrent()) true else |_| false;
+                if (HasState and current) {
                     if (st.scene_state) |*ss| {
                         if (@hasDecl(Scene.State, "deinit")) {
                             const params = @typeInfo(@TypeOf(Scene.State.deinit)).@"fn".param_types;
@@ -228,6 +234,14 @@ pub fn OpenGlArea(comptime Scene: type) type {
         /// straight into the window: the scene is exported as a dmabuf and
         /// copied in on the GPU, with no copy through the CPU.
         fn drawDirect(payload: *const DrawPayload, backend: gfx.RenderBackend, frame: *const anyopaque, area: gfx.GpuArea) anyerror!bool {
+            return drawDirectWith(payload, backend, frame, area) catch |e| switch (e) {
+                // The context is another thread's: nothing is drawn.
+                error.EglMakeCurrentFailed => true,
+                else => e,
+            };
+        }
+
+        fn drawDirectWith(payload: *const DrawPayload, backend: gfx.RenderBackend, frame: *const anyopaque, area: gfx.GpuArea) anyerror!bool {
             switch (backend) {
                 .vulkan => {
                     const f: *const gfx.vulkan.DirectFrame = @ptrCast(@alignCast(frame));
@@ -244,7 +258,11 @@ pub fn OpenGlArea(comptime Scene: type) type {
         }
 
         fn drawGpu(payload: *const DrawPayload, target: *gfx.software.Image, area: gfx.GpuArea) anyerror!void {
-            try payload.gl_ctx.renderToImage(target, area, payload.clear_color, payload.samples, payload.wait, payload, renderScene);
+            payload.gl_ctx.renderToImage(target, area, payload.clear_color, payload.samples, payload.wait, payload, renderScene) catch |e| switch (e) {
+                // The context is another thread's: nothing is drawn.
+                error.EglMakeCurrentFailed => {},
+                else => return e,
+            };
         }
 
         fn renderScene(payload: *const DrawPayload, ctx: *gfx.OpenGlContext) anyerror!void {

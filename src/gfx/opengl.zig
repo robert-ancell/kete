@@ -537,16 +537,27 @@ pub const OpenGlRenderer = struct {
         return r;
     }
 
-    fn makeCurrent(r: *const OpenGlRenderer) void {
-        if (r.egl) |egl| {
-            if (r.dpy != EGL_NO_DISPLAY) {
-                _ = egl.MakeCurrent(r.dpy, r.surf, r.surf, r.ctx);
-            }
-        }
+    /// Makes its context the calling thread's (if it has one of its own:
+    /// `initDefault`). It fails if the context is another thread's.
+    fn makeCurrent(r: *const OpenGlRenderer) !void {
+        const egl = r.egl orelse return;
+        if (r.dpy == EGL_NO_DISPLAY) return;
+        if (egl.MakeCurrent(r.dpy, r.surf, r.surf, r.ctx) == EGL_FALSE) return error.EglMakeCurrentFailed;
     }
 
     pub fn deinit(r: *OpenGlRenderer) void {
-        r.makeCurrent();
+        r.deleteGlObjects();
+        r.images.deinit(r.gpa);
+        r.image_use.deinit(r.gpa);
+        r.rgba_scratch.deinit(r.gpa);
+        r.pixel_scratch.deinit(r.gpa);
+        r.deinitEgl();
+    }
+
+    /// Deletes what it made in its context, if that can be current here (or
+    /// else it goes with the context).
+    fn deleteGlObjects(r: *OpenGlRenderer) void {
+        r.makeCurrent() catch return;
         if (r.direct) |d| {
             for (&r.targets) |*slot| if (slot.*) |*im| r.dropImport(d, im);
             for (&r.sources) |*slot| if (slot.*) |*im| r.dropImport(d, im);
@@ -559,10 +570,6 @@ pub const OpenGlRenderer = struct {
             const t = [1]GLuint{tex.*};
             r.gl.DeleteTextures(1, &t);
         }
-        r.images.deinit(r.gpa);
-        r.image_use.deinit(r.gpa);
-        r.rgba_scratch.deinit(r.gpa);
-        r.pixel_scratch.deinit(r.gpa);
         if (r.fbo != 0) {
             const fbos = [1]GLuint{r.fbo};
             r.gl.DeleteFramebuffers(1, &fbos);
@@ -584,6 +591,10 @@ pub const OpenGlRenderer = struct {
         for ([_]GLuint{ r.shape_prog, r.solid_prog, r.text_prog, r.image_prog }) |prog| {
             if (prog != 0) r.gl.DeleteProgram(prog);
         }
+    }
+
+    /// Lets its EGL context (and surface, and library) go.
+    fn deinitEgl(r: *OpenGlRenderer) void {
         if (r.egl) |egl| {
             if (r.dpy != EGL_NO_DISPLAY) {
                 _ = egl.MakeCurrent(r.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
@@ -684,7 +695,7 @@ pub const OpenGlRenderer = struct {
     }
 
     pub fn prepare(r: *OpenGlRenderer, canvases: []const *const Canvas) !void {
-        r.makeCurrent();
+        try r.makeCurrent();
         var bytes: usize = 0;
         for (canvases) |c| for (c.batches.items) |*b| {
             bytes += std.mem.alignForward(usize, b.floats.items.len * 4, 16);
@@ -842,7 +853,7 @@ pub const OpenGlRenderer = struct {
         }
         if (!has_work) return;
 
-        r.makeCurrent();
+        try r.makeCurrent();
         r.ensureFbo(target.width, target.height);
 
         const full_vp: Viewport = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
@@ -1046,7 +1057,7 @@ pub const OpenGlRenderer = struct {
                     r.gl.BindFramebuffer(GL_FRAMEBUFFER, im.fbo);
                     const drawn = try direct(g.ctx, .opengl, &frame, g.area);
                     // It may have drawn with a context of its own.
-                    r.makeCurrent();
+                    try r.makeCurrent();
                     if (drawn) continue;
                 }
                 // Drawn on the CPU: what is under it is finished first, and
@@ -1055,7 +1066,7 @@ pub const OpenGlRenderer = struct {
                 var img = try t.cpu.begin(t.cpu.ctx);
                 const drawn = g.f(g.ctx, @ptrCast(&img), g.area);
                 t.cpu.end(t.cpu.ctx);
-                r.makeCurrent();
+                try r.makeCurrent();
                 try drawn;
             },
         };
@@ -1071,7 +1082,7 @@ pub const OpenGlRenderer = struct {
         r.direct_known = true;
         const egl = r.egl orelse return null;
         const lib = if (r.egl_lib) |*l| l else return null;
-        r.makeCurrent();
+        r.makeCurrent() catch return null;
         const d = DirectProcs.load(lib, &egl, r.dpy, r.gl) orelse return null;
         r.sync = SyncProcs.load(lib, &egl, r.dpy);
         r.window_prog = r.compileSpirvOrGlsl(&shaders.window_gl_spv, shaders.glsl_window_vs, shaders.glsl_window_fs) catch
@@ -1174,7 +1185,10 @@ pub const OpenGlRenderer = struct {
     /// right way up).
     fn copyDmabuf(ctx: *anyopaque, frame: *const DirectFrame, src: *const DmabufImage, area: GpuArea) anyerror!bool {
         const r: *OpenGlRenderer = @ptrCast(@alignCast(ctx));
-        r.makeCurrent();
+        r.makeCurrent() catch {
+            if (src.ready_fd >= 0) renderer_mod.waitFd(src.ready_fd);
+            return false;
+        };
         if (src.ready_fd >= 0) r.waitSyncFile(src.ready_fd);
         const d = r.direct orelse return false;
         const s = r.importDmabuf(d, &r.sources, .{ .id = src.id, .fd = src.fd, .fourcc = src.fourcc, .modifier = src.modifier, .offset = src.offset, .stride = src.stride, .width = src.width, .height = src.height }) catch return false;
@@ -1736,18 +1750,21 @@ pub const OffscreenContext = struct {
         self.scratch.deinit(self.gpa);
         self.dropExport();
         if (self.dpy != EGL_NO_DISPLAY) {
-            _ = self.egl.MakeCurrent(self.dpy, self.surf, self.surf, self.ctx);
-            if (self.ubo != 0) {
-                const bufs = [1]GLuint{self.ubo};
-                self.gl.DeleteBuffers(1, &bufs);
+            // What it made is deleted in it, if it can be current here (if it
+            // is another thread's, it goes with it once that lets it go).
+            if (self.egl.MakeCurrent(self.dpy, self.surf, self.surf, self.ctx) != EGL_FALSE) {
+                if (self.ubo != 0) {
+                    const bufs = [1]GLuint{self.ubo};
+                    self.gl.DeleteBuffers(1, &bufs);
+                }
+                if (self.msaa_fbo != 0) {
+                    const fbos = [2]GLuint{ self.msaa_fbo, self.resolve_fbo };
+                    self.gl.DeleteFramebuffers(2, &fbos);
+                    const rbs = [3]GLuint{ self.msaa_color_rb, self.msaa_depth_rb, self.resolve_color_rb };
+                    self.gl.DeleteRenderbuffers(3, &rbs);
+                }
+                _ = self.egl.MakeCurrent(self.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             }
-            if (self.msaa_fbo != 0) {
-                const fbos = [2]GLuint{ self.msaa_fbo, self.resolve_fbo };
-                self.gl.DeleteFramebuffers(2, &fbos);
-                const rbs = [3]GLuint{ self.msaa_color_rb, self.msaa_depth_rb, self.resolve_color_rb };
-                self.gl.DeleteRenderbuffers(3, &rbs);
-            }
-            _ = self.egl.MakeCurrent(self.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             if (self.ctx != EGL_NO_CONTEXT) _ = self.egl.DestroyContext(self.dpy, self.ctx);
             if (self.surf != EGL_NO_SURFACE) _ = self.egl.DestroySurface(self.dpy, self.surf);
             // Not terminated: the display is the process's, shared with
@@ -1758,8 +1775,17 @@ pub const OffscreenContext = struct {
         self.egl_lib.close();
     }
 
-    pub fn makeCurrent(self: *const OffscreenContext) void {
-        _ = self.egl.MakeCurrent(self.dpy, self.surf, self.surf, self.ctx);
+    /// Makes it the calling thread's context. It fails if it is another
+    /// thread's: a context is current on one thread at a time (for drawing
+    /// on another, make one sharing with it: `initSharing`).
+    pub fn makeCurrent(self: *const OffscreenContext) !void {
+        if (self.egl.MakeCurrent(self.dpy, self.surf, self.surf, self.ctx) == EGL_FALSE) return error.EglMakeCurrentFailed;
+    }
+
+    /// Lets the calling thread's context go (this one, if it is current
+    /// here), so that another thread can make it current.
+    pub fn release(self: *const OffscreenContext) void {
+        _ = self.egl.MakeCurrent(self.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     }
 
     /// The DRM render node of its GPU, or null if EGL cannot say.
@@ -1773,7 +1799,7 @@ pub const OffscreenContext = struct {
     /// been drawn.
     pub fn createFence(self: *const OffscreenContext) !Wait {
         const x = self.sync orelse return error.Unsupported;
-        self.makeCurrent();
+        try self.makeCurrent();
         const sync = x.CreateSyncKHR(self.dpy, EGL_SYNC_FENCE_KHR, null);
         if (sync == null) return error.EglCreateSyncFailed;
         // Sent to the GPU, so that another context's wait for it ends.
@@ -1825,7 +1851,7 @@ pub const OffscreenContext = struct {
     /// `glSpecializeShader`) when `supportsSpirv()` is true and `shader_spv` is
     /// provided, falling back to `vs_source` / `fs_source` GLSL shaders.
     pub fn createPipeline(self: *OffscreenContext, desc: PipelineDesc) !Pipeline {
-        self.makeCurrent();
+        try self.makeCurrent();
         const prog: GLuint = blk: {
             if (self.spirv_supported) {
                 if (desc.shader_spv) |spv| {
@@ -1861,7 +1887,8 @@ pub const OffscreenContext = struct {
     }
 
     pub fn destroyPipeline(self: *const OffscreenContext, p: Pipeline) void {
-        self.makeCurrent();
+        // Another thread's context: it goes with it.
+        self.makeCurrent() catch return;
         if (p.vao != 0) {
             const vaos = [1]GLuint{p.vao};
             self.gl.DeleteVertexArrays(1, &vaos);
@@ -1870,7 +1897,7 @@ pub const OffscreenContext = struct {
     }
 
     pub fn createVertexBuffer(self: *const OffscreenContext, comptime T: type, items: []const T) !Buffer {
-        self.makeCurrent();
+        try self.makeCurrent();
         var id: [1]GLuint = undefined;
         self.gl.GenBuffers(1, &id);
         self.gl.BindBuffer(GL_ARRAY_BUFFER, id[0]);
@@ -1879,7 +1906,7 @@ pub const OffscreenContext = struct {
     }
 
     pub fn createIndexBuffer(self: *const OffscreenContext, indices: []const u16) !Buffer {
-        self.makeCurrent();
+        try self.makeCurrent();
         var id: [1]GLuint = undefined;
         self.gl.GenBuffers(1, &id);
         self.gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, id[0]);
@@ -1888,7 +1915,8 @@ pub const OffscreenContext = struct {
     }
 
     pub fn destroyBuffer(self: *const OffscreenContext, buf: Buffer) void {
-        self.makeCurrent();
+        // Another thread's context: it goes with it.
+        self.makeCurrent() catch return;
         if (buf.id != 0) {
             const ids = [1]GLuint{buf.id};
             self.gl.DeleteBuffers(1, &ids);
@@ -2064,7 +2092,7 @@ pub const OffscreenContext = struct {
     /// Draws the scene over a clear in the multisampled framebuffer, once
     /// `wait` (if given) is done, and resolves it into `resolve_color_rb`.
     fn drawResolved(self: *OffscreenContext, vp: Viewport, clear_color: ?Color, samples: u8, wait: ?Wait, user_ctx: anytype, comptime render_fn: anytype) !void {
-        self.makeCurrent();
+        try self.makeCurrent();
         if (wait) |w| try self.waitFor(w);
         self.ensureFbo(vp.width, vp.height, samples);
         self.width = vp.width;

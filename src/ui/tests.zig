@@ -3577,3 +3577,51 @@ test "the app submits to the renderer's device from another thread while windows
     }
     thread.join();
 }
+
+/// Holds an OpenGL context current on its own thread until told to let it go.
+const HeldContext = struct {
+    ctx: ?gfx.OpenGlContext = null,
+    held: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn run(h: *HeldContext) void {
+        h.ctx = gfx.OpenGlContext.init(testing.allocator) catch null;
+        h.held.store(true, .release);
+        while (!h.release.load(.acquire)) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        if (h.ctx) |*c| c.release();
+    }
+};
+
+test "an OpenGlArea given another thread's context draws nothing, rather than into the UI's" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var held: HeldContext = .{};
+    const thread = try std.Thread.spawn(.{}, HeldContext.run, .{&held});
+    while (!held.held.load(.acquire)) try testing.io.sleep(.fromMilliseconds(1), .awake);
+    defer {
+        held.release.store(true, .release);
+        thread.join();
+        if (held.ctx) |*c| c.deinit();
+    }
+    const ctx = if (held.ctx) |*c| c else return error.SkipZigTest;
+    try testing.expectError(error.EglMakeCurrentFailed, ctx.makeCurrent());
+
+    const u = try ui.WindowUi.createDefault(testing.allocator, testing.io);
+    defer u.destroy();
+    u.attachRenderer(u.shared.software_renderer.renderer(), false);
+    const build = struct {
+        var context: *gfx.OpenGlContext = undefined;
+        fn f(cx: *Context) Widget {
+            return cx.make(ui.Row{ .children = cx.makeAll(.{
+                ui.SizedBox{ .width = 20, .child = cx.make(ui.RoundedBox{ .color = blue }) },
+                ui.Expanded{ .child = cx.make(ui.OpenGlArea(ClearScene){ .scene = .{}, .samples = 1, .clear_color = red, .context = context, .min_width = 0, .min_height = 0 }) },
+            }) });
+        }
+    };
+    build.context = ctx;
+    u.frame(40, 30, 0, Root(build.f){});
+    const img = try Image.init(u, 40, 30);
+    defer img.deinit();
+    // The rest of the frame is drawn; the area is not.
+    try testing.expectEqual(blue.toArgb(), img.at(10, 15));
+    try testing.expect(img.at(30, 15) != red.toArgb());
+}
