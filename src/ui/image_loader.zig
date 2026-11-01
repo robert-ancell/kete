@@ -258,7 +258,9 @@ const Shared = struct {
     }
 
     /// Queues a load, with a worker for it if there are fewer than
-    /// `max_workers` (or loads it now, if the `Io` cannot run one).
+    /// `max_workers` (or leaves the job pending for an existing worker if
+    /// the `Io` cannot start a new concurrent task). The UI thread is
+    /// never used to decode images.
     fn add(s: *Shared, job: *Job) !void {
         s.lock();
         s.pending.append(alloc, job) catch |e| {
@@ -269,7 +271,14 @@ const Shared = struct {
         if (start) s.workers += 1;
         s.unlock();
         if (!start) return;
-        s.group.concurrent(s.io, work, .{s}) catch work(s);
+        s.group.concurrent(s.io, work, .{s}) catch {
+            // Cannot start a concurrent task.  Undo the worker-count increment;
+            // an already-running worker will pick up the job, or the next
+            // successful add() will start one.  The UI thread is never used.
+            s.lock();
+            s.workers -= 1;
+            s.unlock();
+        };
     }
 
     /// The UI lets go of it: what is waiting is dropped, the workers are
@@ -300,13 +309,19 @@ const Shared = struct {
             const job = s.pending.orderedRemove(0);
             s.unlock();
             job.result = load(job, s, &http);
+            // Append to the done list under the lock, then signal outside it
+            // so the UI wake syscall is never made while the spinlock is held.
+            var signal = false;
             s.lock();
             if (s.closed) {
                 job.deinit();
             } else if (s.done.append(alloc, job)) {
-                s.wake.signal();
-            } else |_| job.deinit();
+                signal = true;
+            } else |_| {
+                job.deinit();
+            }
             s.unlock();
+            if (signal) s.wake.signal();
         }
     }
 };
