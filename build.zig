@@ -1,11 +1,27 @@
 const std = @import("std");
 
-const IconFont = struct {
+/// A subsetted Material Icons font together with the `IconName` source that
+/// defines which icons it contains.  Pass to `createModules`.
+pub const IconFont = struct {
     ttf: std.Build.LazyPath,
     codepoints: std.Build.LazyPath,
+    /// Source file that defines `pub const IconName = enum { ... }`.
+    /// Used as the `icon_names` module import by the `icons` module.
+    names: std.Build.LazyPath,
 };
 
-fn addIconFont(b: *std.Build) IconFont {
+/// Builds and runs `subset_icons` compiled against the given `names` source.
+fn runSubsetIcons(b: *std.Build, names: std.Build.LazyPath) struct {
+    ttf: std.Build.LazyPath,
+    codepoints: std.Build.LazyPath,
+} {
+    const host_font = b.createModule(.{
+        .root_source_file = b.path("src/font/font.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+    });
+    host_font.addAnonymousImport("FiraSans-Regular.ttf", .{ .root_source_file = b.path("fonts/FiraSans-Regular.ttf") });
+    host_font.addAnonymousImport("TwemojiMozilla.ttf", .{ .root_source_file = b.path("fonts/TwemojiMozilla.ttf") });
     const tool = b.addExecutable(.{
         .name = "subset_icons",
         .root_module = b.createModule(.{
@@ -14,25 +30,59 @@ fn addIconFont(b: *std.Build) IconFont {
             .optimize = .safe,
         }),
     });
-    const host_font = b.createModule(.{
-        .root_source_file = b.path("src/font/font.zig"),
-        .target = b.graph.host,
-        .optimize = .safe,
-    });
-    host_font.addAnonymousImport("FiraSans-Regular.ttf", .{ .root_source_file = b.path("fonts/FiraSans-Regular.ttf") });
-    host_font.addAnonymousImport("TwemojiMozilla.ttf", .{ .root_source_file = b.path("fonts/TwemojiMozilla.ttf") });
     tool.root_module.addImport("font", host_font);
     tool.root_module.addImport("icon_names", b.createModule(.{
-        .root_source_file = b.path("src/icons/names.zig"),
+        .root_source_file = names,
         .target = b.graph.host,
         .optimize = .safe,
     }));
     const run = b.addRunArtifact(tool);
     run.addFileArg(b.path("fonts/MaterialIcons-Regular.ttf"));
     run.addFileArg(b.path("fonts/MaterialIcons-Regular.codepoints"));
-    const ttf = run.addOutputFileArg("MaterialIcons.ttf");
-    const codepoints = run.addOutputFileArg("icon_codepoints.zig");
-    return .{ .ttf = ttf, .codepoints = codepoints };
+    return .{
+        .ttf = run.addOutputFileArg("MaterialIcons.ttf"),
+        .codepoints = run.addOutputFileArg("icon_codepoints.zig"),
+    };
+}
+
+/// Returns an `IconFont` containing all icons in `src/icons/names.zig`.
+pub fn addIconFont(b: *std.Build) IconFont {
+    const names = b.path("src/icons/names.zig");
+    const out = runSubsetIcons(b, names);
+    return .{ .ttf = out.ttf, .codepoints = out.codepoints, .names = names };
+}
+
+/// Returns an `IconFont` subsetted to only the icons referenced in the given
+/// source directories, by scanning for two unambiguous patterns:
+///
+///   1. `IconName.name` — explicit type qualification.
+///   2. `.icon = .name`, `.leading_icon = .name`, `.trailing_icon = .name` —
+///      enum inference on known `IconName`-typed fields.
+///
+/// Kete's own `src/` directory is always scanned in addition to `scan_dirs`,
+/// so icons used internally by kete (e.g. `.expand_more` in the dropdown) are
+/// always included.
+///
+/// For icons chosen dynamically at runtime, add a no-op anywhere in your source:
+///
+///     comptime { _ = &[_]kete.IconName{ .cloud, .download }; }
+///
+pub fn addIconFontScanned(b: *std.Build, scan_dirs: []const std.Build.LazyPath) IconFont {
+    const scanner = b.addExecutable(.{
+        .name = "scan_icons",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/scan_icons.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
+    });
+    const scan = b.addRunArtifact(scanner);
+    scan.addFileArg(b.path("fonts/MaterialIcons-Regular.codepoints"));
+    const names = scan.addOutputFileArg("names.zig");
+    scan.addDirectoryArg(b.path("src")); // kete's own icons (e.g. .expand_more)
+    for (scan_dirs) |dir| scan.addDirectoryArg(dir);
+    const out = runSubsetIcons(b, names);
+    return .{ .ttf = out.ttf, .codepoints = out.codepoints, .names = names };
 }
 
 fn addSpirv(b: *std.Build, name: []const u8, source: []const u8, os_tag: std.Target.Os.Tag) std.Build.LazyPath {
@@ -187,6 +237,11 @@ pub fn createModules(
         .optimize = optimize,
         .imports = &.{
             .{ .name = "font", .module = font },
+            .{ .name = "icon_names", .module = b.createModule(.{
+                .root_source_file = icon_font.names,
+                .target = target,
+                .optimize = optimize,
+            }) },
             .{ .name = "icon_codepoints", .module = b.createModule(.{
                 .root_source_file = icon_font.codepoints,
                 .target = target,

@@ -8,7 +8,7 @@
 //! In the toolkit, `ui.Icon` draws one.
 
 const std = @import("std");
-const names = @import("names.zig");
+const names = @import("icon_names");
 const generated = @import("icon_codepoints");
 
 pub const IconName = names.IconName;
