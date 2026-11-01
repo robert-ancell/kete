@@ -68,6 +68,7 @@ pub const control = @import("control.zig");
 pub const checkbox = @import("checkbox.zig");
 pub const radio = @import("radio.zig");
 pub const @"switch" = @import("switch.zig");
+pub const edit = @import("edit.zig");
 pub const text_field = @import("text_field.zig");
 pub const text_area = @import("text_area.zig");
 pub const menu = @import("menu.zig");
@@ -239,6 +240,7 @@ test {
     _ = checkbox;
     _ = radio;
     _ = @"switch";
+    _ = edit;
     _ = text_field;
     _ = text_area;
     _ = menu;

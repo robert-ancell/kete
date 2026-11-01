@@ -16,6 +16,7 @@
 
 const a11y = @import("accessibility.zig");
 const std = @import("std");
+const edit = @import("edit.zig");
 const gfx = @import("gfx");
 const font = @import("font");
 const geometry = @import("geometry.zig");
@@ -712,14 +713,16 @@ pub const TextArea = struct {
     }
 };
 
-const CharClass = enum { word, space, punct };
+const CharClass = edit.CharClass;
 
 fn charClassAt(text: []const u8, i: usize) CharClass {
-    const b = text[i];
-    if (b >= 0x80) return .word;
-    if (std.ascii.isAlphanumeric(b) or b == '_') return .word;
-    if (std.ascii.isWhitespace(b)) return .space;
-    return .punct;
+    if (text[i] < 0x80) return edit.charClass(text[i]);
+    // Decode the full codepoint; `i` should always be a sequence-start byte
+    // because callers use snap/before/after, but handle malformed UTF-8 safely.
+    const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch return .word;
+    if (i + seq_len > text.len) return .word;
+    const cp = std.unicode.utf8Decode(text[i..][0..seq_len]) catch return .word;
+    return edit.charClass(cp);
 }
 
 /// The line (an index) the cursor at `offset` is on: at a wrap, the line
