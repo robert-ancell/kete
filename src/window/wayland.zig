@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const dbus = @import("dbus.zig");
 const wayland = @import("wayland");
 const gfx = @import("gfx");
 const window_mod = @import("window.zig");
@@ -615,6 +616,13 @@ pub const WaylandDisplay = struct {
     cursor_shape: ?u32 = null,
     // Touch routing (touch id -> window):
     touch_windows: [8]?struct { id: i32, window: ?*WaylandWindow } = @splat(null),
+    /// System dark-mode preference from the XDG Desktop Portal
+    /// (`org.freedesktop.appearance` / `color-scheme`): true if the user
+    /// prefers dark, false if light, null if unavailable or no preference.
+    prefers_dark: ?bool = null,
+    /// Session D-Bus connection used to query and watch the portal (null if
+    /// the session bus is not available or the portal does not respond).
+    portal: ?*dbus.Connection = null,
 
     pub const platform: window_mod.WindowPlatform = .wayland;
 
@@ -627,12 +635,16 @@ pub const WaylandDisplay = struct {
         errdefer conn.disconnect();
         const d = try gpa.create(WaylandDisplay);
         d.* = .{ .gpa = gpa, .io = io, .conn = conn, .compose_env = .from(environ) };
+        // Best-effort: connect to the portal for dark-mode detection.  Any
+        // failure is silently ignored — the app just won't know the theme.
+        d.initPortal(environ);
         return d;
     }
 
     /// Disconnects (its windows must be closed first).
     pub fn close(d: *WaylandDisplay) void {
         std.debug.assert(d.windows.items.len == 0);
+        if (d.portal) |portal_conn| portal_conn.close();
         d.deinitGlobals();
         d.windows.deinit(d.gpa);
         d.conn.disconnect();
@@ -715,6 +727,11 @@ pub const WaylandDisplay = struct {
                     n += 1;
                 }
             }
+            // Portal (session D-Bus): watch for SettingChanged signals.
+            if (d.portal != null and n < sources.len) {
+                sources[n] = .{ .ctx = d, .fd = d.portal.?.fd, .read = portalRead, .done = portalDone };
+                n += 1;
+            }
             try window_mod.waitSources(d.io, sources[0..n], ns);
             if (d.read_error) |e| {
                 d.read_error = null;
@@ -725,12 +742,13 @@ pub const WaylandDisplay = struct {
         d.service();
     }
 
-    /// Reads what has come of pastes, and repeats keys held.
+    /// Reads what has come of pastes, repeats keys held, and handles portal signals.
     fn service(d: *WaylandDisplay) void {
         const now_ns = window_mod.nowNs(d.io);
         if (d.keyboard_window) |w| d.displayServiceRepeat(now_ns, w);
         if (d.clipboard_initialized) d.clipboard.service();
         for (d.windows.items) |w| w.clipboard.service();
+        d.servicePortal();
     }
 
     fn connRead(ctx: *anyopaque) ?std.Io.Operation {
@@ -756,6 +774,115 @@ pub const WaylandDisplay = struct {
     fn displayPasteDone(ctx: *anyopaque, result: std.Io.Operation.Result) void {
         const d: *WaylandDisplay = @ptrCast(@alignCast(ctx));
         d.clipboard.readDone(result);
+    }
+
+    // --- Portal (dark mode detection) -----------------------------------------
+
+    /// Connects to the session bus and queries the XDG Desktop Portal's
+    /// `org.freedesktop.appearance` / `color-scheme` setting.  Does nothing
+    /// if `$DBUS_SESSION_BUS_ADDRESS` is absent or the portal is not
+    /// reachable — in that case `prefers_dark` stays null.
+    fn initPortal(d: *WaylandDisplay, environ: std.process.Environ) void {
+        d.initPortalFallible(environ) catch {};
+    }
+
+    fn initPortalFallible(d: *WaylandDisplay, environ: std.process.Environ) !void {
+        const address = environ.getPosix("DBUS_SESSION_BUS_ADDRESS") orelse return;
+        const conn = try dbus.Connection.open(d.gpa, d.io, address);
+        errdefer conn.close();
+
+        // Subscribe to SettingChanged *before* querying the initial value to
+        // avoid a race where the preference changes in between the two calls.
+        {
+            var w: dbus.Writer = .{ .gpa = d.gpa };
+            defer w.deinit();
+            w.string("type='signal'," ++
+                "sender='org.freedesktop.portal.Desktop'," ++
+                "interface='org.freedesktop.portal.Settings'," ++
+                "member='SettingChanged'," ++
+                "path='/org/freedesktop/portal/desktop'");
+            if (w.failed) return error.OutOfMemory;
+            // Ignore AddMatch failures (the signal just won't arrive).
+            _ = conn.callWait(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "AddMatch",
+                "s",
+                w.buf.items,
+                5000,
+            ) catch {};
+        }
+
+        // Query the initial color-scheme value.
+        {
+            var w: dbus.Writer = .{ .gpa = d.gpa };
+            defer w.deinit();
+            w.string("org.freedesktop.appearance");
+            w.string("color-scheme");
+            if (w.failed) return error.OutOfMemory;
+            if (conn.callWait(
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Settings",
+                "Read",
+                "ss",
+                w.buf.items,
+                5000,
+            )) |reply| {
+                defer d.gpa.free(reply);
+                if (dbus.decode(reply)) |m| {
+                    var r = m.reader();
+                    d.applyColorScheme(&r);
+                } else |_| {}
+            } else |_| {}
+        }
+
+        d.portal = conn;
+    }
+
+    /// Updates `prefers_dark` from a D-Bus variant holding a `color-scheme`
+    /// uint32: 1 = prefer dark, 2 = prefer light, 0 = no preference.
+    fn applyColorScheme(d: *WaylandDisplay, r: *dbus.Reader) void {
+        const sig = r.signature() catch return;
+        if (!std.mem.eql(u8, sig, "u")) return;
+        const value = r.uint32() catch return;
+        d.prefers_dark = switch (value) {
+            1 => true,
+            2 => false,
+            else => null,
+        };
+    }
+
+    /// Drains queued portal messages and applies any `SettingChanged` signals
+    /// for `org.freedesktop.appearance` / `color-scheme`.
+    fn servicePortal(d: *WaylandDisplay) void {
+        const conn = d.portal orelse return;
+        while (true) {
+            const bytes = (conn.next() catch return) orelse return;
+            defer d.gpa.free(bytes);
+            const m = dbus.decode(bytes) catch continue;
+            if (m.header.type != .signal) continue;
+            if (!std.mem.eql(u8, m.header.interface orelse "", "org.freedesktop.portal.Settings")) continue;
+            if (!std.mem.eql(u8, m.header.member orelse "", "SettingChanged")) continue;
+            // Body: ssv — namespace, key, value-variant.
+            var r = m.reader();
+            const ns = r.string() catch continue;
+            if (!std.mem.eql(u8, ns, "org.freedesktop.appearance")) continue;
+            const key = r.string() catch continue;
+            if (!std.mem.eql(u8, key, "color-scheme")) continue;
+            d.applyColorScheme(&r);
+        }
+    }
+
+    fn portalRead(ctx: *anyopaque) ?std.Io.Operation {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ctx));
+        return if (d.portal) |conn| conn.readOperation() else null;
+    }
+
+    fn portalDone(ctx: *anyopaque, result: std.Io.Operation.Result) void {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ctx));
+        if (d.portal) |conn| conn.readDone(result);
     }
 
     fn windowForSurface(d: *WaylandDisplay, surface_id: u32) ?*WaylandWindow {
@@ -1911,6 +2038,14 @@ pub const WaylandWindow = struct {
 
     pub fn interface(w: *WaylandWindow) window_mod.Window {
         return window_mod.Window.of(w);
+    }
+
+    /// Whether the system prefers dark mode: from the XDG Desktop Portal's
+    /// `org.freedesktop.appearance` / `color-scheme` setting, or null if the
+    /// portal was unreachable, the display is not a `WaylandDisplay`, or the
+    /// user has no preference.
+    pub fn prefersDark(w: *const WaylandWindow) ?bool {
+        return if (w.display) |d| d.prefers_dark else null;
     }
 
     pub fn setAppId(w: *WaylandWindow, app_id: []const u8) !void {
