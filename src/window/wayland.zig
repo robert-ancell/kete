@@ -564,6 +564,58 @@ pub const WaylandDisplay = struct {
     /// A read of the connection, through `io`, that failed.
     read_error: ?wire.Error = null,
 
+    // Shared globals bound once when the first window opens:
+    globals: client.Globals = .{},
+    compositor: client.Proxy = .{},
+    wm_base: client.Proxy = .{},
+    shm: ?client.Proxy = null,
+    dmabuf: ?client.Proxy = null,
+    dmabuf_dev: ?DmaBufDevice = null,
+    dmabuf_argb8888: bool = false,
+    dmabuf_xrgb8888: bool = false,
+    drm_syncobj_manager: ?client.Proxy = null,
+    decoration_manager: ?client.Proxy = null,
+    cursor_shape_manager: ?client.Proxy = null,
+    fifo_manager: ?client.Proxy = null,
+    commit_timing_manager: ?client.Proxy = null,
+    pointer_constraints: ?client.Proxy = null,
+    relative_pointer_manager: ?client.Proxy = null,
+    presentation: ?client.Proxy = null,
+    presentation_clock_id: u32 = 1,
+    text_input_manager: ?client.Proxy = null,
+    // Shared seat (one per connection):
+    seat: ?client.Proxy = null,
+    pointer: ?client.Proxy = null,
+    keyboard: ?client.Proxy = null,
+    touch: ?client.Proxy = null,
+    cursor_device: ?client.Proxy = null,
+    relative_pointer: ?client.Proxy = null,
+    text_input: ?client.Proxy = null,
+    clipboard: Clipboard = undefined,
+    clipboard_initialized: bool = false,
+    // Shared keyboard/compose/repeat state:
+    keymap: ?xkb.Keymap = null,
+    xkb_state: xkb.State = .{},
+    compose_table: ?compose.Table = null,
+    compose_tried: bool = false,
+    compose_state: compose.State = .{},
+    repeat_rate: u32 = 25,
+    repeat_delay_ms: u32 = 600,
+    display_repeat: ?struct { code: u32, next_ns: u64 } = null,
+    keys_down: std.bit_set.Static(256) = .empty,
+    // Input routing:
+    pointer_window: ?*WaylandWindow = null,
+    keyboard_window: ?*WaylandWindow = null,
+    // Shared pointer state:
+    pointer_pos: [2]f32 = .{ 0, 0 },
+    press_serial: u32 = 0,
+    enter_serial: u32 = 0,
+    buttons_down: u32 = 0,
+    leave_pending: bool = false,
+    cursor_shape: ?u32 = null,
+    // Touch routing (touch id -> window):
+    touch_windows: [8]?struct { id: i32, window: ?*WaylandWindow } = @splat(null),
+
     pub const platform: window_mod.WindowPlatform = .wayland;
 
     /// Connects to the compositor named in `environ` (`WAYLAND_DISPLAY`
@@ -581,6 +633,7 @@ pub const WaylandDisplay = struct {
     /// Disconnects (its windows must be closed first).
     pub fn close(d: *WaylandDisplay) void {
         std.debug.assert(d.windows.items.len == 0);
+        d.deinitGlobals();
         d.windows.deinit(d.gpa);
         d.conn.disconnect();
         d.gpa.destroy(d);
@@ -589,15 +642,26 @@ pub const WaylandDisplay = struct {
     /// Opens a window on it (closed with `WaylandWindow.close`).
     pub fn openWindow(d: *WaylandDisplay, options: WaylandWindow.Options) !*WaylandWindow {
         try d.windows.ensureUnusedCapacity(d.gpa, 1);
-        const w = try WaylandWindow.openOn(d.gpa, d.conn, options);
-        w.display = d;
-        w.compose_env = d.compose_env;
+        if (d.compositor.id == 0) try d.initGlobals();
+        const w = try d.createWindowObject(options);
         d.windows.appendAssumeCapacity(w);
         return w;
     }
 
     /// A window of its is closing.
     fn forget(d: *WaylandDisplay, w: *WaylandWindow) void {
+        if (d.pointer_window == w) {
+            d.pointer_window = null;
+            d.buttons_down = 0;
+            d.leave_pending = false;
+        }
+        if (d.keyboard_window == w) {
+            d.keyboard_window = null;
+            d.display_repeat = null;
+        }
+        for (&d.touch_windows) |*slot| if (slot.*) |tw| if (tw.window == w) {
+            slot.* = null;
+        };
         if (std.mem.indexOfScalar(*WaylandWindow, d.windows.items, w)) |i| _ = d.windows.orderedRemove(i);
     }
 
@@ -636,8 +700,15 @@ pub const WaylandDisplay = struct {
                 sources[n] = x;
                 n += 1;
             };
+            if (d.displayRepeatTimeoutMs(now_ns)) |ms| ns = @min(ns, ms *| std.time.ns_per_ms);
+            if (d.clipboard_initialized) {
+                if (d.clipboard.pasteTimeoutMs()) |ms| ns = @min(ns, ms *| std.time.ns_per_ms);
+                if (d.clipboard.pasteFd() != null and n < sources.len) {
+                    sources[n] = .{ .ctx = d, .fd = -1, .read = displayPasteRead, .done = displayPasteDone };
+                    n += 1;
+                }
+            }
             for (d.windows.items) |w| {
-                if (w.repeatTimeoutMs(now_ns)) |ms| ns = @min(ns, ms *| std.time.ns_per_ms);
                 if (w.clipboard.pasteTimeoutMs()) |ms| ns = @min(ns, ms *| std.time.ns_per_ms);
                 if (w.clipboard.pasteFd() != null and n < sources.len) {
                     sources[n] = .{ .ctx = w, .fd = -1, .read = WaylandWindow.pasteRead, .done = WaylandWindow.pasteDone };
@@ -657,10 +728,9 @@ pub const WaylandDisplay = struct {
     /// Reads what has come of pastes, and repeats keys held.
     fn service(d: *WaylandDisplay) void {
         const now_ns = window_mod.nowNs(d.io);
-        for (d.windows.items) |w| {
-            w.clipboard.service();
-            w.serviceRepeat(now_ns);
-        }
+        if (d.keyboard_window) |w| d.displayServiceRepeat(now_ns, w);
+        if (d.clipboard_initialized) d.clipboard.service();
+        for (d.windows.items) |w| w.clipboard.service();
     }
 
     fn connRead(ctx: *anyopaque) ?std.Io.Operation {
@@ -676,6 +746,651 @@ pub const WaylandDisplay = struct {
         _ = d.conn.conn.readDone(result) catch |e| {
             d.read_error = e;
         };
+    }
+
+    fn displayPasteRead(ctx: *anyopaque) ?std.Io.Operation {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ctx));
+        return d.clipboard.readOperation();
+    }
+
+    fn displayPasteDone(ctx: *anyopaque, result: std.Io.Operation.Result) void {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ctx));
+        d.clipboard.readDone(result);
+    }
+
+    fn windowForSurface(d: *WaylandDisplay, surface_id: u32) ?*WaylandWindow {
+        for (d.windows.items) |w| {
+            if (w.ownsSurface(surface_id)) return w;
+        }
+        return null;
+    }
+
+    fn touchWindowFor(d: *WaylandDisplay, id: i32) ?*WaylandWindow {
+        for (&d.touch_windows) |*slot| if (slot.*) |tw| if (tw.id == id) return tw.window;
+        return null;
+    }
+
+    fn removeTouchWindow(d: *WaylandDisplay, id: i32) ?*WaylandWindow {
+        for (&d.touch_windows) |*slot| if (slot.*) |tw| if (tw.id == id) {
+            const w = tw.window;
+            slot.* = null;
+            return w;
+        };
+        return null;
+    }
+
+    fn flushDisplayPointerLeave(d: *WaylandDisplay) void {
+        if (!d.leave_pending) return;
+        d.leave_pending = false;
+        if (d.pointer_window) |w| {
+            d.pointer_window = null;
+            d.buttons_down = 0;
+            w.pointer_surface = 0;
+            w.pointer_pos = .{ 0, 0 };
+            w.pushInput(.leave);
+        }
+    }
+
+    fn updateDisplayCursor(d: *WaylandDisplay) void {
+        const w = d.pointer_window orelse return;
+        const edges = if (d.buttons_down == 0) w.edgesAt(w.pointer_pos) else 0;
+        const sh = p.wp_cursor_shape_device_v1.shape;
+        const vertical = edges & (edge_top | edge_bottom);
+        const horizontal = edges & (edge_left | edge_right);
+        const shape: u32 = if (vertical != 0 and horizontal != 0)
+            (if ((vertical == edge_top) == (horizontal == edge_left)) sh.nwse_resize else sh.nesw_resize)
+        else if (horizontal != 0)
+            sh.ew_resize
+        else if (vertical != 0)
+            sh.ns_resize
+        else
+            WaylandWindow.cursorShape(w.app_cursor);
+        if (d.cursor_shape == shape) return;
+        const device = d.cursor_device orelse return;
+        var m = device.request(p.wp_cursor_shape_device_v1.request.set_shape) catch return;
+        m.uint(d.enter_serial).uint(shape).end();
+        d.cursor_shape = shape;
+    }
+
+    fn displayRepeatTimeoutMs(d: *const WaylandDisplay, now_ns: u64) ?u64 {
+        const rep = d.display_repeat orelse return null;
+        if (d.repeat_rate == 0) return null;
+        if (now_ns >= rep.next_ns) return 0;
+        return std.math.divCeil(u64, rep.next_ns - now_ns, std.time.ns_per_ms) catch 0;
+    }
+
+    fn displayServiceRepeat(d: *WaylandDisplay, now_ns: u64, w: *WaylandWindow) void {
+        const rep = &(d.display_repeat orelse return);
+        if (d.repeat_rate == 0) {
+            d.display_repeat = null;
+            return;
+        }
+        if (now_ns < rep.next_ns) return;
+        const step = std.time.ns_per_s / @as(u64, d.repeat_rate);
+        rep.next_ns = if (now_ns - rep.next_ns < step) rep.next_ns + step else now_ns + step;
+        w.pushKeyViaDisplay(rep.code, true, true, d);
+    }
+
+    fn initGlobals(d: *WaylandDisplay) !void {
+        const registry = try d.globals.fetch(d.conn);
+        d.compositor = (try d.globals.bind(registry, p.wl_compositor.name, 6, null)) orelse return error.NoCompositor;
+        d.wm_base = (try d.globals.bind(registry, p.xdg_wm_base.name, 6, .{ .ptr = d, .handler = displayWmBaseEvent })) orelse return error.NoXdgShell;
+        if (d.globals.find(p.zwp_linux_dmabuf_v1.name)) |gl| if (gl.version >= 2) {
+            if (DmaBufDevice.open()) |dev_val| {
+                var dev = dev_val;
+                if (try d.globals.bind(registry, p.zwp_linux_dmabuf_v1.name, 3, .{ .ptr = d, .handler = displayDmabufEvent })) |dmabuf_proxy| {
+                    d.dmabuf = dmabuf_proxy;
+                    d.dmabuf_dev = dev;
+                } else {
+                    dev.close();
+                }
+            }
+        };
+        errdefer if (d.dmabuf_dev) |*dev| {
+            dev.close();
+            d.dmabuf_dev = null;
+        };
+        if (try d.globals.bind(registry, p.wl_shm.name, 1, null)) |shm_proxy| {
+            d.shm = shm_proxy;
+        } else if (d.dmabuf == null or d.dmabuf_dev == null) {
+            return error.NoShm;
+        }
+        if (d.dmabuf != null and d.dmabuf_dev != null and d.dmabuf_dev.?.supports_syncobj) {
+            d.drm_syncobj_manager = try d.globals.bind(registry, p.wp_linux_drm_syncobj_manager_v1.name, 1, null);
+        }
+        d.decoration_manager = try d.globals.bind(registry, p.zxdg_decoration_manager_v1.name, 1, null);
+        d.cursor_shape_manager = try d.globals.bind(registry, p.wp_cursor_shape_manager_v1.name, 1, null);
+        d.presentation = try d.globals.bind(registry, p.wp_presentation.name, p.wp_presentation.version, .{ .ptr = d, .handler = displayPresentationClockEvent });
+        d.fifo_manager = try d.globals.bind(registry, p.wp_fifo_manager_v1.name, 1, null);
+        d.commit_timing_manager = try d.globals.bind(registry, p.wp_commit_timing_manager_v1.name, 1, null);
+        d.pointer_constraints = try d.globals.bind(registry, p.zwp_pointer_constraints_v1.name, 1, null);
+        d.relative_pointer_manager = try d.globals.bind(registry, p.zwp_relative_pointer_manager_v1.name, 1, null);
+        d.seat = try d.globals.bind(registry, p.wl_seat.name, 5, .{ .ptr = d, .handler = displaySeatEvent });
+        d.clipboard = .{ .gpa = d.gpa, .io = d.io };
+        d.clipboard_initialized = true;
+        errdefer if (d.clipboard_initialized) {
+            d.clipboard.deinit();
+            d.clipboard_initialized = false;
+        };
+        try d.clipboard.attach(d.conn, try d.globals.bind(registry, p.wl_data_device_manager.name, 3, null), d.seat);
+        d.text_input_manager = try d.globals.bind(registry, p.zwp_text_input_manager_v3.name, 1, null);
+        if (d.text_input_manager) |mgr| if (d.seat) |seat| {
+            const ti = try d.conn.newObject(.{ .ptr = d, .handler = displayTextInputEvent });
+            var m = try mgr.request(p.zwp_text_input_manager_v3.request.get_text_input);
+            m.uint(ti.id).uint(seat.id).end();
+            d.text_input = ti;
+        };
+    }
+
+    fn deinitGlobals(d: *WaylandDisplay) void {
+        if (d.compositor.id == 0) return;
+        if (d.clipboard_initialized) {
+            d.clipboard.deinit();
+            d.clipboard_initialized = false;
+        }
+        if (d.keymap) |*km| {
+            km.deinit();
+            d.keymap = null;
+        }
+        if (d.compose_table) |*t| {
+            t.deinit();
+            d.compose_table = null;
+        }
+        if (d.dmabuf_dev) |*dev| {
+            dev.close();
+            d.dmabuf_dev = null;
+        }
+    }
+
+    /// Creates a window with only per-window objects, using shared display globals.
+    fn createWindowObject(d: *WaylandDisplay, options: WaylandWindow.Options) !*WaylandWindow {
+        const gpa = d.gpa;
+        const conn = d.conn;
+        const w = try gpa.create(WaylandWindow);
+        errdefer gpa.destroy(w);
+        errdefer conn.forgetAll(w);
+        const min_size = options.min_size orelse [2]u32{ 0, 0 };
+        w.* = WaylandWindow{
+            .gpa = gpa,
+            .io = conn.conn.io,
+            .conn = conn,
+            .compositor = d.compositor,
+            .wm_base = d.wm_base,
+            .shm = d.shm orelse .{},
+            .dmabuf = d.dmabuf,
+            .dmabuf_argb8888 = d.dmabuf_argb8888,
+            .dmabuf_xrgb8888 = d.dmabuf_xrgb8888,
+            .drm_syncobj_manager = d.drm_syncobj_manager,
+            .decoration_manager = d.decoration_manager,
+            .cursor_shape_manager = d.cursor_shape_manager,
+            .fifo_manager = d.fifo_manager,
+            .commit_timing_manager = d.commit_timing_manager,
+            .pointer_constraints = d.pointer_constraints,
+            .relative_pointer_manager = d.relative_pointer_manager,
+            .presentation = d.presentation,
+            .presentation_clock_id = d.presentation_clock_id,
+            .text_input_manager = d.text_input_manager,
+            .clipboard = .{ .gpa = gpa, .io = conn.conn.io },
+            .display = d,
+            .compose_env = d.compose_env,
+            .width = if (options.maximized) options.size[0] else @max(options.size[0], min_size[0]),
+            .height = if (options.maximized) options.size[1] else @max(options.size[1], min_size[1]),
+            .min_size = min_size,
+            .maximized = options.maximized,
+        };
+        const tlen = @min(options.title.len, w.title_buf.len);
+        @memcpy(w.title_buf[0..tlen], options.title[0..tlen]);
+        w.title_len = tlen;
+        w.clipboard.drag_callbacks = .{ .ctx = w, .enter = WaylandWindow.onDragEnter, .motion = WaylandWindow.onDragMotion, .leave = WaylandWindow.onDragLeave, .drop = WaylandWindow.onDragDrop };
+        w.surface = try conn.newObject(.{ .ptr = w, .handler = WaylandWindow.surfaceEvent });
+        var m = try w.compositor.request(p.wl_compositor.request.create_surface);
+        m.uint(w.surface.id).end();
+        if (d.fifo_manager) |mgr| {
+            const fifo = try conn.newObject(null);
+            m = try mgr.request(p.wp_fifo_manager_v1.request.get_fifo);
+            m.uint(fifo.id).uint(w.surface.id).end();
+            w.fifo = fifo;
+        }
+        if (d.commit_timing_manager) |mgr| {
+            const timer = try conn.newObject(null);
+            m = try mgr.request(p.wp_commit_timing_manager_v1.request.get_timer);
+            m.uint(timer.id).uint(w.surface.id).end();
+            w.commit_timer = timer;
+        }
+        w.xdg_surface = try conn.newObject(.{ .ptr = w, .handler = WaylandWindow.xdgSurfaceEvent });
+        m = try w.wm_base.request(p.xdg_wm_base.request.get_xdg_surface);
+        m.uint(w.xdg_surface.id).uint(w.surface.id).end();
+        w.toplevel = try conn.newObject(.{ .ptr = w, .handler = WaylandWindow.toplevelEvent });
+        m = try w.xdg_surface.request(p.xdg_surface.request.get_toplevel);
+        m.uint(w.toplevel.id).end();
+        if (d.decoration_manager) |mgr| {
+            const dec = try conn.newObject(.{ .ptr = w, .handler = WaylandWindow.decorationEvent });
+            m = try mgr.request(p.zxdg_decoration_manager_v1.request.get_toplevel_decoration);
+            m.uint(dec.id).uint(w.toplevel.id).end();
+            w.toplevel_decoration = dec;
+            if (options.draw_in_title_bar) {
+                m = try dec.request(p.zxdg_toplevel_decoration_v1.request.set_mode);
+                m.uint(p.zxdg_toplevel_decoration_v1.mode.client_side).end();
+            }
+        }
+        m = try w.toplevel.request(p.xdg_toplevel.request.set_title);
+        m.string(options.title).end();
+        if (options.app_id) |app_id| {
+            m = try w.toplevel.request(p.xdg_toplevel.request.set_app_id);
+            m.string(app_id).end();
+        }
+        if (options.parent) |parent_win| {
+            m = try w.toplevel.request(p.xdg_toplevel.request.set_parent);
+            m.uint(parent_win.toplevel.id).end();
+        }
+        if (options.min_size) |ms| {
+            m = try w.toplevel.request(p.xdg_toplevel.request.set_min_size);
+            m.int(@intCast(ms[0])).int(@intCast(ms[1])).end();
+        }
+        if (options.maximized) {
+            m = try w.toplevel.request(p.xdg_toplevel.request.set_maximized);
+            m.end();
+        }
+        m = try w.surface.request(p.wl_surface.request.commit);
+        m.end();
+        while (w.pending_serial == null) try conn.dispatch();
+        _ = try w.applyConfigure();
+        w.updateExtensions();
+        try conn.flush();
+        return w;
+    }
+
+    fn displayWmBaseEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *wire.Reader) void {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ptr.?));
+        if (opcode != p.xdg_wm_base.event.ping) return;
+        const serial = r.uint() catch return;
+        var m = d.wm_base.request(p.xdg_wm_base.request.pong) catch return;
+        m.uint(serial).end();
+        d.conn.flush() catch {};
+    }
+
+    fn displayDmabufEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *wire.Reader) void {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ptr.?));
+        switch (opcode) {
+            p.zwp_linux_dmabuf_v1.event.format => {
+                const fmt = r.uint() catch return;
+                if (fmt == p.fourcc.argb8888) d.dmabuf_argb8888 = true;
+                if (fmt == p.fourcc.xrgb8888) d.dmabuf_xrgb8888 = true;
+            },
+            p.zwp_linux_dmabuf_v1.event.modifier => {
+                const fmt = r.uint() catch return;
+                const mod_hi = r.uint() catch return;
+                const mod_lo = r.uint() catch return;
+                const mod = (@as(u64, mod_hi) << 32) | mod_lo;
+                if (mod == p.modifier.linear or mod == 0x00ffffffffffffff) {
+                    if (fmt == p.fourcc.argb8888) d.dmabuf_argb8888 = true;
+                    if (fmt == p.fourcc.xrgb8888) d.dmabuf_xrgb8888 = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn displayPresentationClockEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *wire.Reader) void {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ptr.?));
+        if (opcode == p.wp_presentation.event.clock_id) {
+            d.presentation_clock_id = r.uint() catch return;
+        }
+    }
+
+    fn displaySeatEvent(ptr: ?*anyopaque, conn: *client.Display, _: u32, opcode: u16, r: *wire.Reader) void {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ptr.?));
+        if (opcode != p.wl_seat.event.capabilities) return;
+        const caps = r.uint() catch return;
+        if (caps & p.wl_seat.capability.pointer != 0 and d.pointer == null) {
+            const pointer = conn.newObject(.{ .ptr = d, .handler = displayPointerEvent }) catch return;
+            var m = d.seat.?.request(p.wl_seat.request.get_pointer) catch return;
+            m.uint(pointer.id).end();
+            d.pointer = pointer;
+            if (d.cursor_shape_manager) |manager| {
+                const device = conn.newObject(null) catch return;
+                m = manager.request(p.wp_cursor_shape_manager_v1.request.get_pointer) catch return;
+                m.uint(device.id).uint(pointer.id).end();
+                d.cursor_device = device;
+            }
+            if (d.relative_pointer_manager) |manager| {
+                const rel = conn.newObject(.{ .ptr = d, .handler = displayRelativeEvent }) catch return;
+                m = manager.request(p.zwp_relative_pointer_manager_v1.request.get_relative_pointer) catch return;
+                m.uint(rel.id).uint(pointer.id).end();
+                d.relative_pointer = rel;
+            }
+        }
+        if (caps & p.wl_seat.capability.touch != 0 and d.touch == null) {
+            const touch = conn.newObject(.{ .ptr = d, .handler = displayTouchEvent }) catch return;
+            var m = d.seat.?.request(p.wl_seat.request.get_touch) catch return;
+            m.uint(touch.id).end();
+            d.touch = touch;
+        }
+        if (caps & p.wl_seat.capability.keyboard != 0 and d.keyboard == null) {
+            const keyboard = conn.newObject(.{ .ptr = d, .handler = displayKeyboardEvent }) catch return;
+            var m = d.seat.?.request(p.wl_seat.request.get_keyboard) catch return;
+            m.uint(keyboard.id).end();
+            d.keyboard = keyboard;
+        }
+    }
+
+    fn displayRelativeEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *wire.Reader) void {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ptr.?));
+        const w = d.pointer_window orelse return;
+        if (opcode != p.zwp_relative_pointer_v1.event.relative_motion) return;
+        _ = r.uint() catch return;
+        _ = r.uint() catch return;
+        const dx: f32 = @floatCast(r.fixed() catch return);
+        const dy: f32 = @floatCast(r.fixed() catch return);
+        w.pushInput(.{ .relative_motion = .{ dx, dy } });
+    }
+
+    fn displayPointerEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *wire.Reader) void {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ptr.?));
+        switch (opcode) {
+            p.wl_pointer.event.enter => {
+                const serial = r.uint() catch return;
+                const surface_id = r.uint() catch return;
+                const x = r.fixed() catch return;
+                const y = r.fixed() catch return;
+                const next_win = d.windowForSurface(surface_id);
+                if (d.pointer_window != null and d.pointer_window != next_win) {
+                    d.flushDisplayPointerLeave();
+                }
+                d.leave_pending = false;
+                d.pointer_window = next_win;
+                const w = d.pointer_window orelse return;
+                d.enter_serial = serial;
+                d.cursor_shape = p.wp_cursor_shape_device_v1.shape.default;
+                d.buttons_down = 0;
+                w.pointer_surface = surface_id;
+                w.leave_pending = false;
+                w.pointer_pos = w.toWindow(surface_id, .{ @floatCast(x), @floatCast(y) });
+                d.updateDisplayCursor();
+                w.pushInput(.{ .motion = w.pointer_pos });
+            },
+            p.wl_pointer.event.motion => {
+                _ = r.uint() catch return;
+                const x = r.fixed() catch return;
+                const y = r.fixed() catch return;
+                const w = d.pointer_window orelse return;
+                w.pointer_pos = w.toWindow(w.pointer_surface, .{ @floatCast(x), @floatCast(y) });
+                d.updateDisplayCursor();
+                w.pushInput(.{ .motion = w.pointer_pos });
+            },
+            p.wl_pointer.event.button => {
+                const serial = r.uint() catch return;
+                _ = r.uint() catch return;
+                const button = pointerButtonOf(r.uint() catch return);
+                const state = r.uint() catch return;
+                const pressed = state == p.wl_pointer.button_state.pressed;
+                const w = d.pointer_window orelse return;
+                if (pressed) {
+                    w.press_serial = serial;
+                    w.grab_serial = serial;
+                    d.clipboard.serial = serial;
+                } else {
+                    w.press_serial = 0;
+                }
+                const on_window = w.pointer_surface == w.surface.id or w.pointer_surface == 0;
+                if (pressed and button == .left and on_window) {
+                    const edges = w.edgesAt(w.pointer_pos);
+                    if (edges != 0) if (d.seat) |seat| {
+                        var m = w.toplevel.request(p.xdg_toplevel.request.resize) catch return;
+                        m.uint(seat.id).uint(serial).uint(edges).end();
+                        w.conn.flush() catch {};
+                        return;
+                    };
+                }
+                const bit = @as(u32, 1) << @backingInt(button);
+                if (pressed) {
+                    if (d.buttons_down == 0 and on_window and !w.isInsideContent(w.pointer_pos)) return;
+                    d.buttons_down |= bit;
+                } else {
+                    d.buttons_down &= ~bit;
+                    if (d.buttons_down == 0) d.updateDisplayCursor();
+                }
+                w.pushInput(.{ .button = .{ .pos = w.pointer_pos, .button = button, .pressed = pressed } });
+            },
+            p.wl_pointer.event.axis => {
+                _ = r.uint() catch return;
+                const axis = r.uint() catch return;
+                const value: f32 = @floatCast(r.fixed() catch return);
+                const w = d.pointer_window orelse return;
+                const vertical = axis == p.wl_pointer.axis.vertical_scroll;
+                w.pushInput(.{ .scroll = .{ .pos = w.pointer_pos, .dx = if (vertical) 0 else value, .dy = if (vertical) value else 0 } });
+            },
+            p.wl_pointer.event.leave => {
+                _ = r.uint() catch return;
+                _ = r.uint() catch return;
+                d.leave_pending = true;
+            },
+            p.wl_pointer.event.frame => d.flushDisplayPointerLeave(),
+            else => {},
+        }
+    }
+
+    fn displayTouchEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *wire.Reader) void {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ptr.?));
+        switch (opcode) {
+            p.wl_touch.event.down => {
+                const serial = r.uint() catch return;
+                _ = r.uint() catch return;
+                const surface_id = r.uint() catch return;
+                const id: i32 = @bitCast(r.uint() catch return);
+                const x = r.fixed() catch return;
+                const y = r.fixed() catch return;
+                const w = d.windowForSurface(surface_id);
+                for (&d.touch_windows) |*slot| if (slot.* == null) {
+                    slot.* = .{ .id = id, .window = w };
+                    break;
+                };
+                const win = w orelse return;
+                win.touch_surface = surface_id;
+                const pos = win.toWindow(surface_id, .{ @floatCast(x), @floatCast(y) });
+                win.press_serial = serial;
+                win.grab_serial = serial;
+                d.clipboard.serial = serial;
+                const on_window = surface_id == win.surface.id;
+                const edges = if (on_window) win.edgesAt(pos) else 0;
+                if (edges != 0) if (d.seat) |seat| {
+                    var m = win.toplevel.request(p.xdg_toplevel.request.resize) catch return;
+                    m.uint(seat.id).uint(serial).uint(edges).end();
+                    win.conn.flush() catch {};
+                    return;
+                };
+                if (on_window and !win.isInsideContent(pos)) return;
+                win.pushInput(.{ .touch_down = .{ .id = id, .pos = pos } });
+            },
+            p.wl_touch.event.motion => {
+                _ = r.uint() catch return;
+                const id: i32 = @bitCast(r.uint() catch return);
+                const x = r.fixed() catch return;
+                const y = r.fixed() catch return;
+                const w = d.touchWindowFor(id) orelse return;
+                const pos = w.toWindow(w.touch_surface, .{ @floatCast(x), @floatCast(y) });
+                w.pushInput(.{ .touch_motion = .{ .id = id, .pos = pos } });
+            },
+            p.wl_touch.event.up => {
+                _ = r.uint() catch return;
+                _ = r.uint() catch return;
+                const id: i32 = @bitCast(r.uint() catch return);
+                const w = d.removeTouchWindow(id) orelse return;
+                w.press_serial = 0;
+                w.pushInput(.{ .touch_up = id });
+            },
+            p.wl_touch.event.cancel => {
+                for (&d.touch_windows) |*slot| {
+                    if (slot.*) |tw| if (tw.window) |win| {
+                        win.press_serial = 0;
+                        win.pushInput(.touch_cancel);
+                    };
+                    slot.* = null;
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn displayKeyboardEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *wire.Reader) void {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ptr.?));
+        switch (opcode) {
+            p.wl_keyboard.event.keymap => {
+                const fd = r.fd() catch return;
+                defer _ = linux.close(fd);
+                _ = r.uint() catch return;
+                const size = r.uint() catch return;
+                if (keymapFrom(d.gpa, fd, size)) |km| {
+                    if (d.keymap) |*old| old.deinit();
+                    d.keymap = km;
+                    d.xkb_state = .{};
+                    d.compose_state.reset();
+                }
+            },
+            p.wl_keyboard.event.modifiers => {
+                _ = r.uint() catch return;
+                const depressed = r.uint() catch return;
+                const latched = r.uint() catch return;
+                const locked = r.uint() catch return;
+                const group = r.uint() catch return;
+                d.xkb_state = .{ .depressed = depressed, .latched = latched, .locked = locked, .group = group };
+            },
+            p.wl_keyboard.event.enter => {
+                _ = r.uint() catch return;
+                const surface_id = r.uint() catch return;
+                const next_win = d.windowForSurface(surface_id);
+                if (d.keyboard_window != null and d.keyboard_window != next_win) {
+                    const old_w = d.keyboard_window.?;
+                    d.display_repeat = null;
+                    d.compose_state.reset();
+                    var it = old_w.keys_down.iterator(.{});
+                    while (it.next()) |code| {
+                        old_w.pushInput(.{ .key = .{ .key = window_mod.evdev.keyOf(@intCast(code)), .pressed = false } });
+                    }
+                    old_w.keys_down = .empty;
+                }
+                d.keyboard_window = next_win;
+            },
+            p.wl_keyboard.event.key => {
+                const w = d.keyboard_window orelse return;
+                const serial = r.uint() catch return;
+                _ = r.uint() catch return;
+                const code = r.uint() catch return;
+                const key_state = r.uint() catch return;
+                const pressed = key_state == p.wl_keyboard.key_state.pressed;
+                if (pressed) {
+                    d.clipboard.serial = serial;
+                    w.grab_serial = serial;
+                }
+                if (code < 256) {
+                    d.keys_down.setValue(code, pressed);
+                    w.keys_down.setValue(code, pressed);
+                }
+                if (pressed) {
+                    if (!WaylandWindow.isModifierKey(code) and d.repeat_rate > 0) {
+                        d.display_repeat = .{
+                            .code = code,
+                            .next_ns = window_mod.nowNs(d.io) + @as(u64, d.repeat_delay_ms) * std.time.ns_per_ms,
+                        };
+                    }
+                } else if (d.display_repeat) |rep| {
+                    if (rep.code == code) d.display_repeat = null;
+                }
+                w.pushKeyViaDisplay(code, pressed, false, d);
+            },
+            p.wl_keyboard.event.leave => {
+                _ = r.uint() catch return;
+                _ = r.uint() catch return;
+                const w = d.keyboard_window orelse return;
+                d.keyboard_window = null;
+                d.display_repeat = null;
+                d.compose_state.reset();
+                var it = w.keys_down.iterator(.{});
+                while (it.next()) |code| {
+                    w.pushInput(.{ .key = .{ .key = window_mod.evdev.keyOf(@intCast(code)), .pressed = false } });
+                }
+                w.keys_down = .empty;
+                d.keys_down = .empty;
+            },
+            p.wl_keyboard.event.repeat_info => {
+                const rate = r.int() catch return;
+                const delay = r.int() catch return;
+                d.repeat_rate = @intCast(@max(rate, 0));
+                d.repeat_delay_ms = @intCast(@max(delay, 0));
+                if (d.repeat_rate == 0) d.display_repeat = null;
+            },
+            else => {},
+        }
+    }
+
+    fn displayTextInputEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *wire.Reader) void {
+        const d: *WaylandDisplay = @ptrCast(@alignCast(ptr.?));
+        const w = d.keyboard_window orelse return;
+        switch (opcode) {
+            p.zwp_text_input_v3.event.enter => {
+                if (!w.ownsSurface(r.uint() catch return)) return;
+                w.text_input_entered = true;
+                if (w.text_input_enabled) if (d.text_input) |ti| {
+                    w.sendTextInputState(ti, true);
+                };
+            },
+            p.zwp_text_input_v3.event.leave => {
+                if (!w.ownsSurface(r.uint() catch return)) return;
+                w.text_input_entered = false;
+                w.text_input_pending_preedit = null;
+                w.text_input_pending_commit = null;
+                w.text_input_pending_delete = null;
+            },
+            p.zwp_text_input_v3.event.preedit_string => {
+                const text = (r.string() catch return) orelse "";
+                const begin = r.int() catch return;
+                const end = r.int() catch return;
+                var pre: @TypeOf(w.text_input_pending_preedit.?) = .{ .cursor_begin = begin, .cursor_end = end };
+                const n: u8 = @intCast(@min(text.len, pre.buf.len));
+                @memcpy(pre.buf[0..n], text[0..n]);
+                pre.len = n;
+                w.text_input_pending_preedit = pre;
+            },
+            p.zwp_text_input_v3.event.commit_string => {
+                const text = (r.string() catch return) orelse "";
+                var com: @TypeOf(w.text_input_pending_commit.?) = .{};
+                const n: u8 = @intCast(@min(text.len, com.buf.len));
+                @memcpy(com.buf[0..n], text[0..n]);
+                com.len = n;
+                w.text_input_pending_commit = com;
+            },
+            p.zwp_text_input_v3.event.delete_surrounding_text => {
+                const before = r.uint() catch return;
+                const after = r.uint() catch return;
+                w.text_input_pending_delete = .{ .before_length = before, .after_length = after };
+            },
+            p.zwp_text_input_v3.event.done => {
+                _ = r.uint() catch return;
+                if (w.text_input_pending_delete) |del| {
+                    w.text_input_pending_delete = null;
+                    w.pushInput(.{ .text_delete_surrounding = .{ .before_length = del.before_length, .after_length = del.after_length } });
+                }
+                if (w.text_input_pending_commit) |com| {
+                    w.text_input_pending_commit = null;
+                    if (com.len > 0) {
+                        var ev: window_mod.InputEvent = .{ .text_commit = .{ .len = com.len } };
+                        @memcpy(ev.text_commit.buf[0..com.len], com.buf[0..com.len]);
+                        w.pushInput(ev);
+                    }
+                }
+                if (w.text_input_pending_preedit) |pre| {
+                    w.text_input_pending_preedit = null;
+                    w.text_input_has_preedit = pre.len > 0;
+                    var ev: window_mod.InputEvent = .{ .text_preedit = .{ .len = pre.len, .cursor_begin = pre.cursor_begin, .cursor_end = pre.cursor_end } };
+                    @memcpy(ev.text_preedit.buf[0..pre.len], pre.buf[0..pre.len]);
+                    w.pushInput(ev);
+                } else if (w.text_input_has_preedit) {
+                    w.text_input_has_preedit = false;
+                    w.pushInput(.{ .text_preedit = .{} });
+                }
+            },
+            else => {},
+        }
     }
 };
 
@@ -695,14 +1410,16 @@ pub const WaylandWindow = struct {
     pub const platform: window_mod.WindowPlatform = .wayland;
 
     pub fn usingDmabuf(w: *const WaylandWindow) bool {
-        return w.dmabuf != null and w.dmabuf_dev != null and (w.dmabuf_argb8888 or w.dmabuf_xrgb8888);
+        const dev_present = if (w.display) |d| d.dmabuf_dev != null else w.dmabuf_dev != null;
+        return w.dmabuf != null and dev_present and (w.dmabuf_argb8888 or w.dmabuf_xrgb8888);
     }
 
     pub fn usingDrmSyncobj(w: *const WaylandWindow) bool {
         if (w.syncobj_surface != null) return true;
         if (!w.usingDmabuf()) return false;
         if (w.drm_syncobj_manager == null) return false;
-        return w.dmabuf_dev.?.supports_syncobj;
+        const dev = if (w.display) |d| d.dmabuf_dev else w.dmabuf_dev;
+        return if (dev) |v| v.supports_syncobj else false;
     }
 
     /// Stops using explicit synchronization (`wp_linux_drm_syncobj_v1`) for
@@ -1115,9 +1832,10 @@ pub const WaylandWindow = struct {
 
     /// Notes which of `known_extensions` the compositor announced.
     pub fn updateExtensions(w: *WaylandWindow) void {
+        const gl = if (w.display) |d| &d.globals else &w.globals;
         var n: usize = 0;
         for (known_extensions) |name| {
-            if (w.globals.find(name) == null) continue;
+            if (gl.find(name) == null) continue;
             w.extensions_buf[n] = name;
             n += 1;
         }
@@ -1161,56 +1879,20 @@ pub const WaylandWindow = struct {
         if (w.dmabuf_dev) |*dev| dev.close();
         if (w.display) |d| {
             // The connection stays (the display's), with the other windows
-            // on it: this one's surface, seat devices, and bound globals go,
-            // and nothing more of it is told what comes.
+            // on it: this one's surface, decoration, and toplevel go,
+            // while shared globals stay with the display.
             for ([_]?client.Proxy{
                 w.locked_pointer,
-                w.relative_pointer,
-                w.cursor_device,
-                w.text_input,
-                w.keyboard,
-                w.pointer,
-                w.touch,
-                w.seat,
                 w.toplevel_decoration,
                 w.toplevel,
                 w.xdg_surface,
-                w.wm_base,
                 w.surface,
-                w.presentation,
-                w.dmabuf,
-                w.decoration_manager,
-                w.cursor_shape_manager,
-                w.fifo_manager,
-                w.commit_timing_manager,
-                w.drm_syncobj_manager,
-                w.pointer_constraints,
-                w.relative_pointer_manager,
-                w.text_input_manager,
             }, [_]u16{
                 p.zwp_locked_pointer_v1.request.destroy,
-                p.zwp_relative_pointer_v1.request.destroy,
-                p.wp_cursor_shape_device_v1.request.destroy,
-                p.zwp_text_input_v3.request.destroy,
-                p.wl_keyboard.request.release,
-                p.wl_pointer.request.release,
-                p.wl_touch.request.release,
-                p.wl_seat.request.release,
                 p.zxdg_toplevel_decoration_v1.request.destroy,
                 p.xdg_toplevel.request.destroy,
                 p.xdg_surface.request.destroy,
-                p.xdg_wm_base.request.destroy,
                 p.wl_surface.request.destroy,
-                p.wp_presentation.request.destroy,
-                p.zwp_linux_dmabuf_v1.request.destroy,
-                p.zxdg_decoration_manager_v1.request.destroy,
-                p.wp_cursor_shape_manager_v1.request.destroy,
-                p.wp_fifo_manager_v1.request.destroy,
-                p.wp_commit_timing_manager_v1.request.destroy,
-                p.wp_linux_drm_syncobj_manager_v1.request.destroy,
-                p.zwp_pointer_constraints_v1.request.destroy,
-                p.zwp_relative_pointer_manager_v1.request.destroy,
-                p.zwp_text_input_manager_v3.request.destroy,
             }) |obj, opcode| if (obj) |o| if (o.id != 0) {
                 if (o.request(opcode)) |m0| {
                     var m = m0;
@@ -1218,9 +1900,6 @@ pub const WaylandWindow = struct {
                 } else |_| {}
             };
             w.conn.forgetAll(w);
-            if (w.keyboard) |kb| if (kb.id != 0) {
-                w.conn.setListener(kb.id, .{ .ptr = null, .handler = drainKeyboardEvent }) catch {};
-            };
             w.conn.flush() catch {};
             d.forget(w);
         } else {
@@ -1260,9 +1939,10 @@ pub const WaylandWindow = struct {
 
     pub fn lockPointer(w: *WaylandWindow) bool {
         if (w.locked_pointer != null) return true;
-        const constraints = w.pointer_constraints orelse return false;
-        const pointer = w.pointer orelse return false;
-        if (w.relative_pointer == null) return false;
+        const constraints = if (w.display) |d| (d.pointer_constraints orelse return false) else (w.pointer_constraints orelse return false);
+        const pointer = if (w.display) |d| (d.pointer orelse return false) else (w.pointer orelse return false);
+        const has_rel = if (w.display) |d| (d.relative_pointer != null) else (w.relative_pointer != null);
+        if (!has_rel) return false;
         const lock = w.conn.newObject(.{ .ptr = w, .handler = lockEvent }) catch return false;
         var m = constraints.request(p.zwp_pointer_constraints_v1.request.lock_pointer) catch return false;
         m.uint(lock.id).uint(w.surface.id).uint(pointer.id).uint(0).uint(p.zwp_pointer_constraints_v1.lifetime.persistent).end();
@@ -1359,7 +2039,7 @@ pub const WaylandWindow = struct {
         w.conn.forget(positioner.id);
 
         switch (pl.kind) {
-            .menu => if (w.seat) |seat| if (w.grab_serial != 0) {
+            .menu => if (if (w.display) |d| d.seat else w.seat) |seat| if (w.grab_serial != 0) {
                 m = try popup.request(p.xdg_popup.request.grab);
                 m.uint(seat.id).uint(w.grab_serial).end();
             },
@@ -1570,11 +2250,11 @@ pub const WaylandWindow = struct {
     pub fn setCursor(w: *WaylandWindow, cursor: PointerCursor) void {
         if (w.app_cursor == cursor) return;
         w.app_cursor = cursor;
-        w.updateCursor();
+        if (w.display) |d| d.updateDisplayCursor() else w.updateCursor();
     }
 
     /// `cursor`'s `wp_cursor_shape_device_v1.shape` code.
-    fn cursorShape(cursor: PointerCursor) u32 {
+    pub fn cursorShape(cursor: PointerCursor) u32 {
         const sh = p.wp_cursor_shape_device_v1.shape;
         return switch (cursor) {
             inline else => |c| @field(sh, @tagName(c)),
@@ -1599,11 +2279,28 @@ pub const WaylandWindow = struct {
     pub fn startDrag(w: *WaylandWindow, mime_type: []const u8, bytes: []const u8, actions: window_mod.DragActions) bool {
         // Wayland's `dnd_action`s: copy 1, move 2, ask 4.
         const bits: u32 = @as(u32, @intFromBool(actions.copy)) | @as(u32, @intFromBool(actions.move)) << 1 | @as(u32, @intFromBool(actions.ask)) << 2;
-        return w.clipboard.startDrag(w.surface, null, mime_type, bytes, bits);
+        const cb = if (w.display) |d| &d.clipboard else &w.clipboard;
+        return cb.startDrag(w.surface, null, mime_type, bytes, bits);
     }
 
     pub fn takeDrop(w: *WaylandWindow) ?DroppedData {
-        return w.clipboard.takeDrop();
+        const cb = if (w.display) |d| &d.clipboard else &w.clipboard;
+        return cb.takeDrop();
+    }
+
+    pub fn hasClipboard(w: *const WaylandWindow) bool {
+        const cb = if (w.display) |d| &d.clipboard else &w.clipboard;
+        return cb.hasClipboard();
+    }
+
+    pub fn copy(w: *WaylandWindow, text: []const u8) void {
+        const cb = if (w.display) |d| &d.clipboard else &w.clipboard;
+        cb.copy(text);
+    }
+
+    pub fn paste(w: *WaylandWindow, sink: clipboard_mod.Sink) void {
+        const cb = if (w.display) |d| &d.clipboard else &w.clipboard;
+        cb.paste(sink);
     }
 
     /// The next frame shown is drawn for `target_ns`: with
@@ -1621,7 +2318,7 @@ pub const WaylandWindow = struct {
     }
 
     pub fn setTextInput(w: *WaylandWindow, state: ?TextInputState) void {
-        const ti = w.text_input orelse return;
+        const ti = if (w.display) |d| (d.text_input orelse return) else (w.text_input orelse return);
         if (!w.text_input_entered) {
             if (state) |s| {
                 w.saveTextInputState(s);
@@ -1856,10 +2553,73 @@ pub const WaylandWindow = struct {
         } };
     }
 
+    fn pushKeyViaDisplay(w: *WaylandWindow, code: u32, pressed: bool, repeat: bool, d: *WaylandDisplay) void {
+        var ev = w.keyInputViaDisplay(code, pressed, d);
+        const km = &(d.keymap orelse return w.pushInput(ev));
+        if (!pressed) return w.pushInput(ev);
+        const sym = km.keysym(code, d.xkb_state);
+        if (repeat) {
+            // A dead key, Compose, or a key in a sequence does not repeat.
+            if (d.compose_state.composing() or compose.starts(sym)) ev.key.char = null;
+            return w.pushInput(ev);
+        }
+        const table = w.composeTableViaDisplay(sym, d) orelse return w.pushInput(ev);
+        switch (d.compose_state.feed(table, sym)) {
+            .none => w.pushInput(ev),
+            .composing, .cancelled => {
+                ev.key.char = null;
+                w.pushInput(ev);
+            },
+            .composed => |r| {
+                // One character comes with the key; more as text.
+                const view = std.unicode.Utf8View.init(r.text) catch {
+                    ev.key.char = null;
+                    return w.pushInput(ev);
+                };
+                var it = view.iterator();
+                const first = it.nextCodepoint();
+                const one = first != null and it.nextCodepoint() == null;
+                ev.key.char = if (one) first else null;
+                w.pushInput(ev);
+                if (!one and r.text.len > 0) {
+                    var commit: window_mod.InputEvent = .{ .text_commit = .{} };
+                    const n: u8 = @intCast(@min(r.text.len, commit.text_commit.buf.len));
+                    @memcpy(commit.text_commit.buf[0..n], r.text[0..n]);
+                    commit.text_commit.len = n;
+                    w.pushInput(commit);
+                }
+            },
+        }
+    }
+
+    fn composeTableViaDisplay(w: *WaylandWindow, sym: u32, d: *WaylandDisplay) ?*const compose.Table {
+        _ = w;
+        if (d.compose_table) |*t| return t;
+        if (d.compose_tried or !compose.starts(sym)) return null;
+        d.compose_tried = true;
+        d.compose_table = compose.Table.load(d.gpa, d.io, d.compose_env) orelse compose.Table.builtin(d.gpa) catch null;
+        return if (d.compose_table) |*t| t else null;
+    }
+
+    fn keyInputViaDisplay(w: *const WaylandWindow, code: u32, pressed: bool, d: *const WaylandDisplay) window_mod.InputEvent {
+        _ = w;
+        const key = window_mod.evdev.keyOf(code);
+        const km = &(d.keymap orelse return .{ .key = .{ .key = key, .pressed = pressed } });
+        const mods = d.xkb_state.mods();
+        return .{ .key = .{
+            .key = key,
+            .pressed = pressed,
+            .char = if (pressed) km.char(code, d.xkb_state) else null,
+            .shift = mods & xkb.shift_mask != 0,
+            .ctrl = mods & xkb.control_mask != 0,
+        } };
+    }
+
     /// The keyboard layout in use.
     pub fn layout(w: *const WaylandWindow) window_mod.KeyboardLayout {
-        const km = &(w.keymap orelse return .{});
-        return .init(km.layoutName(w.xkb_state), km.layoutCode(w.xkb_state));
+        const km = if (w.display) |d| &(d.keymap orelse return .{}) else &(w.keymap orelse return .{});
+        const xkb_state = if (w.display) |d| d.xkb_state else w.xkb_state;
+        return .init(km.layoutName(xkb_state), km.layoutCode(xkb_state));
     }
 
     pub fn applyConfigure(w: *WaylandWindow) !?[2]u32 {
@@ -2213,8 +2973,10 @@ pub const WaylandWindow = struct {
                 // dmabuf buffers belong to the device being closed.
                 w.stopSyncobj();
                 for (&w.buffers, 0..) |*other, i| if (i != slot) if (other.*) |*b| if (b.bo != null) w.freeBuffer(b, other);
-                if (w.dmabuf_dev) |*dev| dev.close();
-                w.dmabuf_dev = null;
+                if (w.display == null) {
+                    if (w.dmabuf_dev) |*dev| dev.close();
+                    w.dmabuf_dev = null;
+                }
                 w.updateExtensions();
             }
         }
@@ -2223,7 +2985,7 @@ pub const WaylandWindow = struct {
 
     fn allocDmabufBuffer(w: *WaylandWindow, slot: usize, bw: u32, bh: u32, cw: u32, ch: u32, m_px: u32, s: u32) !Buffer {
         const dmabuf = w.dmabuf orelse return error.NoDmabuf;
-        const dev = &(w.dmabuf_dev orelse return error.NoDmabuf);
+        const dev = if (w.display) |d| &(d.dmabuf_dev orelse return error.NoDmabuf) else &(w.dmabuf_dev orelse return error.NoDmabuf);
         const fmt: u32 = if ((m_px > 0 and w.dmabuf_argb8888) or !w.dmabuf_xrgb8888)
             p.fourcc.argb8888
         else
@@ -2855,7 +3617,7 @@ pub const WaylandWindow = struct {
         }
     }
 
-    fn isModifierKey(code: u32) bool {
+    pub fn isModifierKey(code: u32) bool {
         return switch (code) {
             29, 42, 54, 56, 58, 97, 100, 125, 126 => true,
             else => false,
@@ -3056,6 +3818,77 @@ test "windows on one display heed only what happens on their own surfaces" {
     // A touch on the first is not the second's.
     send(&wins, &disp, WaylandWindow.touchEvent, p.wl_touch.event.down, &.{ 5, 0, 10, 7, 1 << 8, 1 << 8 });
     send(&wins, &disp, WaylandWindow.touchEvent, p.wl_touch.event.up, &.{ 6, 0, 7 });
+    try std.testing.expectEqual(@as(usize, 0), wins[1].takeInput().len);
+}
+
+test "WaylandDisplay routes pointer, keyboard, and touch events to the appropriate window" {
+    var disp_conn: client.Display = undefined;
+    var d: WaylandDisplay = .{
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .conn = &disp_conn,
+    };
+    var wins: [2]WaylandWindow = undefined;
+    for (&wins, [_]u32{ 10, 20 }) |*w, id| {
+        w.* = .{
+            .gpa = std.testing.allocator,
+            .io = std.testing.io,
+            .conn = &disp_conn,
+            .clipboard = .{ .gpa = std.testing.allocator, .io = std.testing.io },
+            .surface = .{ .id = id },
+            .display = &d,
+            .width = 100,
+            .height = 100,
+            .system_decorations = true,
+        };
+        try d.windows.append(std.testing.allocator, w);
+    }
+    defer d.windows.deinit(std.testing.allocator);
+
+    // Test pointer enter and motion routing:
+    var r_enter = wire.Reader{ .data = std.mem.sliceAsBytes(&[_]u32{ 1, 10, 5 << 8, 5 << 8 }), .c = undefined };
+    WaylandDisplay.displayPointerEvent(&d, &disp_conn, 1, p.wl_pointer.event.enter, &r_enter);
+    try std.testing.expectEqual(&wins[0], d.pointer_window);
+    try std.testing.expect(wins[0].takeInput().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), wins[1].takeInput().len);
+
+    // Test pointer motion:
+    var r_motion = wire.Reader{ .data = std.mem.sliceAsBytes(&[_]u32{ 2, 6 << 8, 6 << 8 }), .c = undefined };
+    WaylandDisplay.displayPointerEvent(&d, &disp_conn, 1, p.wl_pointer.event.motion, &r_motion);
+    try std.testing.expect(wins[0].takeInput().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), wins[1].takeInput().len);
+
+    // Test pointer leave:
+    var r_leave = wire.Reader{ .data = std.mem.sliceAsBytes(&[_]u32{ 3, 10 }), .c = undefined };
+    WaylandDisplay.displayPointerEvent(&d, &disp_conn, 1, p.wl_pointer.event.leave, &r_leave);
+    var r_frame = wire.Reader{ .data = &.{}, .c = undefined };
+    WaylandDisplay.displayPointerEvent(&d, &disp_conn, 1, p.wl_pointer.event.frame, &r_frame);
+    try std.testing.expectEqual(@as(?*WaylandWindow, null), d.pointer_window);
+    const left_events = wins[0].takeInput();
+    try std.testing.expectEqual(@as(usize, 1), left_events.len);
+    try std.testing.expectEqual(window_mod.InputEvent.leave, left_events[0]);
+
+    // Test keyboard enter and key routing:
+    var r_kb_enter = wire.Reader{ .data = std.mem.sliceAsBytes(&[_]u32{ 4, 20 }), .c = undefined };
+    WaylandDisplay.displayKeyboardEvent(&d, &disp_conn, 1, p.wl_keyboard.event.enter, &r_kb_enter);
+    try std.testing.expectEqual(&wins[1], d.keyboard_window);
+
+    var r_key = wire.Reader{ .data = std.mem.sliceAsBytes(&[_]u32{ 5, 0, 30, p.wl_keyboard.key_state.pressed }), .c = undefined };
+    WaylandDisplay.displayKeyboardEvent(&d, &disp_conn, 1, p.wl_keyboard.event.key, &r_key);
+    try std.testing.expectEqual(@as(usize, 0), wins[0].takeInput().len);
+    const kb_events = wins[1].takeInput();
+    try std.testing.expectEqual(@as(usize, 1), kb_events.len);
+    try std.testing.expect(kb_events[0].key.pressed);
+
+    // Test touch down and up routing:
+    var r_touch_down = wire.Reader{ .data = std.mem.sliceAsBytes(&[_]u32{ 6, 0, 10, 7, 30 << 8, 30 << 8 }), .c = undefined };
+    WaylandDisplay.displayTouchEvent(&d, &disp_conn, 1, p.wl_touch.event.down, &r_touch_down);
+    try std.testing.expectEqual(@as(usize, 1), wins[0].takeInput().len);
+    try std.testing.expectEqual(@as(usize, 0), wins[1].takeInput().len);
+
+    var r_touch_up = wire.Reader{ .data = std.mem.sliceAsBytes(&[_]u32{ 7, 0, 7 }), .c = undefined };
+    WaylandDisplay.displayTouchEvent(&d, &disp_conn, 1, p.wl_touch.event.up, &r_touch_up);
+    try std.testing.expectEqual(@as(usize, 1), wins[0].takeInput().len);
     try std.testing.expectEqual(@as(usize, 0), wins[1].takeInput().len);
 }
 
