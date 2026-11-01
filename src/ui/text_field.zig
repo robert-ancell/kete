@@ -4,7 +4,9 @@
 //! passwords) it shows dots.
 //!
 //! Text is selected by dragging over it, or with Shift and the arrow keys,
-//! Home or End (Ctrl+A: all of it). Ctrl+X cuts the selection, Ctrl+C
+//! Home or End (Ctrl+A: all of it). Ctrl+Left and Ctrl+Right move by word
+//! (with Shift, extending the selection); Ctrl+Backspace and Ctrl+Delete
+//! delete the word to the left or right. Ctrl+X cuts the selection, Ctrl+C
 //! copies it and Ctrl+V pastes over it, when the text comes (through the
 //! UI's clipboard: see `WindowUi.copyText` and `WindowUi.pasteText`); the right button, or holding the left down, shows a
 //! menu with the same (`WindowUi.openMenu`). An obscured field's text cannot be
@@ -297,6 +299,25 @@ pub const TextField = struct {
                     },
                     // The text comes later (see `pasted`).
                     .v => s.paste(),
+                    // Word movement: Ctrl+Left/Right move by word; Shift extends
+                    // the selection. Ctrl+Backspace/Delete delete a whole word.
+                    .left => s.moveTo(edit.wordBefore(s.buf[0..s.len], s.cursor), k.shift),
+                    .right => s.moveTo(edit.wordAfter(s.buf[0..s.len], s.cursor), k.shift),
+                    .backspace => {
+                        if (s.deleteSelection()) return true;
+                        const from = edit.wordBefore(s.buf[0..s.len], s.cursor);
+                        if (from == s.cursor) return false;
+                        s.remove(from, s.cursor);
+                        s.cursor = from;
+                        return true;
+                    },
+                    .delete => {
+                        if (s.deleteSelection()) return true;
+                        const to = edit.wordAfter(s.buf[0..s.len], s.cursor);
+                        if (to == s.cursor) return false;
+                        s.remove(s.cursor, to);
+                        return true;
+                    },
                     else => {},
                 }
                 return false;

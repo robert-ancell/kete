@@ -4,11 +4,13 @@
 //! (`Document`), so it can be any size and kept or saved as the app likes.
 //!
 //! Clicking puts the cursor there and dragging selects; the arrows, Home,
-//! End, Page Up and Page Down move it (with Shift, selecting); Enter starts
-//! a line and Tab types four spaces; Backspace and Delete take whole
-//! characters. Ctrl+A selects everything, and Ctrl+X, Ctrl+C and Ctrl+V cut,
-//! copy and paste (through the UI's clipboard), as the menu does (the
-//! right button, or a touch held down).
+//! End, Page Up and Page Down move it (with Shift, selecting); Ctrl+Left
+//! and Ctrl+Right move by word (with Shift, extending the selection), and
+//! Ctrl+Backspace and Ctrl+Delete delete a word. Enter starts a line and
+//! Tab types four spaces; Backspace and Delete take whole characters.
+//! Ctrl+A selects everything, and Ctrl+X, Ctrl+C and Ctrl+V cut, copy and
+//! paste (through the UI's clipboard), as the menu does (the right button,
+//! or a touch held down).
 //!
 //! Code can be coloured: a `highlighter` says what each byte of the text
 //! is (a keyword, a string, ...), and each is drawn in the theme's colour
@@ -614,6 +616,25 @@ pub const TextArea = struct {
                 .v => st.paste(),
                 .home => d.moveTo(0, k.shift),
                 .end => d.moveTo(d.text().len, k.shift),
+                // Word movement: Ctrl+Left/Right move by word; Shift extends
+                // the selection. Ctrl+Backspace/Delete delete a whole word.
+                .left => d.moveTo(edit.wordBefore(d.text(), d.cursor), k.shift),
+                .right => d.moveTo(edit.wordAfter(d.text(), d.cursor), k.shift),
+                .backspace => {
+                    if (d.deleteSelection()) return true;
+                    const from = edit.wordBefore(d.text(), d.cursor);
+                    if (from == d.cursor) return false;
+                    d.remove(from, d.cursor);
+                    d.cursor = from;
+                    return true;
+                },
+                .delete => {
+                    if (d.deleteSelection()) return true;
+                    const to = edit.wordAfter(d.text(), d.cursor);
+                    if (to == d.cursor) return false;
+                    d.remove(d.cursor, to);
+                    return true;
+                },
                 else => {},
             }
             return false;

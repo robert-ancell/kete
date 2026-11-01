@@ -1,7 +1,7 @@
-//! Shared character-class helpers for text editing widgets.
+//! Shared character-class and word-navigation helpers for text editing widgets.
 //!
-//! Used by `TextField` and `TextArea` for double-click word selection
-//! and Ctrl+arrow word movement.
+//! Used by `TextField` and `TextArea` for double-click word selection,
+//! Ctrl+arrow word movement, and Ctrl+Backspace / Ctrl+Delete word deletion.
 
 const std = @import("std");
 
@@ -94,6 +94,77 @@ pub fn charClass(cp: u21) CharClass {
     };
 }
 
+/// The character boundary before byte `pos` in `text` (0 at the start).
+pub fn before(text: []const u8, pos: usize) usize {
+    var j = @min(pos, text.len) -| 1;
+    while (j > 0 and text[j] & 0xc0 == 0x80) j -= 1;
+    return j;
+}
+
+/// The character boundary after byte `pos` in `text` (`text.len` at the end).
+pub fn after(text: []const u8, pos: usize) usize {
+    if (pos >= text.len) return text.len;
+    var j = pos + 1;
+    while (j < text.len and text[j] & 0xc0 == 0x80) j += 1;
+    return j;
+}
+
+/// The character class of the UTF-8 character starting at byte `i` in `text`.
+fn charClassOf(text: []const u8, i: usize) CharClass {
+    if (text[i] < 0x80) return charClass(text[i]);
+    const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch return .word;
+    if (i + seq_len > text.len) return .word;
+    const cp = std.unicode.utf8Decode(text[i..][0..seq_len]) catch return .word;
+    return charClass(cp);
+}
+
+/// The byte index of the start of the word to the left of `pos` in `text`.
+///
+/// Steps left past punctuation and spaces, then left through the preceding
+/// word (letters, digits, `_`).  Returns 0 when already at the start.
+///
+/// Examples:
+/// - `"hello world"`, pos=11 → 6  (`"hello |world"`)
+/// - `"hello world"`, pos=6  → 0  (`"|hello world"`)
+/// - `"hello, world"`, pos=7 → 0  (comma+space are separators, skipping "hello")
+pub fn wordBefore(text: []const u8, pos: usize) usize {
+    if (pos == 0) return 0;
+    // Step back one character.
+    var i = before(text, pos);
+    // Skip non-word characters (spaces, punctuation) going left.
+    while (i > 0 and charClassOf(text, i) != .word) i = before(text, i);
+    // Skip word characters going left to reach the start of the word.
+    if (charClassOf(text, i) == .word) {
+        while (i > 0) {
+            const p = before(text, i);
+            if (charClassOf(text, p) != .word) break;
+            i = p;
+        }
+    }
+    return i;
+}
+
+/// The byte index to move the cursor to after pressing Ctrl+Right at `pos`.
+///
+/// Steps right through any current word characters, then right past any
+/// following non-word characters, stopping at the start of the next word
+/// (or `text.len` if there is none).
+///
+/// Examples:
+/// - `"hello world"`, pos=0  → 6  (`"hello |world"`)
+/// - `"hello world"`, pos=5  → 6  (`"hello |world"`, cursor was on the space)
+/// - `"hello world"`, pos=6  → 11 (`"hello world|"`)
+pub fn wordAfter(text: []const u8, pos: usize) usize {
+    const len = text.len;
+    if (pos >= len) return len;
+    var i = pos;
+    // Skip current word characters (if cursor is inside or at the start of a word).
+    while (i < len and charClassOf(text, i) == .word) i = after(text, i);
+    // Skip non-word characters to land at the start of the next word.
+    while (i < len and charClassOf(text, i) != .word) i = after(text, i);
+    return i;
+}
+
 test "ASCII classification" {
     try std.testing.expect(charClass('a') == .word);
     try std.testing.expect(charClass('Z') == .word);
@@ -130,4 +201,38 @@ test "Unicode letters and CJK are word" {
     try std.testing.expect(charClass(0x0430) == .word); // а (CYRILLIC SMALL LETTER A)
     try std.testing.expect(charClass(0x4E2D) == .word); // 中 (CJK UNIFIED IDEOGRAPH)
     try std.testing.expect(charClass(0x1F600) == .word); // 😀 (emoji — word for movement)
+}
+
+test "wordBefore: Ctrl+Left word navigation" {
+    // Already at start — stays there.
+    try std.testing.expectEqual(@as(usize, 0), wordBefore("hello", 0));
+    // End of a single word → its start.
+    try std.testing.expectEqual(@as(usize, 0), wordBefore("hello", 5));
+    // Middle of a word → its start.
+    try std.testing.expectEqual(@as(usize, 0), wordBefore("hello", 3));
+    // After a space, before the second word → start of the first word.
+    try std.testing.expectEqual(@as(usize, 0), wordBefore("hello world", 6));
+    // End of the second word → its start.
+    try std.testing.expectEqual(@as(usize, 6), wordBefore("hello world", 11));
+    // Comma + space are separators; skips them and the preceding word.
+    try std.testing.expectEqual(@as(usize, 0), wordBefore("hello, world", 7));
+    // Multibyte: "héllo" (é = 0xC3 0xA9, so len=6).
+    try std.testing.expectEqual(@as(usize, 0), wordBefore("héllo", 6));
+}
+
+test "wordAfter: Ctrl+Right word navigation" {
+    // Already at end — stays there.
+    try std.testing.expectEqual(@as(usize, 5), wordAfter("hello", 5));
+    // Start of a single word → its end (then no more non-word chars → stops at end).
+    try std.testing.expectEqual(@as(usize, 5), wordAfter("hello", 0));
+    // Cursor on the space between two words → start of next word.
+    try std.testing.expectEqual(@as(usize, 6), wordAfter("hello world", 5));
+    // Start of the first word → start of the second word.
+    try std.testing.expectEqual(@as(usize, 6), wordAfter("hello world", 0));
+    // Start of the second word → end of string.
+    try std.testing.expectEqual(@as(usize, 11), wordAfter("hello world", 6));
+    // Comma + space: lands at start of next word.
+    try std.testing.expectEqual(@as(usize, 7), wordAfter("hello, world", 0));
+    // Multibyte: "héllo" → end of string.
+    try std.testing.expectEqual(@as(usize, 6), wordAfter("héllo", 0));
 }
