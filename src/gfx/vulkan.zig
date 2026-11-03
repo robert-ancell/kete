@@ -226,9 +226,10 @@ pub const TextureHooks = struct {
     /// Uploads dirty rows `[y0..y1)` of the 8-bit `atlas` and returns the
     /// descriptor set to bind for `.text` draws.
     uploadAtlas: ?*const fn (ctx: ?*anyopaque, pixels: []const u8, width: u32, height: u32, y0: u32, y1: u32) anyerror!VkDescriptorSet = null,
-    /// Uploads or looks up an `0xAARRGGBB` `Image` and returns the descriptor
-    /// set to bind for `.image` draws.
-    acquireImage: ?*const fn (ctx: ?*anyopaque, id: u64, pixels: []const u32, width: u32, height: u32) anyerror!VkDescriptorSet = null,
+    /// Uploads or looks up an `0xAARRGGBB` `Image` (uploading its pixels
+    /// again if its `version` is not the one uploaded) and returns the
+    /// descriptor set to bind for `.image` draws.
+    acquireImage: ?*const fn (ctx: ?*anyopaque, img: *const canvas_mod.Image) anyerror!VkDescriptorSet = null,
     /// Releases an image texture no longer drawn.
     releaseImage: ?*const fn (ctx: ?*anyopaque, id: u64) void = null,
 };
@@ -267,6 +268,9 @@ pub const ShaderModules = struct {
     }
 };
 
+/// An image's descriptor set, and the `Image.version` uploaded to it.
+const ImageSet = struct { set: VkDescriptorSet, version: u64 };
+
 pub const VulkanRenderer = struct {
     gpa: std.mem.Allocator,
     device: VkDevice,
@@ -285,7 +289,7 @@ pub const VulkanRenderer = struct {
     atlas: ?*atlas_mod.Atlas = null,
     atlas_stale: ?atlas_mod.Rect = null,
     atlas_set: VkDescriptorSet = VK_NULL_HANDLE,
-    images: std.AutoHashMapUnmanaged(u64, VkDescriptorSet) = .empty,
+    images: std.AutoHashMapUnmanaged(u64, ImageSet) = .empty,
     image_use: renderer_mod.ImageUse = .{},
 
     /// Initializes a self-contained Vulkan 1.1+ 2D renderer that compiles SPIR-V
@@ -468,9 +472,9 @@ pub const VulkanRenderer = struct {
         if (r.textures.acquireImage) |acq| {
             for (canvases) |c| for (c.batches.items) |*b| {
                 const img = b.image orelse continue;
-                if (r.images.contains(img.id)) continue;
-                const set = try acq(r.textures.ctx, img.id, img.pixels, img.width, img.height);
-                try r.images.put(r.gpa, img.id, set);
+                if (r.images.get(img.id)) |had| if (had.version == img.version) continue;
+                const set = try acq(r.textures.ctx, img);
+                try r.images.put(r.gpa, img.id, .{ .set = set, .version = img.version });
             };
         }
     }
@@ -588,8 +592,8 @@ pub const VulkanRenderer = struct {
                 },
                 .image => {
                     const img = b.image orelse continue;
-                    if (r.images.get(img.id)) |set| {
-                        const sets = [1]VkDescriptorSet{set};
+                    if (r.images.get(img.id)) |had| {
+                        const sets = [1]VkDescriptorSet{had.set};
                         r.vk.CmdBindDescriptorSets(target.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.pipelines.layout, 0, 1, &sets, 0, null);
                     }
                 },
@@ -1673,6 +1677,10 @@ const Owned2DContext = struct {
         mem: VkDeviceMemory,
         view: VkImageView,
         set: VkDescriptorSet,
+        width: u32,
+        height: u32,
+        /// The `Image.version` its pixels are.
+        version: u64,
     };
 
     gpa: std.mem.Allocator,
@@ -2315,9 +2323,21 @@ const Owned2DContext = struct {
         return self.atlas_set;
     }
 
-    fn acquireImageHook(raw: ?*anyopaque, id: u64, pixels: []const u32, width: u32, height: u32) anyerror!VkDescriptorSet {
+    fn acquireImageHook(raw: ?*anyopaque, pic: *const canvas_mod.Image) anyerror!VkDescriptorSet {
         const self: *Owned2DContext = @ptrCast(@alignCast(raw.?));
-        if (self.textures.get(id)) |existing| return existing.set;
+        const id = pic.id;
+        const width = pic.width;
+        const height = pic.height;
+        if (self.textures.getPtr(id)) |existing| {
+            if (existing.version == pic.version) return existing.set;
+            // New pixels: into the texture it has, if they fit it.
+            if (existing.width == width and existing.height == height) {
+                try self.uploadImagePixels(existing.img, pic.pixels, width, height, true);
+                existing.version = pic.version;
+                return existing.set;
+            }
+            releaseImageHook(raw, id);
+        }
 
         const img_info: VkImageCreateInfo = .{
             .format = VK_FORMAT_B8G8R8A8_UNORM,
@@ -2358,7 +2378,7 @@ const Owned2DContext = struct {
         const set = sets[0];
 
         const img_desc: VkDescriptorImageInfo = .{
-            .sampler = self.linear_sampler,
+            .sampler = if (pic.nearest) self.nearest_sampler else self.linear_sampler,
             .imageView = view,
             .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         };
@@ -2370,6 +2390,14 @@ const Owned2DContext = struct {
         }};
         self.vk.UpdateDescriptorSets(self.device, 1, &write, 0, null);
 
+        try self.uploadImagePixels(img, pic.pixels, width, height, false);
+        try self.textures.put(self.gpa, id, .{ .img = img, .mem = mem, .view = view, .set = set, .width = width, .height = height, .version = pic.version });
+        return set;
+    }
+
+    /// Copies `pixels` into `img` (all of it). If it was `drawn_from`, the
+    /// copy waits for the frames already sent to finish reading it.
+    fn uploadImagePixels(self: *Owned2DContext, img: VkImage, pixels: []const u32, width: u32, height: u32, drawn_from: bool) !void {
         const bytes = std.mem.sliceAsBytes(pixels);
         try self.ensureUploadBuf(bytes.len);
         @memcpy(self.upload_map[0..bytes.len], bytes);
@@ -2386,7 +2414,10 @@ const Owned2DContext = struct {
             .image = img,
             .subresourceRange = .{ .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT },
         }};
-        self.vk.CmdPipelineBarrier(self.upload_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &to_dst);
+        // What it held is replaced (UNDEFINED), but not before the shaders of
+        // the frames sent before have read it.
+        const src_stage = if (drawn_from) VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT else VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        self.vk.CmdPipelineBarrier(self.upload_cmd, src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &to_dst);
 
         const region = [1]VkBufferImageCopy{.{
             .imageExtent = .{ .width = width, .height = height, .depth = 1 },
@@ -2407,9 +2438,6 @@ const Owned2DContext = struct {
         const cmds = [1]VkCommandBuffer{self.upload_cmd};
         const submits = [1]VkSubmitInfo{.{ .pCommandBuffers = &cmds }};
         try submitAndWait(&self.vk, self.device, self.queue, &self.queue_lock, &submits, self.idle_fence);
-
-        try self.textures.put(self.gpa, id, .{ .img = img, .mem = mem, .view = view, .set = set });
-        return set;
     }
 
     fn releaseImageHook(raw: ?*anyopaque, id: u64) void {

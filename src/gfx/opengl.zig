@@ -360,6 +360,9 @@ pub const Target = struct {
     origin: [2]i32 = .{ 0, 0 },
 };
 
+/// An image's texture, and the `Image.version` (and size) uploaded to it.
+const ImageTexture = struct { tex: GLuint, width: u32, height: u32, version: u64 };
+
 pub const OpenGlRenderer = struct {
     gpa: std.mem.Allocator,
     gl: Procs,
@@ -384,7 +387,7 @@ pub const OpenGlRenderer = struct {
     atlas_tex: GLuint = 0,
     atlas: ?*atlas_mod.Atlas = null,
     atlas_stale: ?atlas_mod.Rect = null,
-    images: std.AutoHashMapUnmanaged(u64, GLuint) = .empty,
+    images: std.AutoHashMapUnmanaged(u64, ImageTexture) = .empty,
     image_use: renderer_mod.ImageUse = .{},
     rgba_scratch: std.ArrayList(u8) = .empty,
     fbo: GLuint = 0,
@@ -567,7 +570,7 @@ pub const OpenGlRenderer = struct {
         if (r.window_prog != 0) r.gl.DeleteProgram(r.window_prog);
         var it = r.images.valueIterator();
         while (it.next()) |tex| {
-            const t = [1]GLuint{tex.*};
+            const t = [1]GLuint{tex.tex};
             r.gl.DeleteTextures(1, &t);
         }
         if (r.fbo != 0) {
@@ -774,13 +777,14 @@ pub const OpenGlRenderer = struct {
         try r.image_use.update(r.gpa, canvases, &stale);
         for (stale.items) |id| {
             const tex = (r.images.fetchRemove(id) orelse continue).value;
-            const arr = [1]GLuint{tex};
+            const arr = [1]GLuint{tex.tex};
             r.gl.DeleteTextures(1, &arr);
         }
 
         for (canvases) |c| for (c.batches.items) |*b| {
             const img = b.image orelse continue;
-            if (r.images.contains(img.id)) continue;
+            const had = r.images.get(img.id);
+            if (had) |h| if (h.version == img.version) continue;
             const byte_count = @as(usize, img.width) * img.height * 4;
             try r.rgba_scratch.resize(r.gpa, byte_count);
             const out = r.rgba_scratch.items;
@@ -790,15 +794,24 @@ pub const OpenGlRenderer = struct {
                 out[i * 4 + 2] = @truncate(px);
                 out[i * 4 + 3] = @truncate(px >> 24);
             }
+            r.gl.ActiveTexture(GL_TEXTURE0);
+            r.gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            // New pixels: into the texture it has, if they fit it.
+            if (had) |h| if (h.width == img.width and h.height == img.height) {
+                r.gl.BindTexture(GL_TEXTURE_2D, h.tex);
+                r.gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, @intCast(img.width), @intCast(img.height), GL_RGBA, GL_UNSIGNED_BYTE, out.ptr);
+                try r.images.put(r.gpa, img.id, .{ .tex = h.tex, .width = img.width, .height = img.height, .version = img.version });
+                continue;
+            };
+            if (had) |h| r.gl.DeleteTextures(1, &[1]GLuint{h.tex});
             var tex: [1]GLuint = undefined;
             r.gl.GenTextures(1, &tex);
-            r.gl.ActiveTexture(GL_TEXTURE0);
             r.gl.BindTexture(GL_TEXTURE_2D, tex[0]);
-            r.gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            r.gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            const filter = if (img.nearest) GL_NEAREST else GL_LINEAR;
+            r.gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+            r.gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
             r.gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             r.gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            r.gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
             r.gl.TexImage2D(
                 GL_TEXTURE_2D,
                 0,
@@ -810,7 +823,7 @@ pub const OpenGlRenderer = struct {
                 GL_UNSIGNED_BYTE,
                 out.ptr,
             );
-            try r.images.put(r.gpa, img.id, tex[0]);
+            try r.images.put(r.gpa, img.id, .{ .tex = tex[0], .width = img.width, .height = img.height, .version = img.version });
         };
     }
 
@@ -981,7 +994,7 @@ pub const OpenGlRenderer = struct {
                     const img = b.image orelse continue;
                     const tex = r.images.get(img.id) orelse return error.NotPrepared;
                     r.gl.ActiveTexture(GL_TEXTURE0);
-                    r.gl.BindTexture(GL_TEXTURE_2D, tex);
+                    r.gl.BindTexture(GL_TEXTURE_2D, tex.tex);
                 },
                 else => {},
             }
@@ -2330,9 +2343,17 @@ const MockGl = struct {
     fn activeTexture(_: GLenum) callconv(.c) void {}
     fn bindTexture(_: GLenum, _: GLuint) callconv(.c) void {}
     fn pixelStorei(_: GLenum, _: GLint) callconv(.c) void {}
-    fn texParameteri(_: GLenum, _: GLenum, _: GLint) callconv(.c) void {}
+    /// The last magnification filter set.
+    var mag_filter: GLint = 0;
+    fn texParameteri(_: GLenum, name: GLenum, value: GLint) callconv(.c) void {
+        if (name == GL_TEXTURE_MAG_FILTER) mag_filter = value;
+    }
     fn texImage2D(_: GLenum, _: GLint, _: GLint, _: GLsizei, _: GLsizei, _: GLint, _: GLenum, _: GLenum, _: ?*const anyopaque) callconv(.c) void {}
-    fn texSubImage2D(_: GLenum, _: GLint, _: GLint, _: GLint, _: GLsizei, _: GLsizei, _: GLenum, _: GLenum, _: ?*const anyopaque) callconv(.c) void {}
+    /// How many times part of a texture was replaced.
+    var sub_uploads: usize = 0;
+    fn texSubImage2D(_: GLenum, _: GLint, _: GLint, _: GLint, _: GLsizei, _: GLsizei, _: GLenum, _: GLenum, _: ?*const anyopaque) callconv(.c) void {
+        sub_uploads += 1;
+    }
     fn drawArrays(_: GLenum, _: GLint, _: GLsizei) callconv(.c) void {
         draws += 1;
     }
@@ -2438,6 +2459,34 @@ test "OpenGlRenderer keeps the images of every window it draws" {
     try std.testing.expectEqual(1, gl_renderer.images.count());
     try std.testing.expect(gl_renderer.images.contains(pic_b.id));
     try std.testing.expectEqual(textures - 1, MockGl.textures);
+}
+
+test "OpenGlRenderer uploads an image's changed pixels into its texture, and samples it as asked" {
+    var gl_renderer = try OpenGlRenderer.initWithProcs(std.testing.allocator, MockGl.procs());
+    defer gl_renderer.deinit();
+    var px = [_]u32{ 0xff00ff00, 0xff00ff00, 0xff00ff00, 0xff00ff00 };
+    var pic = canvas_mod.Image.init(&px, 2, 2);
+    pic.nearest = true;
+    var c = Canvas.init(std.testing.allocator);
+    defer c.deinit();
+    c.begin(100, 100);
+    c.drawImage(&pic, .{ .x = 0, .y = 0, .w = 20, .h = 20 }, 1.0);
+
+    const made = MockGl.made_textures;
+    const subs = MockGl.sub_uploads;
+    try gl_renderer.prepare(&.{&c});
+    try std.testing.expectEqual(GL_NEAREST, MockGl.mag_filter);
+
+    // Unchanged: nothing is uploaded again.
+    try gl_renderer.prepare(&.{&c});
+    try std.testing.expectEqual(subs, MockGl.sub_uploads);
+
+    // Changed: into the same texture.
+    px[0] = 0xffff0000;
+    pic.changed();
+    try gl_renderer.prepare(&.{&c});
+    try std.testing.expectEqual(subs + 1, MockGl.sub_uploads);
+    try std.testing.expectEqual(made + 1, MockGl.made_textures);
 }
 
 test "OpenGlRenderer.initDefault renders 2D Canvas shapes and images into software.Image" {

@@ -680,7 +680,8 @@ pub const D3D11Renderer = struct {
     /// A frame's pixels on the CPU, for GPU draws of widgets drawn there.
     scratch: std.ArrayList(u32) = .empty,
 
-    const ImageTex = struct { tex: Obj, srv: Obj };
+    /// An image's texture, and the `Image.version` uploaded to it.
+    const ImageTex = struct { tex: Obj, srv: Obj, version: u64 };
 
     const Frame = struct {
         tex: ?Obj = null,
@@ -932,7 +933,14 @@ pub const D3D11Renderer = struct {
 
         for (canvases) |c| for (c.batches.items) |*b| {
             const img = b.image orelse continue;
-            if (r.images.contains(img.id) or img.width == 0 or img.height == 0) continue;
+            if (img.width == 0 or img.height == 0) continue;
+            // New pixels go in a new texture (the GPU keeps the old while it uses it).
+            if (r.images.get(img.id)) |had| {
+                if (had.version == img.version) continue;
+                w32.release(had.srv);
+                w32.release(had.tex);
+                _ = r.images.remove(img.id);
+            }
             // 0xAARRGGBB, little-endian: BGRA in memory, as the texture is.
             const init_data: SubresourceData = .{ .pSysMem = img.pixels.ptr, .SysMemPitch = img.width * 4 };
             const tex = try Device.createTexture2D(r.device.?, .{ .Width = img.width, .Height = img.height, .Format = format_bgra8, .Usage = usage_immutable, .BindFlags = bind_shader_resource }, &init_data);
@@ -940,7 +948,7 @@ pub const D3D11Renderer = struct {
                 w32.release(tex);
                 return e;
             };
-            try r.images.put(r.gpa, img.id, .{ .tex = tex, .srv = srv });
+            try r.images.put(r.gpa, img.id, .{ .tex = tex, .srv = srv, .version = img.version });
         };
     }
 
@@ -1040,7 +1048,11 @@ pub const D3D11Renderer = struct {
             };
             const srv: ?Obj, const smp: ?Obj = switch (b.kind) {
                 .text => .{ r.atlas_srv orelse continue, r.nearest },
-                .image => .{ (r.images.get((b.image orelse continue).id) orelse return error.NotPrepared).srv, r.linear },
+                .image => blk: {
+                    const img = b.image orelse continue;
+                    const srv = (r.images.get(img.id) orelse return error.NotPrepared).srv;
+                    break :blk .{ srv, if (img.nearest) r.nearest else r.linear };
+                },
                 else => .{ null, null },
             };
             const offset = try r.vertices(data);

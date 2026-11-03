@@ -70,6 +70,9 @@ fn regionOf(v: Viewport) Region {
 /// Room in each frame's vertex buffer for the quads that clear.
 const clear_bytes = renderer_mod.max_uncovered * 6 * shaders.solid_floats * 4 + 16;
 
+/// An image's texture, and the `Image.version` uploaded to it.
+const ImageTex = struct { tex: Id, version: u64 };
+
 pub const MetalRenderer = struct {
     gpa: std.mem.Allocator,
     device: Id,
@@ -85,7 +88,7 @@ pub const MetalRenderer = struct {
     atlas_tex: Id = null,
     atlas: ?*atlas_mod.Atlas = null,
     atlas_stale: ?atlas_mod.Rect = null,
-    images: std.AutoHashMapUnmanaged(u64, Id) = .empty,
+    images: std.AutoHashMapUnmanaged(u64, ImageTex) = .empty,
     image_use: renderer_mod.ImageUse = .{},
     /// The windows' frames (each kept from one to the next, so only what
     /// changed is drawn), by the layer each is shown in, and the texture
@@ -165,7 +168,7 @@ pub const MetalRenderer = struct {
         r.waitIdle();
         for (&r.slots) |*s| objc.release(s.buffer);
         var it = r.images.valueIterator();
-        while (it.next()) |tex| objc.release(tex.*);
+        while (it.next()) |img| objc.release(img.tex);
         r.images.deinit(r.gpa);
         r.image_use.deinit(r.gpa);
         r.scratch.deinit(r.gpa);
@@ -370,16 +373,22 @@ pub const MetalRenderer = struct {
         var stale: std.ArrayList(u64) = .empty;
         defer stale.deinit(r.gpa);
         try r.image_use.update(r.gpa, canvases, &stale);
-        for (stale.items) |id| if (r.images.fetchRemove(id)) |e| objc.release(e.value);
+        for (stale.items) |id| if (r.images.fetchRemove(id)) |e| objc.release(e.value.tex);
 
         for (canvases) |c| for (c.batches.items) |*b| {
             const img = b.image orelse continue;
-            if (r.images.contains(img.id) or img.width == 0 or img.height == 0) continue;
+            if (img.width == 0 or img.height == 0) continue;
+            // New pixels go in a new texture (the GPU keeps the old while it uses it).
+            if (r.images.get(img.id)) |had| {
+                if (had.version == img.version) continue;
+                objc.release(had.tex);
+                _ = r.images.remove(img.id);
+            }
             // 0xAARRGGBB, little-endian: BGRA in memory, as the texture is.
             const tex = try r.texture(format_bgra8, img.width, img.height, usage_read);
             const region = regionOf(.{ .width = img.width, .height = img.height });
             msg(void, tex, "replaceRegion:mipmapLevel:withBytes:bytesPerRow:", .{ region, @as(u64, 0), img.pixels.ptr, @as(u64, img.width) * 4 });
-            try r.images.put(r.gpa, img.id, tex);
+            try r.images.put(r.gpa, img.id, .{ .tex = tex, .version = img.version });
         };
     }
 
@@ -461,7 +470,11 @@ pub const MetalRenderer = struct {
             };
             const tex: Id, const smp: Id = switch (b.kind) {
                 .text => .{ r.atlas_tex orelse continue, r.nearest },
-                .image => .{ r.images.get((b.image orelse continue).id) orelse return error.NotPrepared, r.linear },
+                .image => blk: {
+                    const img = b.image orelse continue;
+                    const tex = (r.images.get(img.id) orelse return error.NotPrepared).tex;
+                    break :blk .{ tex, if (img.nearest) r.nearest else r.linear };
+                },
                 else => .{ null, null },
             };
 

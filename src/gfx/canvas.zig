@@ -143,13 +143,20 @@ pub const BatchKind = enum {
 
 /// Pixels to draw: 0xAARRGGBB (straight alpha), row by row. Each has an
 /// `id` of its own (from `init`), by which the GPU's copy is found: make a
-/// new Image, rather than change the pixels of one, to show others. At
-/// most `max_size` pixels across and down (the GPU's limit).
+/// new Image to show other pixels, or, for pixels that change often (a
+/// video, an emulated screen), change them in place and call `changed`, for
+/// the GPU's copy to be updated. At most `max_size` pixels across and down
+/// (the GPU's limit).
 pub const Image = struct {
     pixels: []const u32,
     width: u32,
     height: u32,
     id: u64,
+    /// Drawn bigger or smaller with the nearest pixel, not smoothed: for
+    /// pixel art, or an emulated screen, to stay sharp.
+    nearest: bool = false,
+    /// Counts the changes to its pixels (`changed`).
+    version: u64 = 0,
 
     pub const max_size = 2048;
 
@@ -161,6 +168,11 @@ pub const Image = struct {
         std.debug.assert(pixels.len == @as(usize, width) * height and width <= max_size and height <= max_size);
         next_id += 1;
         return .{ .pixels = pixels, .width = width, .height = height, .id = next_id - 1 };
+    }
+
+    /// Its pixels have changed (in place): they are drawn as they are now.
+    pub fn changed(img: *Image) void {
+        img.version +%= 1;
     }
 };
 
@@ -722,7 +734,7 @@ pub const Canvas = struct {
     pub fn drawImage(c: *Canvas, img: *const Image, dest_in: Rect, alpha: f32) void {
         const r = c.moved(dest_in);
         if (r.w <= 0 or r.h <= 0 or alpha <= 0 or img.width == 0 or img.height == 0) return;
-        c.note(.image, r, .{ img.id, alpha, r }, "");
+        c.note(.image, r, .{ img.id, img.version, alpha, r }, "");
         const b = c.batchForImage(img, r) orelse return;
         const corners = [4][4]f32{ .{ r.x, r.y, 0, 0 }, .{ r.x + r.w, r.y, 1, 0 }, .{ r.x + r.w, r.y + r.h, 1, 1 }, .{ r.x, r.y + r.h, 0, 1 } };
         var verts: [4][shaders.text_floats]f32 = undefined;
@@ -749,7 +761,7 @@ pub const Canvas = struct {
             y1 = @max(y1, k[1]);
         }
         const r = c.moved(.{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 });
-        c.note(.image_triangles, r, .{ img.id, alpha, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(corners)), c.origin, s }, "");
+        c.note(.image_triangles, r, .{ img.id, img.version, alpha, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(corners)), c.origin, s }, "");
         const b = c.batchForImage(img, r) orelse return;
         const n = corners.len / 3 * 3;
         const out = c.vertices(b, shaders.text_floats, n) orelse return;
