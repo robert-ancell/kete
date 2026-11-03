@@ -165,8 +165,11 @@ pub const ScrollView = struct {
     pub fn event(self: *const ScrollView, n: *Node, e: Event) bool {
         const s = n.state(State);
         switch (e) {
-            .enter => s.hovered = true,
-            .leave => s.hovered = false,
+            .enter, .leave => {
+                const hovered = e == .enter;
+                if (s.hovered != hovered) n.ui.needs_frame = true;
+                s.hovered = hovered;
+            },
             .scroll => |sc| {
                 // The content follows a finger; a wheel's notches go further.
                 if (!s.scrollTo(s.offset + sc.dy * (if (sc.touch) 1 else self.wheel_factor))) return false;

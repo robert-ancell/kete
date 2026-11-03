@@ -331,10 +331,11 @@ pub const WindowUi = struct {
     frame_no: u64 = 0,
     /// The time of the frame being made, on the monotonic clock (`window.nowNs`).
     now_ns: u64 = 0,
-    /// Something changed (input, or a widget asked for another frame).
+    /// Something changed (a widget asked for another frame).
     needs_frame: bool = true,
-    /// How many input events it has handled (`handleInput`).
-    inputs: u64 = 0,
+    /// How many input events a widget reacted to (`handleInput`), asking
+    /// for another frame.
+    reactions: u64 = 0,
     /// The frame's drawing: canvases (kept for reuse) and GPU draws.
     canvases: std.ArrayList(*gfx.Canvas) = .empty,
     /// How many of `canvases` this frame has drawn on.
@@ -1458,9 +1459,16 @@ pub const WindowUi = struct {
 
     // --- Input ------------------------------------------------------------------
 
-    /// Handles an input event from the window.
+    /// Handles an input event from the window. Input draws nothing again
+    /// itself, nor does a widget taking it: only a widget asking for another
+    /// frame (as it reacts) does, which counts in `reactions`.
     pub fn handleInput(ui: *WindowUi, e: window_mod.InputEvent) void {
-        ui.inputs +%= 1;
+        const asked = ui.needs_frame;
+        ui.needs_frame = false;
+        defer {
+            if (ui.needs_frame) ui.reactions +%= 1;
+            ui.needs_frame = ui.needs_frame or asked;
+        }
         switch (e) {
             .motion => |pos| ui.pointerMotion(pos),
             .button => |b| ui.pointerButton(b.pos, b.button, b.pressed),
@@ -1477,15 +1485,12 @@ pub const WindowUi = struct {
             .relative_motion, .pointer_locked => {},
             .text_commit => |*c| if (ui.focused) |n| {
                 _ = send(n, .{ .text_commit = c.slice() });
-                ui.needs_frame = true;
             },
             .text_preedit => |*p| if (ui.focused) |n| {
                 _ = send(n, .{ .text_preedit = .{ .text = p.slice(), .cursor_begin = p.cursor_begin, .cursor_end = p.cursor_end } });
-                ui.needs_frame = true;
             },
             .text_delete_surrounding => |d| if (ui.focused) |n| {
                 _ = send(n, .{ .text_delete_surrounding = .{ .before_length = d.before_length, .after_length = d.after_length } });
-                ui.needs_frame = true;
             },
             .drag_enter, .drag_motion, .drop => |pos| {
                 ui.pointer = pos;
@@ -1528,13 +1533,11 @@ pub const WindowUi = struct {
         var i: usize = 0;
         while (i < ui.hovered.items.len) {
             const n = ui.hovered.items[i];
-            if (send(n, .{ .motion = local(n, pos) })) {
-                ui.needs_frame = true;
-            }
+            _ = send(n, .{ .motion = local(n, pos) });
             if (i < ui.hovered.items.len and ui.hovered.items[i] == n) i += 1;
         }
         if (ui.captured) |n| if (std.mem.indexOfScalar(*Node, ui.hovered.items, n) == null) {
-            if (send(n, .{ .motion = local(n, pos) })) ui.needs_frame = true;
+            _ = send(n, .{ .motion = local(n, pos) });
         };
         if (ui.win) |win| ui.syncCursor(win);
     }
@@ -1553,10 +1556,10 @@ pub const WindowUi = struct {
     pub fn pointerButtonAt(ui: *WindowUi, pos: Point, button: widget.PointerButton, pressed: bool, now_ns: u64) void {
         ui.pointer = pos;
         ui.updateHover(pos);
-        ui.needs_frame = true;
         defer if (ui.win) |win| ui.syncCursor(win);
         if (pressed) {
             // The pointer's: the focus ring goes.
+            if (ui.focus_visible) ui.needs_frame = true;
             ui.focus_visible = false;
             if (ui.captured != null) return;
             if (ui.menu != null and !ui.overMenu()) {
@@ -1660,10 +1663,7 @@ pub const WindowUi = struct {
         var i: usize = 0;
         while (i < ui.hovered.items.len) {
             const n = ui.hovered.items[i];
-            if (send(n, .{ .scroll = .{ .pos = local(n, at), .dx = dx, .dy = dy, .touch = true } })) {
-                ui.needs_frame = true;
-                return true;
-            }
+            if (send(n, .{ .scroll = .{ .pos = local(n, at), .dx = dx, .dy = dy, .touch = true } })) return true;
             if (i < ui.hovered.items.len and ui.hovered.items[i] == n) i += 1;
         }
         return false;
@@ -1673,7 +1673,6 @@ pub const WindowUi = struct {
         const n = ui.captured orelse return;
         ui.captured = null;
         _ = send(n, .{ .release = .{ .pos = .{ -1, -1 }, .button = ui.captured_button, .inside = false } });
-        ui.needs_frame = true;
     }
 
     /// The wheel turned at `pos`: by `dy` pixels down and `dx` right.
@@ -1683,10 +1682,7 @@ pub const WindowUi = struct {
         var i: usize = 0;
         while (i < ui.hovered.items.len) {
             const n = ui.hovered.items[i];
-            if (send(n, .{ .scroll = .{ .pos = local(n, pos), .dx = dx, .dy = dy } })) {
-                ui.needs_frame = true;
-                return;
-            }
+            if (send(n, .{ .scroll = .{ .pos = local(n, pos), .dx = dx, .dy = dy } })) return;
             if (i < ui.hovered.items.len and ui.hovered.items[i] == n) i += 1;
         }
     }
@@ -1741,7 +1737,6 @@ pub const WindowUi = struct {
             },
             else => {},
         }
-        ui.needs_frame = true;
         // Tab moves the focus (Control and Tab, from what takes Tab).
         if (k.key == .tab) {
             const takes_tab = if (ui.focused) |f| f.widget.vtable.takes_tab else false;
@@ -1765,7 +1760,10 @@ pub const WindowUi = struct {
         switch (k.key) {
             // Escape dismisses the dialog in front.
             .escape => if (ui.root) |r| if (focus_mod.topDialog(r)) |d| {
-                if (d.widget.as(@import("dialog.zig").Dialog).?.on_dismiss) |f| f.call();
+                if (d.widget.as(@import("dialog.zig").Dialog).?.on_dismiss) |f| {
+                    f.call();
+                    ui.needs_frame = true;
+                }
             },
             // Up and down move through a menu.
             .up, .down => if (ui.menu != null) {
@@ -1789,7 +1787,6 @@ pub const WindowUi = struct {
         }
         ui.hovered.clearRetainingCapacity();
         if (ui.win) |win| ui.syncCursor(win);
-        ui.needs_frame = true;
     }
 
     fn updateHover(ui: *WindowUi, pos: Point) void {
@@ -1810,7 +1807,6 @@ pub const WindowUi = struct {
             const n = ui.hovered.items[i];
             if (std.mem.indexOfScalar(*Node, ui.hover_scratch.items, n) == null) {
                 _ = send(n, .leave);
-                ui.needs_frame = true;
             }
             if (i < ui.hovered.items.len and ui.hovered.items[i] == n) i += 1;
         }
@@ -1819,7 +1815,6 @@ pub const WindowUi = struct {
             const n = ui.hover_scratch.items[i];
             if (std.mem.indexOfScalar(*Node, ui.hovered.items, n) == null) {
                 _ = send(n, .enter);
-                ui.needs_frame = true;
             }
             if (i < ui.hover_scratch.items.len and ui.hover_scratch.items[i] == n) i += 1;
         }
@@ -2325,18 +2320,18 @@ pub const App = struct {
     }
 
     /// Hands each window's input to its UI (its widgets' callbacks are
-    /// called): if any came, every window is drawn again.
+    /// called): if a widget reacted to any, every window is drawn again.
     fn takeInput(a: *App) void {
         var any = false;
         var i: usize = 0;
         while (i < a.windows.items.len) : (i += 1) {
             const w = a.windows.items[i];
             if (w.closed) continue;
-            const before = w.ui.inputs;
+            const before = w.ui.reactions;
             w.busy = true;
             w.ui.takeInput(w.win);
             w.busy = false;
-            if (w.ui.inputs != before) any = true;
+            if (w.ui.reactions != before) any = true;
             if (w.closed) w.release();
         }
         if (any) for (a.windows.items) |w| {

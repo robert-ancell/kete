@@ -151,12 +151,10 @@ pub const Slider = struct {
     pub fn event(self: *const Slider, n: *Node, e: Event) bool {
         const st = n.state(State);
         switch (e) {
-            .enter => {
-                st.hovered = true;
-                return false;
-            },
-            .leave => {
-                st.hovered = false;
+            .enter, .leave => {
+                const hovered = e == .enter;
+                if (st.hovered != hovered) n.ui.needs_frame = true;
+                st.hovered = hovered;
                 return false;
             },
             .press => |pr| {
@@ -164,11 +162,13 @@ pub const Slider = struct {
                 const on_changed = self.on_changed orelse return false;
                 st.pressed = true;
                 on_changed.call(self.valueAt(n.size.w, pr.pos[0]));
+                n.ui.needs_frame = true;
                 return true;
             },
             .motion => |pos| {
                 if (!st.pressed) return false;
                 if (self.on_changed) |on_changed| on_changed.call(self.valueAt(n.size.w, pos[0]));
+                n.ui.needs_frame = true;
                 return true;
             },
             .key => |k| {
@@ -183,12 +183,16 @@ pub const Slider = struct {
                     .end => self.max,
                     else => return false,
                 };
-                if (k.pressed) on_changed.call(std.math.clamp(v, self.min, self.max));
+                if (k.pressed) {
+                    on_changed.call(std.math.clamp(v, self.min, self.max));
+                    n.ui.needs_frame = true;
+                }
                 return true;
             },
             .release => |rel| {
                 if (rel.button == .left and st.pressed) {
                     st.pressed = false;
+                    n.ui.needs_frame = true;
                     return true;
                 }
                 return false;

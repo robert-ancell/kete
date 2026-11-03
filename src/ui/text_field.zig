@@ -577,8 +577,12 @@ pub const TextField = struct {
             return false;
         }
         switch (e) {
-            .enter => st.hovered = true,
+            .enter => {
+                if (!st.hovered) n.ui.needs_frame = true;
+                st.hovered = true;
+            },
             .leave => {
+                if (st.hovered) n.ui.needs_frame = true;
                 st.hovered = false;
                 if (st.toggle_hovered) {
                     st.toggle_hovered = false;
@@ -648,6 +652,7 @@ pub const TextField = struct {
             },
             .key => |k| {
                 if (!k.pressed) return true;
+                n.ui.needs_frame = true;
                 if (k.key == .enter or k.key == .keypad_enter) {
                     if (self.on_submit) |f| f.call();
                     return true;

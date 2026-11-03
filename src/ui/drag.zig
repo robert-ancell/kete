@@ -79,10 +79,14 @@ pub const Draggable = struct {
         const st = n.state(State);
         const origin = n.position();
         switch (e) {
-            .enter => i.hovered = true,
-            .leave => i.hovered = false,
+            .enter, .leave => {
+                const hovered = e == .enter;
+                if (i.hovered != hovered) n.ui.needs_frame = true;
+                i.hovered = hovered;
+            },
             .press => |p| {
                 if (p.button != .left) return false;
+                if (self.interaction != null) n.ui.needs_frame = true;
                 i.pressed = true;
                 st.start = .{ origin[0] + p.pos[0], origin[1] + p.pos[1] };
                 return true;
@@ -98,6 +102,7 @@ pub const Draggable = struct {
                 }
             },
             .release => |r| {
+                if (self.interaction != null) n.ui.needs_frame = true;
                 i.pressed = false;
                 const was_down = st.start != null;
                 st.start = null;
@@ -106,7 +111,10 @@ pub const Draggable = struct {
                     n.ui.endDrag(!(r.pos[0] == -1 and r.pos[1] == -1 and !r.inside));
                     return true;
                 };
-                if (was_down and r.inside) if (self.on_press) |f| f.call();
+                if (was_down and r.inside) if (self.on_press) |f| {
+                    f.call();
+                    n.ui.needs_frame = true;
+                };
                 return true;
             },
             else => {},

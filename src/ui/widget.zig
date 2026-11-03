@@ -95,7 +95,10 @@ pub const TextInputInfo = struct {
     change_cause_other: bool = false,
 };
 
-/// What happens to a widget with an `event` function.
+/// What happens to a widget with an `event` function. It returns whether it
+/// took the event (so that it goes no further); taking it draws nothing
+/// again: a widget that changes (or calls back) asks for another frame
+/// (`needs_frame` on its node's UI).
 pub const Event = union(enum) {
     /// The pointer moved over it (or onto something inside it).
     enter,

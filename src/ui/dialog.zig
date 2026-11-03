@@ -179,12 +179,15 @@ const Scrim = struct {
         return .default;
     }
 
-    pub fn event(self: *const Scrim, _: *Node, e: Event) bool {
+    pub fn event(self: *const Scrim, n: *Node, e: Event) bool {
         switch (e) {
             .press => |pr| return pr.button == .left,
             .release => |rel| {
                 if (rel.button == .left and rel.inside) {
-                    if (self.on_dismiss) |cb| cb.call();
+                    if (self.on_dismiss) |cb| {
+                        cb.call();
+                        n.ui.needs_frame = true;
+                    }
                 }
                 return true;
             },

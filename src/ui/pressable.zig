@@ -47,26 +47,37 @@ pub const Pressable = struct {
         return if (self.on_press != null) .pointer else null;
     }
 
-    pub fn event(self: *const Pressable, _: *Node, e: Event) bool {
+    pub fn event(self: *const Pressable, n: *Node, e: Event) bool {
         var dummy: PointerInteraction = .{};
         const i = self.interaction orelse &dummy;
         switch (e) {
-            .enter => i.hovered = true,
-            .leave => i.hovered = false,
+            .enter, .leave => if (self.interaction) |it| {
+                const hovered = e == .enter;
+                if (it.hovered != hovered) n.ui.needs_frame = true;
+                it.hovered = hovered;
+            },
             .press => |p| {
                 if (p.button != .left or self.on_press == null) return false;
+                if (self.interaction != null) n.ui.needs_frame = true;
                 i.pressed = true;
                 return true;
             },
             .release => |r| {
+                if (self.interaction != null) n.ui.needs_frame = true;
                 i.pressed = false;
-                if (r.inside) if (self.on_press) |f| f.call();
+                if (r.inside) if (self.on_press) |f| {
+                    f.call();
+                    n.ui.needs_frame = true;
+                };
                 return true;
             },
             .key => |k| {
                 if (k.key != .space and k.key != .enter and k.key != .keypad_enter) return false;
                 const f = self.on_press orelse return false;
-                if (k.pressed) f.call();
+                if (k.pressed) {
+                    f.call();
+                    n.ui.needs_frame = true;
+                }
                 return true;
             },
             else => {},

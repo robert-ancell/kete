@@ -3635,6 +3635,50 @@ test "an OpenGlArea given another thread's context draws nothing, rather than in
     try testing.expect(img.at(30, 15) != red.toArgb());
 }
 
+test "input draws nothing again unless a widget reacts to it" {
+    const u = try ui.WindowUi.createDefault(testing.allocator, testing.io);
+    defer u.destroy();
+    var pressed = false;
+    const build = struct {
+        var flag: *bool = undefined;
+        fn f(cx: *Context) Widget {
+            return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.FilledButton{ .label = "Press", .on_press = .of(flag, struct {
+                fn f(b: *bool) void {
+                    b.* = true;
+                }
+            }.f) }) });
+        }
+    };
+    build.flag = &pressed;
+    u.frame(200, 100, 0, Root(build.f){});
+
+    // Away from the button: nothing reacts to the pointer, a press or a key.
+    var before = u.reactions;
+    u.handleInput(.{ .motion = .{ 150, 80 } });
+    u.handleInput(.{ .button = .{ .pos = .{ 150, 80 }, .button = .left, .pressed = true } });
+    u.handleInput(.{ .button = .{ .pos = .{ 150, 80 }, .button = .left, .pressed = false } });
+    u.handleInput(.{ .key = .{ .key = .a, .pressed = true } });
+    try testing.expectEqual(before, u.reactions);
+    try testing.expect(!u.needs_frame);
+
+    // Onto the button: it is tinted.
+    u.handleInput(.{ .motion = .{ 10, 10 } });
+    try testing.expect(u.reactions != before);
+    u.frame(200, 100, 1, Root(build.f){});
+
+    // Within it: nothing changes.
+    before = u.reactions;
+    u.handleInput(.{ .motion = .{ 12, 11 } });
+    try testing.expectEqual(before, u.reactions);
+    try testing.expect(!u.needs_frame);
+
+    // Pressing it: it takes the press.
+    u.handleInput(.{ .button = .{ .pos = .{ 12, 11 }, .button = .left, .pressed = true } });
+    try testing.expect(u.reactions != before);
+    u.handleInput(.{ .button = .{ .pos = .{ 12, 11 }, .button = .left, .pressed = false } });
+    try testing.expect(pressed);
+}
+
 test "a window with no size given opens at its content's, and can be kept from being resized" {
     var display: AppDisplay = .{};
     const app = try ui.App.init(testing.allocator, testing.io, .empty, .{ .display = .of(&display) });
