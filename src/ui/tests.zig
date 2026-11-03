@@ -2860,11 +2860,20 @@ const AppDisplay = struct {
         close_requested: bool = false,
         closed: bool = false,
         parent: ?*AppWin = null,
+        /// The size it was opened at, and whether it can be resized.
+        opened_size: [2]u32 = .{ 0, 0 },
+        resizable: bool = true,
+        asked_size: ?[2]u32 = null,
 
         pub const Options = struct {
             title: []const u8,
             parent: ?*AppWin = null,
+            size: [2]u32 = .{ 64, 48 },
+            resizable: bool = true,
         };
+        pub fn setSize(w: *AppWin, width: u32, height: u32) void {
+            w.asked_size = .{ width, height };
+        }
         pub fn beginSoftwareFrame(w: *AppWin) !gfx.software.Image {
             return .{ .pixels = &w.pixels, .width = w.width, .height = w.height };
         }
@@ -2878,7 +2887,7 @@ const AppDisplay = struct {
 
     pub fn openWindow(d: *AppDisplay, o: AppWin.Options) !*AppWin {
         if (d.len == d.windows.len) return error.TooManyWindows;
-        d.windows[d.len] = .{ .parent = o.parent };
+        d.windows[d.len] = .{ .parent = o.parent, .opened_size = o.size, .resizable = o.resizable };
         d.len += 1;
         return &d.windows[d.len - 1];
     }
@@ -3624,4 +3633,38 @@ test "an OpenGlArea given another thread's context draws nothing, rather than in
     // The rest of the frame is drawn; the area is not.
     try testing.expectEqual(blue.toArgb(), img.at(10, 15));
     try testing.expect(img.at(30, 15) != red.toArgb());
+}
+
+test "a window with no size given opens at its content's, and can be kept from being resized" {
+    var display: AppDisplay = .{};
+    const app = try ui.App.init(testing.allocator, testing.io, .empty, .{ .display = .of(&display) });
+    defer app.deinit();
+    app.shared.attachRenderer(app.shared.software_renderer.renderer(), false);
+    // What its root takes: a box, and a column of two.
+    const box: ui.SizedBox = .{ .width = 300, .height = 200 };
+    const S = struct {
+        fn build(cx: *Context) Widget {
+            return cx.make(ui.Column{ .fill = false, .children = cx.makeAll(.{
+                ui.SizedBox{ .width = 100, .height = 20 },
+                ui.SizedBox{ .width = 80, .height = 30 },
+            }) });
+        }
+    };
+    const column: Root(S.build) = .{};
+    _ = try app.openWindow(.{ .title = "box", .root = .of(&box), .resizable = false });
+    _ = try app.openWindow(.{ .title = "column", .root = .of(&column) });
+    try testing.expectEqual([2]u32{ 300, 200 }, display.windows[0].opened_size);
+    try testing.expect(!display.windows[0].resizable);
+    try testing.expectEqual([2]u32{ 100, 50 }, display.windows[1].opened_size);
+    try testing.expect(display.windows[1].resizable);
+    // A size given is the size; a root with nothing in it has none of its
+    // own, and the window opens as big as one usually does.
+    const fill: ui.Align = .{};
+    _ = try app.openWindow(.{ .title = "sized", .root = .of(&box), .size = .{ 500, 400 } });
+    const filled = try app.openWindow(.{ .title = "fill", .root = .of(&fill) });
+    try testing.expectEqual([2]u32{ 500, 400 }, display.windows[2].opened_size);
+    try testing.expectEqual([2]u32{ 1280, 720 }, display.windows[3].opened_size);
+    // Resized by the app (no title bar of the toolkit's to add here).
+    filled.setSize(640, 480);
+    try testing.expectEqual([2]u32{ 640, 480 }, display.windows[3].asked_size.?);
 }

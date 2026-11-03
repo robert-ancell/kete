@@ -110,6 +110,8 @@ const WM_DPICHANGED = 0x02e0;
 const WM_APP_FRAME = 0x8000 + 1;
 
 const WS_OVERLAPPEDWINDOW: w32.DWORD = 0x00cf0000;
+const WS_THICKFRAME: w32.DWORD = 0x00040000;
+const WS_MAXIMIZEBOX: w32.DWORD = 0x00010000;
 const WS_POPUP: w32.DWORD = 0x80000000;
 const WS_VISIBLE: w32.DWORD = 0x10000000;
 const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
@@ -374,6 +376,8 @@ pub const Win32Window = struct {
     next_popup_id: u32 = 1,
     /// The content is under the title bar (`Options.draw_in_title_bar`).
     draw_in_title_bar: bool = false,
+    /// Whether the user can resize it (`Options.resizable`).
+    resizable: bool = true,
 
     /// A popup: a layered window over the window (owned by it), which never
     /// takes the keyboard, its pointer input the window's (in its
@@ -411,6 +415,9 @@ pub const Win32Window = struct {
         /// A window it belongs to (a dialog's, a tool window's): it owns
         /// it, so that it stays above it, and is minimized with it.
         parent: ?*Win32Window = null,
+        /// Whether the user can resize (and maximize) it: if not, it has
+        /// no sizing frame or maximize button.
+        resizable: bool = true,
     };
 
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("KeteWindow");
@@ -441,6 +448,7 @@ pub const Win32Window = struct {
             .width = options.size[0],
             .height = options.size[1],
             .draw_in_title_bar = options.draw_in_title_bar,
+            .resizable = options.resizable,
         };
         errdefer gpa.free(w.title_buf);
         if (options.min_size) |m| w.min_size = m;
@@ -448,7 +456,7 @@ pub const Win32Window = struct {
         var title_w: [256]u16 = undefined;
         // Sized for its DPI once it has one (WM_DPICHANGED, or below).
         const owner: ?w32.HWND = if (options.parent) |parent| parent.hwnd else null;
-        const hwnd = u.CreateWindowExW(0, class_name, w32.wide(&title_w, options.title).ptr, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, owner, null, instance, w) orelse return error.CreateWindowFailed;
+        const hwnd = u.CreateWindowExW(0, class_name, w32.wide(&title_w, options.title).ptr, w.windowStyle(), CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, owner, null, instance, w) orelse return error.CreateWindowFailed;
         w.hwnd = hwnd;
         w.updateScale(u);
         w.extendFrame(u);
@@ -457,7 +465,7 @@ pub const Win32Window = struct {
         w.applyDarkTitleBar();
         w.updateRefresh();
         w.timer = w32.CreateWaitableTimerExW(null, null, w32.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, w32.TIMER_ALL_ACCESS);
-        _ = u.ShowWindow(hwnd, if (options.maximized) SW_MAXIMIZE else SW_SHOW);
+        _ = u.ShowWindow(hwnd, if (options.maximized and options.resizable) SW_MAXIMIZE else SW_SHOW);
         _ = try w.applyConfigure();
         return w;
     }
@@ -545,6 +553,27 @@ pub const Win32Window = struct {
 
     /// Sets the window's size to `logical` (its client area, in logical
     /// pixels at its scale).
+    /// Its window style: the usual frame, without its sizing border and
+    /// maximize button if it is not resized.
+    fn windowStyle(w: *const Win32Window) w32.DWORD {
+        return if (w.resizable) WS_OVERLAPPEDWINDOW else WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+    }
+
+    /// Maximized, or full screen, only if it is resized.
+    pub fn canMaximize(w: *const Win32Window) bool {
+        return w.resizable;
+    }
+
+    pub fn canFullscreen(w: *const Win32Window) bool {
+        return w.resizable;
+    }
+
+    /// Makes its client area `width` by `height` (logical pixels).
+    pub fn setSize(w: *Win32Window, width: u32, height: u32) void {
+        const u = w32.user32() orelse return;
+        w.resizeTo(u, .{ width, height });
+    }
+
     fn resizeTo(w: *Win32Window, u: *const w32.User32, logical: [2]u32) void {
         var r: w32.RECT = .{ .right = @intCast(logical[0] * w.scale), .bottom = @intCast(logical[1] * w.scale) };
         w.outerRect(u, &r);
@@ -571,7 +600,7 @@ pub const Win32Window = struct {
     fn outerRect(w: *const Win32Window, u: *const w32.User32, r: *w32.RECT) void {
         if (w.draw_in_title_bar) return;
         const dpi = u.GetDpiForWindow(w.hwnd);
-        _ = u.AdjustWindowRectExForDpi(r, WS_OVERLAPPEDWINDOW, w32.FALSE, 0, if (dpi == 0) 96 else dpi);
+        _ = u.AdjustWindowRectExForDpi(r, w.windowStyle(), w32.FALSE, 0, if (dpi == 0) 96 else dpi);
     }
 
     /// Has DWM draw the window's buttons over the content (it draws them in
@@ -745,7 +774,7 @@ pub const Win32Window = struct {
                     var result: LRESULT = 0;
                     if (d.DwmDefWindowProc(w.hwnd, message, wparam, lparam, &result) != 0) return result;
                 }
-                if (u.IsZoomed(w.hwnd) != 0) return HTCLIENT;
+                if (u.IsZoomed(w.hwnd) != 0 or !w.resizable) return HTCLIENT;
                 // The edges, which resize it (there is no frame to do so).
                 var r: w32.RECT = .{};
                 _ = u.GetWindowRect(w.hwnd, &r);

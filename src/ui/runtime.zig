@@ -744,6 +744,37 @@ pub const WindowUi = struct {
 
     /// Builds, lays out and paints a frame with `root` (a widget's value)
     /// filling a `width` by `height` window.
+    /// The size `root` takes when nothing limits it (in whole logical
+    /// pixels; never smaller than it can be), as a window sized to its
+    /// content is: built and laid out as for a frame, but not painted. A
+    /// side it has no size on (nothing in it, or as big as it is let be) is
+    /// `fallback`'s. The toolkit's title bar is not in it.
+    pub fn naturalSize(ui: *WindowUi, root: anytype, fallback: [2]u32) [2]u32 {
+        ui.frame_no += 1;
+        _ = ui.arenas[@intCast(ui.frame_no % 2)].reset(.retain_capacity);
+        var cx: Context = .{ .ui = ui, .arena = ui.arena() };
+        const w = cx.make(root);
+        if (ui.root) |r| if (r.widget.vtable != w.vtable or r.widget.key != w.key) {
+            r.destroy();
+            ui.root = null;
+        };
+        if (ui.root == null) ui.root = Node.create(ui, w);
+        const r = ui.root orelse return fallback;
+        r.theme_ptr = null;
+        r.build(w);
+        const natural = r.layout(.unbounded);
+        const least = r.minSize(.unbounded);
+        const side = struct {
+            fn f(want: f32, min: f32, otherwise: u32) u32 {
+                // Nothing to size it by, or as big as it is let be: it has
+                // no size of its own.
+                if (!std.math.isFinite(want) or want <= 0 or want > 16384) return otherwise;
+                return @intFromFloat(@max(@ceil(@max(want, min)), 1));
+            }
+        }.f;
+        return .{ side(natural.w, least.w, fallback[0]), side(natural.h, least.h, fallback[1]) };
+    }
+
     pub fn frame(ui: *WindowUi, width: u32, height: u32, now_ns: u64, root: anytype) void {
         ui.frame_no += 1;
         _ = ui.arenas[@intCast(ui.frame_no % 2)].reset(.retain_capacity);
@@ -1939,15 +1970,22 @@ pub const App = struct {
     pub const Root = struct {
         ptr: *const anyopaque,
         frame: *const fn (ptr: *const anyopaque, ui: *WindowUi, width: u32, height: u32, now_ns: u64) void,
+        /// Its size with nothing to limit it (`WindowUi.naturalSize`).
+        measure: *const fn (ptr: *const anyopaque, ui: *WindowUi, fallback: [2]u32) [2]u32,
 
         pub fn of(root: anytype) Root {
             const T = @typeInfo(@TypeOf(root)).pointer.child;
-            return .{ .ptr = @ptrCast(root), .frame = struct {
+            const S = struct {
                 fn frame(p: *const anyopaque, ui: *WindowUi, width: u32, height: u32, now_ns: u64) void {
                     const r: *const T = @ptrCast(@alignCast(p));
                     ui.frame(width, height, now_ns, r.*);
                 }
-            }.frame };
+                fn measure(p: *const anyopaque, ui: *WindowUi, fallback: [2]u32) [2]u32 {
+                    const r: *const T = @ptrCast(@alignCast(p));
+                    return ui.naturalSize(r.*, fallback);
+                }
+            };
+            return .{ .ptr = @ptrCast(root), .frame = S.frame, .measure = S.measure };
         }
     };
 
@@ -1973,9 +2011,16 @@ pub const App = struct {
         title: []const u8,
         /// What it draws.
         root: Root,
-        size: [2]u32 = .{ 1280, 720 },
+        /// Its size, in logical pixels (the toolkit's title bar, if it draws
+        /// one, not counted); if null, the size its root takes when nothing
+        /// limits it (`WindowUi.naturalSize`: a side it has no size on is
+        /// 1280 by 720's).
+        size: ?[2]u32 = null,
         min_size: ?[2]u32 = null,
         maximized: bool = false,
+        /// Whether the user can resize (and maximize) it; if not, it stays
+        /// the size it opens at (or `Window.setSize` makes it).
+        resizable: bool = true,
         /// Whether what it draws goes under its title bar, the way the
         /// system's own controls (close, minimize, maximize) are drawn over
         /// it: where they are is in `Window.cutouts`, and `WindowDragArea`
@@ -2058,18 +2103,32 @@ pub const App = struct {
     /// Opens a window of the display's, as `options` says.
     pub fn openWindow(a: *App, options: WindowOptions) !*Window {
         const parent: ?window_mod.Window = if (options.parent) |p| (if (p.closed) return error.ParentClosed else p.win) else null;
+        // Sized to its content: its root measured, in a UI of its own, before
+        // the window opens (so it opens at that size).
+        const size = options.size orelse blk: {
+            const probe = try a.shared.createWindowUi();
+            defer probe.destroy();
+            probe.theme = a.theme.scheme();
+            break :blk options.root.measure(options.root.ptr, probe, .{ 1280, 720 });
+        };
         const win = try a.display.openWindow(.{
             .title = options.title,
             .app_id = a.app_id,
-            .size = options.size,
+            .size = size,
             .min_size = options.min_size,
             .maximized = options.maximized,
             .draw_in_title_bar = options.draw_in_title_bar,
             .parent = parent,
+            .resizable = options.resizable,
         });
         errdefer win.close();
         const w = try a.adopt(win, .{ .root = options.root, .min_size = options.min_size, .draw_in_title_bar = options.draw_in_title_bar, .clear_color = options.clear_color, .on_close_request = options.on_close_request });
         w.owns_window = true;
+        // The toolkit's title bar (it knows once the window is open whether
+        // it draws one) above what was asked for.
+        if (w.ui.hasToolkitTitleBar() and !w.ui.hasControlsOverlay()) {
+            win.setSize(size[0], size[1] + @as(u32, @intFromFloat(title_bar_mod.TitleBar.height)));
+        }
         w.ui.enableAccessibility(a.environ);
         return w;
     }
@@ -2353,6 +2412,16 @@ pub const App = struct {
             if (w.busy or w.drawing or a.stepping) return;
             if (std.mem.indexOfScalar(*Window, a.windows.items, w)) |i| _ = a.windows.orderedRemove(i);
             a.gpa.destroy(w);
+        }
+
+        /// Asks for it to be `width` by `height` (logical pixels, the
+        /// toolkit's title bar, if it draws one, not counted), when it is not
+        /// maximized, full screen or tiled; resizable or not.
+        pub fn setSize(w: *Window, width: u32, height: u32) void {
+            if (w.closed) return;
+            const bar: u32 = if (w.ui.hasToolkitTitleBar() and !w.ui.hasControlsOverlay()) @intFromFloat(title_bar_mod.TitleBar.height) else 0;
+            w.win.setSize(width, height + bar);
+            w.dirty = true;
         }
 
         /// Changes the title the system shows for it.

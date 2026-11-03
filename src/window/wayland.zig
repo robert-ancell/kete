@@ -1063,7 +1063,8 @@ pub const WaylandDisplay = struct {
             .width = if (options.maximized) options.size[0] else @max(options.size[0], min_size[0]),
             .height = if (options.maximized) options.size[1] else @max(options.size[1], min_size[1]),
             .min_size = min_size,
-            .maximized = options.maximized,
+            .maximized = options.maximized and options.resizable,
+            .resizable = options.resizable,
         };
         const tlen = @min(options.title.len, w.title_buf.len);
         @memcpy(w.title_buf[0..tlen], options.title[0..tlen]);
@@ -1114,7 +1115,9 @@ pub const WaylandDisplay = struct {
             m = try w.toplevel.request(p.xdg_toplevel.request.set_min_size);
             m.int(@intCast(ms[0])).int(@intCast(ms[1])).end();
         }
-        if (options.maximized) {
+        if (!options.resizable) {
+            w.fixSize();
+        } else if (options.maximized) {
             m = try w.toplevel.request(p.xdg_toplevel.request.set_maximized);
             m.end();
         }
@@ -1650,6 +1653,10 @@ pub const WaylandWindow = struct {
     decoration_changed: bool = false,
     last_geometry: ?[3]u32 = null,
     next_size: [2]i32 = .{ 0, 0 },
+    /// Whether the user can resize it (`Options.resizable`), and the size
+    /// the compositor was last told it is fixed at (if not).
+    resizable: bool = true,
+    fixed_size: [2]u32 = .{ 0, 0 },
     pending_serial: ?u32 = null,
     /// The window system asked for it to be closed (taken by the app).
     close_requested: bool = false,
@@ -1792,6 +1799,9 @@ pub const WaylandWindow = struct {
         /// A window it belongs to (a dialog's, a tool window's), on the
         /// same display.
         parent: ?*WaylandWindow = null,
+        /// Whether the user can resize (and maximize) it: if not, the
+        /// compositor is told it is as small and as big as it is.
+        resizable: bool = true,
     };
 
     /// Connects to the compositor named in `environ` (`WAYLAND_DISPLAY`
@@ -1826,7 +1836,8 @@ pub const WaylandWindow = struct {
             .width = if (options.maximized) options.size[0] else @max(options.size[0], min_size[0]),
             .height = if (options.maximized) options.size[1] else @max(options.size[1], min_size[1]),
             .min_size = min_size,
-            .maximized = options.maximized,
+            .maximized = options.maximized and options.resizable,
+            .resizable = options.resizable,
         };
         const tlen = @min(options.title.len, w.title_buf.len);
         @memcpy(w.title_buf[0..tlen], options.title[0..tlen]);
@@ -1930,7 +1941,9 @@ pub const WaylandWindow = struct {
             m = try w.toplevel.request(p.xdg_toplevel.request.set_min_size);
             m.int(@intCast(ms[0])).int(@intCast(ms[1])).end();
         }
-        if (options.maximized) {
+        if (!options.resizable) {
+            w.fixSize();
+        } else if (options.maximized) {
             m = try w.toplevel.request(p.xdg_toplevel.request.set_maximized);
             m.end();
         }
@@ -2307,7 +2320,7 @@ pub const WaylandWindow = struct {
     }
 
     pub fn canMaximize(w: *const WaylandWindow) bool {
-        return w.can_maximize;
+        return w.can_maximize and w.resizable;
     }
 
     pub fn canMinimize(w: *const WaylandWindow) bool {
@@ -2325,6 +2338,9 @@ pub const WaylandWindow = struct {
     }
 
     pub fn setMinSize(w: *WaylandWindow, width: u32, height: u32) void {
+        // A window that is not resized keeps its size (as small and as big
+        // as it is, to the compositor).
+        if (!w.resizable) return w.fixSize();
         if (w.isFloating()) {
             if (w.width < width) w.width = width;
             if (w.height < height) w.height = height;
@@ -2333,6 +2349,28 @@ pub const WaylandWindow = struct {
         w.min_size = .{ width, height };
         var m = w.toplevel.request(p.xdg_toplevel.request.set_min_size) catch return;
         m.int(@intCast(width)).int(@intCast(height)).end();
+        w.conn.flush() catch {};
+    }
+
+    /// Asks for the window to be `width` by `height` (logical pixels), when
+    /// it is not maximized, fullscreen or tiled (when the compositor says
+    /// how big it is); not smaller than its minimum size, if it is resized.
+    pub fn setSize(w: *WaylandWindow, width: u32, height: u32) void {
+        if (!w.isFloating()) return;
+        w.width = if (w.resizable) @max(width, w.min_size[0]) else width;
+        w.height = if (w.resizable) @max(height, w.min_size[1]) else height;
+        if (!w.resizable) w.fixSize();
+    }
+
+    /// Tells the compositor that the window is as small and as big as it is
+    /// (it is not resized).
+    fn fixSize(w: *WaylandWindow) void {
+        if (w.fixed_size[0] == w.width and w.fixed_size[1] == w.height) return;
+        w.fixed_size = .{ w.width, w.height };
+        for ([_]u16{ p.xdg_toplevel.request.set_min_size, p.xdg_toplevel.request.set_max_size }) |op| {
+            var m = w.toplevel.request(op) catch return;
+            m.int(@intCast(w.width)).int(@intCast(w.height)).end();
+        }
         w.conn.flush() catch {};
     }
 
@@ -2354,7 +2392,7 @@ pub const WaylandWindow = struct {
     }
 
     pub fn edgesAt(w: *const WaylandWindow, pos: [2]f32) u32 {
-        if (!w.hasToolkitDecorations()) return 0;
+        if (!w.hasToolkitDecorations() or !w.resizable) return 0;
         const width: f32 = @floatFromInt(w.width);
         const height: f32 = @floatFromInt(w.height);
         const x = pos[0];
@@ -2769,6 +2807,8 @@ pub const WaylandWindow = struct {
         if (w.isFloating()) {
             size[0] = @max(size[0], w.min_size[0]);
             size[1] = @max(size[1], w.min_size[1]);
+            // Not resized: its own size, whatever is suggested.
+            if (!w.resizable) size = .{ w.width, w.height };
         }
         var m = try w.xdg_surface.request(p.xdg_surface.request.ack_configure);
         m.uint(serial).end();

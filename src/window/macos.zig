@@ -55,6 +55,8 @@ pub const MacWindow = struct {
     fullscreen: bool = false,
     /// The content is under the title bar (`Options.draw_in_title_bar`).
     draw_in_title_bar: bool = false,
+    /// Whether the user can resize it (`Options.resizable`).
+    resizable: bool = true,
     /// The last press of the left button (kept), which moving the window
     /// from where the app says (`startMove`) goes on from.
     last_press: Id = null,
@@ -188,6 +190,9 @@ pub const MacWindow = struct {
         /// A window it belongs to (a dialog's, a tool window's): it stays
         /// above it, and moves with it.
         parent: ?*MacWindow = null,
+        /// Whether the user can resize it (by its edges, its zoom button, or
+        /// to full screen).
+        resizable: bool = true,
     };
 
     /// Opens a window on a display of its own (and, the first time,
@@ -212,9 +217,11 @@ pub const MacWindow = struct {
         errdefer gpa.free(w.title_buf);
 
         const rect: objc.Rect = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = @floatFromInt(options.size[0]), .height = @floatFromInt(options.size[1]) } };
-        // Titled, closable, minimizable and resizable: the system's frame
-        // (with the content under the title bar, if the app draws there).
-        const style: u64 = 1 | 2 | 4 | 8 | (if (options.draw_in_title_bar) @as(u64, 1 << 15) else 0);
+        // Titled, closable, minimizable and (unless not) resizable: the
+        // system's frame (with the content under the title bar, if the app
+        // draws there).
+        const style: u64 = 1 | 2 | 4 | (if (options.resizable) @as(u64, 8) else 0) | (if (options.draw_in_title_bar) @as(u64, 1 << 15) else 0);
+        w.resizable = options.resizable;
         const nswin = msg(Id, objc.class("NSWindow"), "alloc", .{});
         w.win = msg(Id, nswin, "initWithContentRect:styleMask:backing:defer:", .{ rect, style, @as(u64, 2), objc.no });
         msg(void, w.win, "setReleasedWhenClosed:", .{objc.no});
@@ -250,7 +257,7 @@ pub const MacWindow = struct {
         msg(void, w.win, "center", .{});
         msg(void, w.win, "makeKeyAndOrderFront:", .{@as(Id, null)});
         msg(void, w.win, "makeFirstResponder:", .{w.view});
-        if (options.maximized) msg(void, w.win, "zoom:", .{@as(Id, null)});
+        if (options.maximized and options.resizable) msg(void, w.win, "zoom:", .{@as(Id, null)});
         if (options.parent) |parent| msg(void, parent.win, "addChildWindow:ordered:", .{ w.win, @as(isize, 1) });
         msg(void, app, "activateIgnoringOtherApps:", .{objc.yes});
 
@@ -648,6 +655,27 @@ pub const MacWindow = struct {
 
     pub fn setMinimized(w: *MacWindow) void {
         msg(void, w.win, "miniaturize:", .{@as(Id, null)});
+    }
+
+    /// Zoomed to fill the screen, or to full screen, only if it is resized.
+    pub fn canMaximize(w: *const MacWindow) bool {
+        return w.resizable;
+    }
+
+    pub fn canFullscreen(w: *const MacWindow) bool {
+        return w.resizable;
+    }
+
+    /// Makes its content `width` by `height` (points), keeping its top
+    /// left where it is.
+    pub fn setSize(w: *MacWindow, width: u32, height: u32) void {
+        const pool = objc.push();
+        defer objc.pop(pool);
+        const before = objc.msgRect(w.win, "frame");
+        msg(void, w.win, "setContentSize:", .{objc.Size{ .width = @floatFromInt(width), .height = @floatFromInt(height) }});
+        // The screen's y runs up: the top stays where it was.
+        msg(void, w.win, "setFrameTopLeftPoint:", .{objc.Point{ .x = before.origin.x, .y = before.origin.y + before.size.height }});
+        postWake();
     }
 
     pub fn setFullscreen(w: *MacWindow, on: bool) void {

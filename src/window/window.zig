@@ -631,6 +631,7 @@ pub const Window = struct {
         isFramePending: *const fn (ptr: *anyopaque) bool,
         setCursor: *const fn (ptr: *anyopaque, cursor: PointerCursor) void,
         setMinSize: *const fn (ptr: *anyopaque, width: u32, height: u32) void,
+        setSize: *const fn (ptr: *anyopaque, width: u32, height: u32) void,
         setRedraw: *const fn (ptr: *anyopaque, redraw: ?Redraw) void,
         setMaximized: *const fn (ptr: *anyopaque, on: bool) void,
         setMinimized: *const fn (ptr: *anyopaque) void,
@@ -799,6 +800,9 @@ pub const Window = struct {
             fn setCursorFn(p: *anyopaque, cursor: PointerCursor) void {
                 if (@hasDecl(T, "setCursor")) self(p).setCursor(cursor);
             }
+            fn setSizeFn(p: *anyopaque, w: u32, h: u32) void {
+                if (@hasDecl(T, "setSize")) self(p).setSize(w, h);
+            }
             fn setMinSizeFn(p: *anyopaque, w: u32, h: u32) void {
                 if (@hasDecl(T, "setMinSize")) self(p).setMinSize(w, h);
             }
@@ -961,6 +965,7 @@ pub const Window = struct {
                 .isFramePending = isFramePendingFn,
                 .setCursor = setCursorFn,
                 .setMinSize = setMinSizeFn,
+                .setSize = setSizeFn,
                 .setRedraw = setRedrawFn,
                 .setMaximized = setMaximizedFn,
                 .setMinimized = setMinimizedFn,
@@ -1108,6 +1113,12 @@ pub const Window = struct {
         w.vtable.setCursor(w.ptr, cursor);
     }
     /// Sets the smallest size, in logical pixels, the user can resize the window to.
+    /// Asks for the window to be `width` by `height` (logical pixels): when
+    /// it is not maximized, full screen or tiled, and as the window system
+    /// lets it be (nothing, where it cannot be).
+    pub fn setSize(w: Window, width: u32, height: u32) void {
+        w.vtable.setSize(w.ptr, width, height);
+    }
     pub fn setMinSize(w: Window, width: u32, height: u32) void {
         w.vtable.setMinSize(w.ptr, width, height);
     }
@@ -1331,6 +1342,9 @@ pub const WindowOptions = struct {
     /// A window it belongs to (a dialog's, a tool window's), opened on the
     /// same display: it stays above it.
     parent: ?Window = null,
+    /// Whether the user can resize (and maximize) it; if not, it stays the
+    /// size it is opened at (or `Window.setSize` makes it).
+    resizable: bool = true,
 };
 
 /// The app's connection to the windowing system: what its windows are
