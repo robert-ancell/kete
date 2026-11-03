@@ -1044,8 +1044,6 @@ pub const WaylandDisplay = struct {
             .wm_base = d.wm_base,
             .shm = d.shm orelse .{},
             .dmabuf = d.dmabuf,
-            .dmabuf_argb8888 = d.dmabuf_argb8888,
-            .dmabuf_xrgb8888 = d.dmabuf_xrgb8888,
             .drm_syncobj_manager = d.drm_syncobj_manager,
             .decoration_manager = d.decoration_manager,
             .cursor_shape_manager = d.cursor_shape_manager,
@@ -1540,7 +1538,15 @@ pub const WaylandWindow = struct {
 
     pub fn usingDmabuf(w: *const WaylandWindow) bool {
         const dev_present = if (w.display) |d| d.dmabuf_dev != null else w.dmabuf_dev != null;
-        return w.dmabuf != null and dev_present and (w.dmabuf_argb8888 or w.dmabuf_xrgb8888);
+        const formats = w.dmabufFormats();
+        return w.dmabuf != null and dev_present and (formats.argb8888 or formats.xrgb8888);
+    }
+
+    /// The formats the compositor takes dmabufs in: its display's, for a
+    /// window of one (they may come after the window is made).
+    fn dmabufFormats(w: *const WaylandWindow) struct { argb8888: bool, xrgb8888: bool } {
+        if (w.display) |d| return .{ .argb8888 = d.dmabuf_argb8888, .xrgb8888 = d.dmabuf_xrgb8888 };
+        return .{ .argb8888 = w.dmabuf_argb8888, .xrgb8888 = w.dmabuf_xrgb8888 };
     }
 
     pub fn usingDrmSyncobj(w: *const WaylandWindow) bool {
@@ -3173,7 +3179,8 @@ pub const WaylandWindow = struct {
     fn allocDmabufBuffer(w: *WaylandWindow, slot: usize, bw: u32, bh: u32, cw: u32, ch: u32, m_px: u32, s: u32) !Buffer {
         const dmabuf = w.dmabuf orelse return error.NoDmabuf;
         const dev = if (w.display) |d| &(d.dmabuf_dev orelse return error.NoDmabuf) else &(w.dmabuf_dev orelse return error.NoDmabuf);
-        const fmt: u32 = if ((m_px > 0 and w.dmabuf_argb8888) or !w.dmabuf_xrgb8888)
+        const formats = w.dmabufFormats();
+        const fmt: u32 = if ((m_px > 0 and formats.argb8888) or !formats.xrgb8888)
             p.fourcc.argb8888
         else
             p.fourcc.xrgb8888;
