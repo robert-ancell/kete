@@ -1329,8 +1329,10 @@ pub const WindowOptions = struct {
     /// What the system knows the app by (Wayland's app id), if not the
     /// display's.
     app_id: ?[]const u8 = null,
-    /// Its size in logical pixels (null: the backend's default).
-    size: ?[2]u32 = null,
+    /// Its size in logical pixels; a side not given is the window
+    /// system's to choose (the backend's: the system's own default size,
+    /// or a part of the screen).
+    size: [2]?u32 = .{ null, null },
     min_size: ?[2]u32 = null,
     maximized: bool = false,
     /// The app draws in the window's title bar: the window system gives up
@@ -1392,7 +1394,13 @@ pub const Display = struct {
                     if (comptime std.mem.eql(u8, name, "parent")) {
                         if (options.parent) |parent| o.parent = parent.as(W) orelse return error.ParentNotOnDisplay;
                     } else if (comptime std.mem.eql(u8, name, "size")) {
-                        if (options.size) |size| o.size = size;
+                        // A backend whose sizes are not optional keeps its
+                        // own for a side not given.
+                        if (@FieldType(Opts, "size") == [2]?u32) {
+                            o.size = options.size;
+                        } else for (options.size, 0..) |side, i| {
+                            if (side) |v| o.size[i] = v;
+                        }
                     } else if (@hasField(WindowOptions, name)) {
                         @field(o, name) = @field(options, name);
                     }

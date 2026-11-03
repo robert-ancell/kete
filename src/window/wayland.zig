@@ -24,8 +24,6 @@ pub const PointerCursor = window_mod.PointerCursor;
 const xkb = window_mod.xkb;
 const compose = window_mod.compose;
 
-const default_size = [2]u32{ 1280, 720 };
-
 pub const shadow_margin: u32 = 28;
 pub const corner_radius: f32 = 12.0;
 pub const resize_outset: f32 = 10.0;
@@ -1060,8 +1058,8 @@ pub const WaylandDisplay = struct {
             .clipboard = .{ .gpa = gpa, .io = conn.conn.io },
             .display = d,
             .compose_env = d.compose_env,
-            .width = if (options.maximized) options.size[0] else @max(options.size[0], min_size[0]),
-            .height = if (options.maximized) options.size[1] else @max(options.size[1], min_size[1]),
+            .width = if (options.size[0]) |x| (if (options.maximized) x else @max(x, min_size[0])) else 0,
+            .height = if (options.size[1]) |y| (if (options.maximized) y else @max(y, min_size[1])) else 0,
             .min_size = min_size,
             .maximized = options.maximized and options.resizable,
             .resizable = options.resizable,
@@ -1115,9 +1113,7 @@ pub const WaylandDisplay = struct {
             m = try w.toplevel.request(p.xdg_toplevel.request.set_min_size);
             m.int(@intCast(ms[0])).int(@intCast(ms[1])).end();
         }
-        if (!options.resizable) {
-            w.fixSize();
-        } else if (options.maximized) {
+        if (options.maximized and options.resizable) {
             m = try w.toplevel.request(p.xdg_toplevel.request.set_maximized);
             m.end();
         }
@@ -1125,6 +1121,8 @@ pub const WaylandDisplay = struct {
         m.end();
         while (w.pending_serial == null) try conn.dispatch();
         _ = try w.applyConfigure();
+        // Not resized: fixed at the size it has now.
+        if (!w.resizable) w.fixSize();
         w.updateExtensions();
         try conn.flush();
         return w;
@@ -1645,8 +1643,13 @@ pub const WaylandWindow = struct {
 
     title_buf: [128]u8 = undefined,
     title_len: usize = 0,
-    width: u32 = default_size[0],
-    height: u32 = default_size[1],
+    /// Its size, in logical pixels (0 on a side until the compositor's
+    /// first configure, if it was not given one).
+    width: u32 = 0,
+    height: u32 = 0,
+    /// The most the compositor suggests a window be (its usable area, from
+    /// `configure_bounds`; 0 if it did not say).
+    bounds: [2]u32 = .{ 0, 0 },
     min_size: [2]u32 = .{ 0, 0 },
     scale: u32 = 1,
     system_decorations: bool = false,
@@ -1790,7 +1793,10 @@ pub const WaylandWindow = struct {
     pub const Options = struct {
         title: []const u8,
         app_id: ?[]const u8 = null,
-        size: [2]u32 = default_size,
+        /// Its size, in logical pixels; a side not given is the
+        /// compositor's to choose (or two thirds of the area it suggests
+        /// for windows, or, if it says nothing, the window's minimum size).
+        size: [2]?u32 = .{ null, null },
         min_size: ?[2]u32 = null,
         maximized: bool = false,
         /// The app draws in the title bar: the compositor is asked to leave
@@ -1833,8 +1839,8 @@ pub const WaylandWindow = struct {
             .io = conn.conn.io,
             .conn = conn,
             .clipboard = .{ .gpa = gpa },
-            .width = if (options.maximized) options.size[0] else @max(options.size[0], min_size[0]),
-            .height = if (options.maximized) options.size[1] else @max(options.size[1], min_size[1]),
+            .width = if (options.size[0]) |x| (if (options.maximized) x else @max(x, min_size[0])) else 0,
+            .height = if (options.size[1]) |y| (if (options.maximized) y else @max(y, min_size[1])) else 0,
             .min_size = min_size,
             .maximized = options.maximized and options.resizable,
             .resizable = options.resizable,
@@ -1941,9 +1947,7 @@ pub const WaylandWindow = struct {
             m = try w.toplevel.request(p.xdg_toplevel.request.set_min_size);
             m.int(@intCast(ms[0])).int(@intCast(ms[1])).end();
         }
-        if (!options.resizable) {
-            w.fixSize();
-        } else if (options.maximized) {
+        if (options.maximized and options.resizable) {
             m = try w.toplevel.request(p.xdg_toplevel.request.set_maximized);
             m.end();
         }
@@ -1951,6 +1955,8 @@ pub const WaylandWindow = struct {
         m.end();
         while (w.pending_serial == null) try conn.dispatch();
         _ = try w.applyConfigure();
+        // Not resized: fixed at the size it has now.
+        if (!w.resizable) w.fixSize();
         w.updateExtensions();
         return w;
     }
@@ -2800,10 +2806,14 @@ pub const WaylandWindow = struct {
         w.pending_serial = null;
         const dec_changed = w.decoration_changed;
         w.decoration_changed = false;
-        var size = [2]u32{
-            if (w.next_size[0] > 0) @intCast(w.next_size[0]) else w.width,
-            if (w.next_size[1] > 0) @intCast(w.next_size[1]) else w.height,
-        };
+        // The compositor's size; else the window's own; else (a side it was
+        // not given, on the first configure) two thirds of what the
+        // compositor suggests for windows, or its minimum size.
+        const own = [2]u32{ w.width, w.height };
+        var size: [2]u32 = undefined;
+        for (&size, 0..) |*side, i| {
+            side.* = if (w.next_size[i] > 0) @intCast(w.next_size[i]) else if (own[i] > 0) own[i] else if (w.bounds[i] > 0) w.bounds[i] * 2 / 3 else @max(w.min_size[i], 1);
+        }
         if (w.isFloating()) {
             size[0] = @max(size[0], w.min_size[0]);
             size[1] = @max(size[1], w.min_size[1]);
@@ -3844,6 +3854,11 @@ pub const WaylandWindow = struct {
                 w.tiled = tiled;
             },
             p.xdg_toplevel.event.close => w.close_requested = true,
+            p.xdg_toplevel.event.configure_bounds => {
+                const bw = r.int() catch 0;
+                const bh = r.int() catch 0;
+                w.bounds = .{ @intCast(@max(bw, 0)), @intCast(@max(bh, 0)) };
+            },
             p.xdg_toplevel.event.wm_capabilities => {
                 const caps = r.array() catch return;
                 w.can_maximize = false;

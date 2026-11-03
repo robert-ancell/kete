@@ -406,7 +406,9 @@ pub const Win32Window = struct {
     pub const Options = struct {
         title: []const u8,
         app_id: ?[]const u8 = null,
-        size: [2]u32 = .{ 960, 640 },
+        /// Its client area's size, in logical pixels; a side not given is
+        /// the size Windows gives a new window (`CW_USEDEFAULT`).
+        size: [2]?u32 = .{ null, null },
         min_size: ?[2]u32 = null,
         maximized: bool = false,
         /// The app draws in the title bar: the window's content fills it, and
@@ -445,8 +447,8 @@ pub const Win32Window = struct {
             .display = d,
             .hwnd = undefined,
             .title_buf = try gpa.dupe(u8, options.title),
-            .width = options.size[0],
-            .height = options.size[1],
+            .width = options.size[0] orelse 0,
+            .height = options.size[1] orelse 0,
             .draw_in_title_bar = options.draw_in_title_bar,
             .resizable = options.resizable,
         };
@@ -460,7 +462,17 @@ pub const Win32Window = struct {
         w.hwnd = hwnd;
         w.updateScale(u);
         w.extendFrame(u);
-        w.resizeTo(u, options.size);
+        // The sides given (Windows chose both, from CW_USEDEFAULT; those not
+        // given are kept), at least the minimum size.
+        if (options.size[0] != null or options.size[1] != null or options.min_size != null) {
+            var r: w32.RECT = .{};
+            _ = u.GetClientRect(hwnd, &r);
+            const s = @max(w.scale, 1);
+            const chosen = [2]u32{ @intCast(@max(r.right - r.left, 0)), @intCast(@max(r.bottom - r.top, 0)) };
+            var want: [2]u32 = undefined;
+            for (&want, 0..) |*side, i| side.* = @max(options.size[i] orelse (chosen[i] + s - 1) / s, w.min_size[i]);
+            w.resizeTo(u, want);
+        }
         w.dark = w32.appsUseDark();
         w.applyDarkTitleBar();
         w.updateRefresh();

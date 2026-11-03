@@ -745,12 +745,12 @@ pub const WindowUi = struct {
 
     /// Builds, lays out and paints a frame with `root` (a widget's value)
     /// filling a `width` by `height` window.
-    /// The size `root` takes when nothing limits it (in whole logical
-    /// pixels; never smaller than it can be), as a window sized to its
-    /// content is: built and laid out as for a frame, but not painted. A
-    /// side it has no size on (nothing in it, or as big as it is let be) is
-    /// `fallback`'s. The toolkit's title bar is not in it.
-    pub fn naturalSize(ui: *WindowUi, root: anytype, fallback: [2]u32) [2]u32 {
+    /// The size `root` takes when nothing limits it, and the least it can
+    /// be (in whole logical pixels), as a window sized to its content is:
+    /// built and laid out as for a frame, but not painted. A side it has
+    /// no size on (nothing in it, or as big as it is let be) is null. The
+    /// toolkit's title bar is not in it.
+    pub fn naturalSize(ui: *WindowUi, root: anytype) NaturalSize {
         ui.frame_no += 1;
         _ = ui.arenas[@intCast(ui.frame_no % 2)].reset(.retain_capacity);
         var cx: Context = .{ .ui = ui, .arena = ui.arena() };
@@ -760,21 +760,35 @@ pub const WindowUi = struct {
             ui.root = null;
         };
         if (ui.root == null) ui.root = Node.create(ui, w);
-        const r = ui.root orelse return fallback;
+        const r = ui.root orelse return .{};
         r.theme_ptr = null;
         r.build(w);
         const natural = r.layout(.unbounded);
-        const least = r.minSize(.unbounded);
-        const side = struct {
-            fn f(want: f32, min: f32, otherwise: u32) u32 {
-                // Nothing to size it by, or as big as it is let be: it has
-                // no size of its own.
-                if (!std.math.isFinite(want) or want <= 0 or want > 16384) return otherwise;
-                return @intFromFloat(@max(@ceil(@max(want, min)), 1));
+        const min = r.minSize(.unbounded);
+        const whole = struct {
+            fn f(v: f32) u32 {
+                return if (std.math.isFinite(v) and v > 0 and v <= 16384) @intFromFloat(@ceil(v)) else 0;
             }
         }.f;
-        return .{ side(natural.w, least.w, fallback[0]), side(natural.h, least.h, fallback[1]) };
+        const least: [2]u32 = .{ whole(min.w), whole(min.h) };
+        const side = struct {
+            fn f(want: f32, at_least: u32) ?u32 {
+                // Nothing to size it by, or as big as it is let be: it has
+                // no size of its own.
+                if (!std.math.isFinite(want) or want <= 0 or want > 16384) return null;
+                return @max(@as(u32, @intFromFloat(@ceil(want))), at_least, 1);
+            }
+        }.f;
+        return .{ .size = .{ side(natural.w, least[0]), side(natural.h, least[1]) }, .least = least };
     }
+
+    /// What `naturalSize` finds.
+    pub const NaturalSize = struct {
+        /// Its size on each side, if it has one there.
+        size: [2]?u32 = .{ null, null },
+        /// The least it can be.
+        least: [2]u32 = .{ 0, 0 },
+    };
 
     pub fn frame(ui: *WindowUi, width: u32, height: u32, now_ns: u64, root: anytype) void {
         ui.frame_no += 1;
@@ -1966,7 +1980,7 @@ pub const App = struct {
         ptr: *const anyopaque,
         frame: *const fn (ptr: *const anyopaque, ui: *WindowUi, width: u32, height: u32, now_ns: u64) void,
         /// Its size with nothing to limit it (`WindowUi.naturalSize`).
-        measure: *const fn (ptr: *const anyopaque, ui: *WindowUi, fallback: [2]u32) [2]u32,
+        measure: *const fn (ptr: *const anyopaque, ui: *WindowUi) WindowUi.NaturalSize,
 
         pub fn of(root: anytype) Root {
             const T = @typeInfo(@TypeOf(root)).pointer.child;
@@ -1975,9 +1989,9 @@ pub const App = struct {
                     const r: *const T = @ptrCast(@alignCast(p));
                     ui.frame(width, height, now_ns, r.*);
                 }
-                fn measure(p: *const anyopaque, ui: *WindowUi, fallback: [2]u32) [2]u32 {
+                fn measure(p: *const anyopaque, ui: *WindowUi) WindowUi.NaturalSize {
                     const r: *const T = @ptrCast(@alignCast(p));
-                    return ui.naturalSize(r.*, fallback);
+                    return ui.naturalSize(r.*);
                 }
             };
             return .{ .ptr = @ptrCast(root), .frame = S.frame, .measure = S.measure };
@@ -2008,8 +2022,8 @@ pub const App = struct {
         root: Root,
         /// Its size, in logical pixels (the toolkit's title bar, if it draws
         /// one, not counted); if null, the size its root takes when nothing
-        /// limits it (`WindowUi.naturalSize`: a side it has no size on is
-        /// 1280 by 720's).
+        /// limits it (`WindowUi.naturalSize`), a side it has no size on left
+        /// to the window system to choose.
         size: ?[2]u32 = null,
         min_size: ?[2]u32 = null,
         maximized: bool = false,
@@ -2099,18 +2113,22 @@ pub const App = struct {
     pub fn openWindow(a: *App, options: WindowOptions) !*Window {
         const parent: ?window_mod.Window = if (options.parent) |p| (if (p.closed) return error.ParentClosed else p.win) else null;
         // Sized to its content: its root measured, in a UI of its own, before
-        // the window opens (so it opens at that size).
-        const size = options.size orelse blk: {
+        // the window opens (so it opens at that size, and no smaller than its
+        // content can be).
+        const natural: WindowUi.NaturalSize = if (options.size) |given| .{ .size = .{ given[0], given[1] } } else blk: {
             const probe = try a.shared.createWindowUi();
             defer probe.destroy();
             probe.theme = a.theme.scheme();
-            break :blk options.root.measure(options.root.ptr, probe, .{ 1280, 720 });
+            break :blk options.root.measure(options.root.ptr, probe);
         };
+        const size = natural.size;
+        const floor = options.min_size orelse [2]u32{ 0, 0 };
+        const least = [2]u32{ @max(floor[0], natural.least[0]), @max(floor[1], natural.least[1]) };
         const win = try a.display.openWindow(.{
             .title = options.title,
             .app_id = a.app_id,
             .size = size,
-            .min_size = options.min_size,
+            .min_size = if (least[0] > 0 or least[1] > 0) least else null,
             .maximized = options.maximized,
             .draw_in_title_bar = options.draw_in_title_bar,
             .parent = parent,
@@ -2121,9 +2139,10 @@ pub const App = struct {
         w.owns_window = true;
         // The toolkit's title bar (it knows once the window is open whether
         // it draws one) above what was asked for.
-        if (w.ui.hasToolkitTitleBar() and !w.ui.hasControlsOverlay()) {
-            win.setSize(size[0], size[1] + @as(u32, @intFromFloat(title_bar_mod.TitleBar.height)));
-        }
+        if (w.ui.hasToolkitTitleBar() and !w.ui.hasControlsOverlay()) if (size[1]) |h| {
+            const now = win.size();
+            win.setSize(size[0] orelse now[0], h + @as(u32, @intFromFloat(title_bar_mod.TitleBar.height)));
+        };
         w.ui.enableAccessibility(a.environ);
         return w;
     }

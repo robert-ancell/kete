@@ -181,7 +181,9 @@ pub const MacWindow = struct {
     pub const Options = struct {
         title: []const u8,
         app_id: ?[]const u8 = null,
-        size: [2]u32 = .{ 960, 640 },
+        /// Its content's size, in points; a side not given is two thirds
+        /// of the screen's (the part of it windows go in).
+        size: [2]?u32 = .{ null, null },
         min_size: ?[2]u32 = null,
         maximized: bool = false,
         /// The app draws in the title bar: the window's content fills it, and
@@ -213,10 +215,19 @@ pub const MacWindow = struct {
 
         const w = try gpa.create(MacWindow);
         errdefer gpa.destroy(w);
-        w.* = .{ .gpa = gpa, .io = d.io, .display = d, .win = null, .view = null, .delegate = null, .title_buf = try gpa.dupe(u8, options.title), .width = options.size[0], .height = options.size[1] };
+        // A side not given: two thirds of the main screen's visible frame
+        // (less the menu bar and the Dock), at least the minimum size.
+        const main_screen = msg(Id, msg(Id, objc.class("NSScreen"), "screens", .{}), "firstObject", .{});
+        const visible: objc.Rect = if (main_screen != null) objc.msgRect(main_screen, "visibleFrame") else .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } };
+        const least = options.min_size orelse [2]u32{ 1, 1 };
+        const opened = [2]u32{
+            options.size[0] orelse @max(@as(u32, @intFromFloat(@max(visible.size.width * 2 / 3, 0))), least[0], 1),
+            options.size[1] orelse @max(@as(u32, @intFromFloat(@max(visible.size.height * 2 / 3, 0))), least[1], 1),
+        };
+        w.* = .{ .gpa = gpa, .io = d.io, .display = d, .win = null, .view = null, .delegate = null, .title_buf = try gpa.dupe(u8, options.title), .width = opened[0], .height = opened[1] };
         errdefer gpa.free(w.title_buf);
 
-        const rect: objc.Rect = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = @floatFromInt(options.size[0]), .height = @floatFromInt(options.size[1]) } };
+        const rect: objc.Rect = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = @floatFromInt(opened[0]), .height = @floatFromInt(opened[1]) } };
         // Titled, closable, minimizable and (unless not) resizable: the
         // system's frame (with the content under the title bar, if the app
         // draws there).

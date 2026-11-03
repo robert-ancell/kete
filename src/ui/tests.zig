@@ -2861,14 +2861,14 @@ const AppDisplay = struct {
         closed: bool = false,
         parent: ?*AppWin = null,
         /// The size it was opened at, and whether it can be resized.
-        opened_size: [2]u32 = .{ 0, 0 },
+        opened_size: [2]?u32 = .{ null, null },
         resizable: bool = true,
         asked_size: ?[2]u32 = null,
 
         pub const Options = struct {
             title: []const u8,
             parent: ?*AppWin = null,
-            size: [2]u32 = .{ 64, 48 },
+            size: [2]?u32 = .{ null, null },
             resizable: bool = true,
         };
         pub fn setSize(w: *AppWin, width: u32, height: u32) void {
@@ -3697,17 +3697,17 @@ test "a window with no size given opens at its content's, and can be kept from b
     const column: Root(S.build) = .{};
     _ = try app.openWindow(.{ .title = "box", .root = .of(&box), .resizable = false });
     _ = try app.openWindow(.{ .title = "column", .root = .of(&column) });
-    try testing.expectEqual([2]u32{ 300, 200 }, display.windows[0].opened_size);
+    try testing.expectEqual([2]?u32{ 300, 200 }, display.windows[0].opened_size);
     try testing.expect(!display.windows[0].resizable);
-    try testing.expectEqual([2]u32{ 100, 50 }, display.windows[1].opened_size);
+    try testing.expectEqual([2]?u32{ 100, 50 }, display.windows[1].opened_size);
     try testing.expect(display.windows[1].resizable);
     // A size given is the size; a root with nothing in it has none of its
-    // own, and the window opens as big as one usually does.
+    // own, and the window system chooses.
     const fill: ui.Align = .{};
     _ = try app.openWindow(.{ .title = "sized", .root = .of(&box), .size = .{ 500, 400 } });
     const filled = try app.openWindow(.{ .title = "fill", .root = .of(&fill) });
-    try testing.expectEqual([2]u32{ 500, 400 }, display.windows[2].opened_size);
-    try testing.expectEqual([2]u32{ 1280, 720 }, display.windows[3].opened_size);
+    try testing.expectEqual([2]?u32{ 500, 400 }, display.windows[2].opened_size);
+    try testing.expectEqual([2]?u32{ null, null }, display.windows[3].opened_size);
     // Resized by the app (no title bar of the toolkit's to add here).
     filled.setSize(640, 480);
     try testing.expectEqual([2]u32{ 640, 480 }, display.windows[3].asked_size.?);
