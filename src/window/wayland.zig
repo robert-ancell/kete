@@ -800,8 +800,9 @@ pub const WaylandDisplay = struct {
                 "member='SettingChanged'," ++
                 "path='/org/freedesktop/portal/desktop'");
             if (w.failed) return error.OutOfMemory;
-            // Ignore AddMatch failures (the signal just won't arrive).
-            _ = conn.callWait(
+            // Ignore AddMatch failures (the signal just won't arrive). The
+            // reply says nothing, but it is ours to free.
+            if (conn.callWait(
                 "org.freedesktop.DBus",
                 "/org/freedesktop/DBus",
                 "org.freedesktop.DBus",
@@ -809,7 +810,7 @@ pub const WaylandDisplay = struct {
                 "s",
                 w.buf.items,
                 5000,
-            ) catch {};
+            )) |reply| d.gpa.free(reply) else |_| {}
         }
 
         // Query the initial color-scheme value.
