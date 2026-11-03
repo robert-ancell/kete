@@ -3515,7 +3515,7 @@ test "the app is given the GPU device its windows are drawn with, from the start
     defer shared.destroy();
     const dev = shared.gpuDevice() orelse return error.SkipZigTest;
     switch (dev) {
-        .vulkan => |d| {
+        .vulkan => |d| if (comptime builtin.os.tag == .linux) {
             // A context on it draws straight into the windows' frames.
             var ctx = try gfx.VulkanContext.initShared(testing.allocator, d);
             defer ctx.deinit();
