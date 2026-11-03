@@ -2570,7 +2570,8 @@ pub const WaylandWindow = struct {
 
     pub fn startMove(w: *WaylandWindow) void {
         if (w.press_serial == 0) return;
-        const seat = w.seat orelse return;
+        // A window of a display's has the display's seat, not one of its own.
+        const seat = (if (w.display) |d| d.seat else w.seat) orelse return;
         var m = w.toplevel.request(p.xdg_toplevel.request.move) catch return;
         m.uint(seat.id).uint(w.press_serial).end();
         w.conn.flush() catch {};
