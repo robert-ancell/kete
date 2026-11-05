@@ -235,7 +235,9 @@ fn buildButton(cx: *Context, state: anytype, b: anytype, look: Look) Widget {
         1 => parts[0],
         else => cx.make(Row{ .spacing = 8, .fill = false, .cross_axis_alignment = .center, .children = parts[0..n] }),
     };
-    const icon_only = b.child == null and b.label.len == 0 and n == 1;
+    // Icons without a label (one, or one and a trailing arrow, say) are as
+    // compact as an icon button.
+    const icon_only = b.child == null and b.label.len == 0 and n > 0;
     const h_pad: f32 = if (icon_only) (height - icon_size) / 2 else look.padding;
     return cx.make(Pressable{
         .on_press = b.on_press,

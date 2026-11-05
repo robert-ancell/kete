@@ -170,6 +170,33 @@ fn click(u: *ui.WindowUi, n: *Node) void {
     u.pointerButton(p, .left, false);
 }
 
+const IconsOnly = struct {
+    pub fn build(_: *const IconsOnly, cx: *Context) Widget {
+        return cx.make(ui.Row{ .fill = false, .children = cx.makeAll(.{
+            ui.TextButton{ .icon = .menu },
+            ui.TextButton{ .icon = .menu, .trailing_icon = .expand_more },
+            ui.TextButton{ .label = "Menu", .icon = .menu, .trailing_icon = .expand_more },
+        }) });
+    }
+};
+
+test "buttons of icons without a label are as compact as icon buttons" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    u.frame(400, 100, 0, IconsOnly{});
+    var buttons: std.ArrayList(*Node) = .empty;
+    defer buttons.deinit(testing.allocator);
+    try findAll(u.root.?, ui.TextButton, &buttons);
+    try testing.expectEqual(@as(usize, 3), buttons.items.len);
+    // An icon in a circle, two icons in a pill padded alike, and with a
+    // label, padded as a label is.
+    const pad = (ui.button.height - ui.button.icon_size) / 2;
+    try testing.expectEqual(@as(f32, ui.button.height), buttons.items[0].size.w);
+    try testing.expectEqual(@as(f32, pad + ui.button.icon_size + 8 + ui.button.icon_size + pad), buttons.items[1].size.w);
+    try testing.expect(buttons.items[2].size.w > buttons.items[1].size.w + 2 * 8);
+}
+
 test "buttons call back, state lasts between frames, and hovering tints" {
     const fira = try font.Font.init(fira_data);
     const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
