@@ -22,6 +22,7 @@ const Icon = @import("icon.zig").Icon;
 const SizedBox = @import("sized_box.zig").SizedBox;
 const Padding = @import("padding.zig").Padding;
 const Column = @import("flex.zig").Column;
+const ScrollView = @import("scroll_view.zig").ScrollView;
 const Row = @import("flex.zig").Row;
 const Expanded = @import("expanded.zig").Expanded;
 const Text = @import("text.zig").Text;
@@ -63,6 +64,11 @@ pub const Item = struct {
     /// `on_press`, `shortcut` and `trailing_icon` are not used. Menus are
     /// nested to three levels.
     submenu: []const Item = &.{},
+    /// Kept at the bottom of the menu, in view, when the menu is too tall
+    /// for the window and its other items scroll: for the items at its end
+    /// (a divider too, to show them apart), such as one that manages what
+    /// the others list.
+    pinned: bool = false,
 
     /// What an item is.
     pub const Kind = enum {
@@ -277,14 +283,16 @@ const MenuCascade = struct {
         var rects: [max_depth]geometry.Rect = undefined;
         const count = n.childCount();
 
-        const first = n.child(0).layout(loose);
+        // No menu is taller than the window: what doesn't fit scrolls.
+        const fit: Constraints = .{ .max_w = loose.max_w, .max_h = win.h };
+        const first = n.child(0).layout(fit);
         st.first_size = first;
         const p = place(win, at, first);
         rects[0] = .{ .x = p[0], .y = p[1], .w = first.w, .h = first.h };
         for (1..count) |k| {
-            const s = n.child(k).layout(loose);
+            const s = n.child(k).layout(fit);
             const parent = rects[k - 1];
-            const row_top = parent.y + padding + itemTop(st.itemsAt(k - 1), st.path[k - 1]);
+            const row_top = parent.y + rowTop(n.child(k - 1), st.rows[k - 1], st.itemsAt(k - 1), st.path[k - 1]);
             var x = parent.x + parent.w - submenu_overlap;
             if (x + s.w > win.w) {
                 const left = parent.x - s.w + submenu_overlap;
@@ -308,6 +316,20 @@ const MenuCascade = struct {
 
     pub fn minSize(_: *const MenuCascade, n: *Node, c: Constraints) Size {
         return n.child(0).minSize(c.loosen());
+    }
+
+    /// How far down the menu `panel` the item `index` (`row`, if it is
+    /// known) is, as laid out: scrolled, or pinned at the bottom.
+    fn rowTop(panel: *Node, row: ?*Node, items: []const Item, index: usize) f32 {
+        if (row) |r| {
+            var y: f32 = 0;
+            var at: ?*Node = r;
+            while (at) |a| : (at = a.parent) {
+                if (a == panel) return y;
+                y += a.offset[1];
+            }
+        }
+        return padding + itemTop(items, index);
     }
 };
 
@@ -337,15 +359,67 @@ const MenuPanel = struct {
             else
                 cx.make(MenuRow{ .item = it, .menu = self.menu, .level = self.level, .index = i, .leading_slot = leading });
         }
+        // The items pinned at the end stay below those that scroll.
+        var first_pinned = self.items.len;
+        while (first_pinned > 0 and self.items[first_pinned - 1].pinned) first_pinned -= 1;
         return cx.make(RoundedBox{
             .color = t.surface_container,
             .border_color = t.outline_variant,
             .radius = .all(4),
             .child = cx.make(SizedBox{ .width = width, .child = cx.make(Padding{
                 .padding = .symmetric(0, padding),
-                .child = cx.make(Column{ .fill = false, .cross_axis_alignment = .stretch, .children = rows }),
+                .child = cx.make(MenuItems{ .children = cx.makeAll(.{
+                    ScrollView{ .child = cx.make(Column{ .fill = false, .cross_axis_alignment = .stretch, .children = rows[0..first_pinned] }) },
+                    Column{ .fill = false, .cross_axis_alignment = .stretch, .children = rows[first_pinned..] },
+                }) }),
             }) }),
         });
+    }
+};
+
+/// A menu's items: those that scroll (in a scroll view, though they all
+/// show if the menu fits the window), and those pinned below them.
+const MenuItems = struct {
+    children: []const Widget,
+
+    pub fn layout(_: *const MenuItems, n: *Node, c: Constraints) Size {
+        const w = c.max_w;
+        const inner: Constraints = .{ .min_w = w, .max_w = w };
+        const pinned = n.child(1).layout(inner);
+        // The scroll view takes all the height it is given: its items,
+        // measured on their own, say how much they want.
+        const scroll = n.child(0);
+        const want = if (scroll.childCount() > 0) scroll.child(0).layout(inner).h else 0;
+        const h = if (c.boundedHeight()) @min(want, @max(c.max_h - pinned.h, 0)) else want;
+        _ = scroll.layout(.tight(.{ .w = w, .h = h }));
+        scroll.place(0, 0);
+        n.child(1).place(0, h);
+        return c.constrain(.{ .w = w, .h = h + pinned.h });
+    }
+
+    pub fn minSize(_: *const MenuItems, n: *Node, c: Constraints) Size {
+        const w = c.max_w;
+        const pinned = n.child(1).minSize(.{ .min_w = w, .max_w = w });
+        return c.constrain(.{ .w = w, .h = pinned.h + item_height });
+    }
+
+    /// The menu's rows (and dividers), from top to bottom.
+    fn rows(n: *Node, out: *std.ArrayList(*Node)) !void {
+        const scroll = n.child(0);
+        if (scroll.childCount() > 0) try out.appendSlice(n.ui.gpa, scroll.child(0).children.items);
+        try out.appendSlice(n.ui.gpa, n.child(1).children.items);
+    }
+
+    /// Scrolls the items so that `row` (one that scrolls) shows.
+    fn reveal(row: *Node) void {
+        const column = row.parent orelse return;
+        const scroll = column.parent orelse return;
+        if (!scroll.widget.is(ScrollView)) return;
+        const st = scroll.state(ScrollView.State);
+        const top = row.offset[1];
+        const bottom = top + row.size.h;
+        const to = if (top < st.offset) top else if (bottom > st.offset + st.viewport) bottom - st.viewport else return;
+        if (st.scrollTo(to)) row.ui.needs_frame = true;
     }
 };
 
@@ -437,11 +511,15 @@ const MenuRow = struct {
     /// Moves the focus to the next item of the menu `n` is in that takes it
     /// (the previous, if not `forward`), round to the first at the end.
     fn moveWithin(n: *Node, forward: bool) bool {
-        const menu = n.parent orelse return false;
+        var menu = n.parent orelse return false;
+        while (!menu.widget.is(MenuItems)) menu = menu.parent orelse return false;
+        var items: std.ArrayList(*Node) = .empty;
+        defer items.deinit(n.ui.gpa);
+        MenuItems.rows(menu, &items) catch return false;
         var list: std.ArrayList(*Node) = .empty;
         defer list.deinit(n.ui.gpa);
         var now: ?usize = null;
-        for (menu.children.items) |item| {
+        for (items.items) |item| {
             const f = focus_mod.first(item) orelse continue;
             if (n.ui.focused) |cur| if (focus_mod.within(cur, item)) {
                 now = list.items.len;
@@ -452,6 +530,10 @@ const MenuRow = struct {
         const len = list.items.len;
         const next = if (now) |i| (if (forward) (i + 1) % len else (i + len - 1) % len) else if (forward) 0 else len - 1;
         focus_mod.show(n.ui, list.items[next]);
+        // The row (the item the focus is in) scrolled into view.
+        for (items.items) |item| {
+            if (focus_mod.within(list.items[next], item)) MenuItems.reveal(item);
+        }
         return true;
     }
 

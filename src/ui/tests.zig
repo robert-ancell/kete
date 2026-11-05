@@ -3779,3 +3779,54 @@ test "modifier keys go to what has the focus, and past fields that type" {
     try testing.expectEqual(ui.KeyboardKey.left_shift, log.items[0].key);
     try testing.expectEqual(ui.KeyboardKey.left_shift, log.items[1].key);
 }
+
+/// The node of the text `text`, in `n`.
+fn findText(n: *Node, text: []const u8) ?*Node {
+    if (n.widget.as(ui.Text)) |t| if (std.mem.eql(u8, t.text, text)) return n;
+    for (n.children.items) |ch| if (findText(ch, text)) |f| return f;
+    return null;
+}
+
+test "a menu too tall for the window scrolls, with its pinned items below in view" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    const R = Root(struct {
+        fn f(cx: *Context) Widget {
+            return cx.make(ui.SizedBox{});
+        }
+    }.f);
+    u.frame(400, 300, 0, R{});
+
+    var items: [32]ui.MenuItem = undefined;
+    var labels: [30][8]u8 = undefined;
+    for (0..30) |i| items[i] = .{ .label = std.fmt.bufPrint(&labels[i], "Item {d}", .{i}) catch unreachable, .on_press = .of(&labels, struct {
+        fn f(_: *[30][8]u8) void {}
+    }.f) };
+    items[30] = .{ .kind = .divider, .pinned = true };
+    items[31] = .{ .label = "Manage", .pinned = true, .on_press = items[0].on_press };
+    u.openMenu(u.root.?, .{ 10, 10 }, &items);
+    u.frame(400, 300, 1, R{});
+
+    // As tall as the window, no more, with the pinned item in view.
+    const menu = u.menu_root.?;
+    try testing.expect(menu.size.h <= 300);
+    const scroll = find(menu, ui.ScrollView).?;
+    const st = scroll.state(ui.ScrollView.State);
+    try testing.expect(st.content > st.viewport);
+    const manage = findText(menu, "Manage").?;
+    try testing.expect(manage.position()[1] + manage.size.h <= 300);
+    try testing.expect(manage.position()[1] >= scroll.position()[1] + scroll.size.h);
+
+    // The keys go round them all: from the first item up to the pinned one,
+    // and on up to the last that scrolls, scrolled into view.
+    u.key(.{ .key = .down, .pressed = true });
+    u.frame(400, 300, 2, R{});
+    u.key(.{ .key = .up, .pressed = true });
+    u.frame(400, 300, 3, R{});
+    try testing.expect(findText(u.focused.?, "Manage") != null);
+    u.key(.{ .key = .up, .pressed = true });
+    u.frame(400, 300, 4, R{});
+    try testing.expectEqual(st.maxOffset(), st.offset);
+    try testing.expect(findText(menu, "Item 29").?.position()[1] + 20 <= scroll.position()[1] + scroll.size.h);
+}
