@@ -38,6 +38,23 @@ const flag_control = 1 << 18;
 const flag_option = 1 << 19;
 const flag_command = 1 << 20;
 
+/// The flag (`NX_DEVICE…KEYMASK`) that says a modifier key, by its macOS key
+/// code, is down: its side's own, so letting go of one Shift with the other
+/// held is seen.
+fn deviceModifierFlag(mac: u16) ?u64 {
+    return switch (mac) {
+        59 => 0x0001, // left Control
+        56 => 0x0002, // left Shift
+        60 => 0x0004, // right Shift
+        55 => 0x0008, // left Command
+        54 => 0x0010, // right Command
+        58 => 0x0020, // left Option
+        61 => 0x0040, // right Option
+        62 => 0x2000, // right Control
+        else => null,
+    };
+}
+
 pub const MacWindow = struct {
     gpa: std.mem.Allocator,
     win: Id,
@@ -80,6 +97,9 @@ pub const MacWindow = struct {
     input: std.ArrayList(InputEvent) = .empty,
     taken: std.ArrayList(InputEvent) = .empty,
     modifiers: u64 = 0,
+    /// The keys down (by Linux key code), let go of when the window loses
+    /// the keyboard.
+    keys_down: std.bit_set.Static(256) = .empty,
     /// The pointer lock asked for (`lockPointer`), and whether it is in
     /// effect (while the window has the keyboard): the pointer is hidden,
     /// held at the middle of the window, and its moves come as
@@ -402,6 +422,22 @@ pub const MacWindow = struct {
 
     fn push(w: *MacWindow, e: InputEvent) void {
         w.input.append(w.gpa, e) catch {};
+    }
+
+    /// A key (by Linux key code, 0 for one the toolkit has no name for) went
+    /// down or up, typing `char`, with the modifiers `flags`.
+    fn pushKey(w: *MacWindow, code: u32, pressed: bool, char: ?u21, flags: u64) void {
+        if (code != 0 and code < w.keys_down.capacity()) w.keys_down.setValue(code, pressed);
+        const ctrl = flags & (flag_control | flag_command) != 0;
+        w.push(.{ .key = .{ .key = window.evdev.keyOf(code), .pressed = pressed, .char = if (ctrl) null else char, .shift = flags & flag_shift != 0, .ctrl = ctrl } });
+    }
+
+    /// Lets go of the keys down: the window no longer has the keyboard, so
+    /// it won't hear of them going up.
+    fn releaseKeys(w: *MacWindow) void {
+        var it = w.keys_down.iterator(.{});
+        while (it.next()) |code| w.push(.{ .key = .{ .key = window.evdev.keyOf(@intCast(code)), .pressed = false } });
+        w.keys_down = .empty;
     }
 
     /// The view's new size, if it changed (and its scale, kept).
@@ -1003,7 +1039,8 @@ pub const MacWindow = struct {
         const flags = msg(u64, event, "modifierFlags", .{});
         w.modifiers = flags;
         // A key the toolkit has no name for still types what it does.
-        const which_key = window.evdev.keyOf(linuxKey(msg(u16, event, "keyCode", .{})) orelse 0);
+        const code = linuxKey(msg(u16, event, "keyCode", .{})) orelse 0;
+        const which_key = window.evdev.keyOf(code);
         // What it types (none for controls and function keys).
         var char: ?u21 = null;
         if (pressed) {
@@ -1014,7 +1051,40 @@ pub const MacWindow = struct {
         }
         const ctrl = flags & (flag_control | flag_command) != 0;
         if (which_key == .other and (char == null or ctrl)) return;
-        w.push(.{ .key = .{ .key = which_key, .pressed = pressed, .char = if (ctrl) null else char, .shift = flags & flag_shift != 0, .ctrl = ctrl } });
+        w.pushKey(code, pressed, char, flags);
+    }
+
+    /// A modifier key went down or up (or Caps Lock was pressed): AppKit
+    /// tells of these only as a change of the flags.
+    fn modifierKey(view: Id, event: Id) void {
+        const w = ofView(view) orelse return;
+        const flags = msg(u64, event, "modifierFlags", .{});
+        w.modifiers = flags;
+        const mac = msg(u16, event, "keyCode", .{});
+        const code = linuxKey(mac) orelse return;
+        if (mac == 57) {
+            // Caps Lock: each change of the lock is a press.
+            w.pushKey(code, true, null, flags);
+            w.pushKey(code, false, null, flags);
+            return;
+        }
+        const down = deviceModifierFlag(mac) orelse return;
+        w.pushKey(code, flags & down != 0, null, flags);
+    }
+
+    /// A key let go of with Command held, which AppKit doesn't send the
+    /// window (it may have been a menu's shortcut): to the window, if it
+    /// heard of the key going down. Called from `key_up_monitor`.
+    fn keyUpWithCommand(_: *const objc.Block, event: Id) callconv(.c) Id {
+        if (msg(u64, event, "modifierFlags", .{}) & flag_command == 0) return event;
+        const win = msg(Id, event, "window", .{}) orelse return event;
+        const view = msg(Id, win, "contentView", .{}) orelse return event;
+        const w = ofView(view) orelse return event;
+        const code = linuxKey(msg(u16, event, "keyCode", .{})) orelse return event;
+        if (code >= w.keys_down.capacity() or !w.keys_down.isSet(code)) return event;
+        key(view, event, false);
+        postWake();
+        return null;
     }
 
     const view_methods = struct {
@@ -1073,8 +1143,7 @@ pub const MacWindow = struct {
             key(v, e, false);
         }
         fn flagsChanged(v: Id, _: objc.Sel, e: Id) callconv(.c) void {
-            const w = ofView(v) orelse return;
-            w.modifiers = msg(u64, e, "modifierFlags", .{});
+            modifierKey(v, e);
         }
         fn nothing(_: Id, _: objc.Sel) callconv(.c) void {}
     };
@@ -1109,12 +1178,13 @@ pub const MacWindow = struct {
             w.endMenus();
             postWake();
         }
-        /// The window lost the keyboard: its menus are done, and a pointer
-        /// lock lets go until it gets it back.
+        /// The window lost the keyboard: its menus are done, the keys down
+        /// are let go of, and a pointer lock lets go until it gets it back.
         fn resignKey(d: Id, _: objc.Sel, _: Id) callconv(.c) void {
             const w = objc.owner(MacWindow, d) orelse return;
             w.endMenus();
             w.releasePointer();
+            w.releaseKeys();
             postWake();
         }
         fn becomeKey(d: Id, _: objc.Sel, _: Id) callconv(.c) void {
@@ -1349,8 +1419,17 @@ fn startApp() Id {
     msg(void, app_item, "setSubmenu:", .{app_menu});
     msg(void, app, "setMainMenu:", .{bar});
     msg(void, app, "finishLaunching", .{});
+    // AppKit doesn't send the window a key's release while Command is held:
+    // take those before it drops them.
+    if (objc.globalBlock(&key_up_block, &MacWindow.keyUpWithCommand)) |block| {
+        const mask_key_up: u64 = 1 << 11;
+        key_up_monitor = objc.retain(msg(Id, objc.class("NSEvent"), "addLocalMonitorForEventsMatchingMask:handler:", .{ mask_key_up, block }));
+    }
     return app;
 }
+
+var key_up_block: objc.Block = undefined;
+var key_up_monitor: Id = null;
 
 fn shouldTerminate(_: Id, _: objc.Sel, _: Id) callconv(.c) u64 {
     if (current_display) |d| d.quit_requested = true;
@@ -1558,6 +1637,24 @@ pub fn linuxKey(mac: u16) ?u32 {
         119 => 107, // End
         120 => 60, // F2
         121 => 109, // Page Down
+        54 => 126, // right Command (Super)
+        55 => 125, // left Command (Super)
+        56 => 42, // left Shift
+        57 => 58, // Caps Lock
+        58 => 56, // left Option (Alt)
+        59 => 29, // left Control
+        60 => 54, // right Shift
+        61 => 100, // right Option (Alt)
+        62 => 97, // right Control
+        105 => 183, // F13
+        107 => 184, // F14
+        113 => 185, // F15
+        106 => 186, // F16
+        64 => 187, // F17
+        79 => 188, // F18
+        80 => 189, // F19
+        90 => 190, // F20
+        110 => 127, // context menu
         122 => 59, // F1
         123 => 105, // Left
         124 => 106, // Right
@@ -1578,7 +1675,97 @@ test "macOS keys become the keyboard keys the toolkit has" {
     try std.testing.expectEqual(window.KeyboardKey.enter, keyOf(36));
     try std.testing.expectEqual(window.KeyboardKey.left, keyOf(123));
     try std.testing.expectEqual(window.KeyboardKey.c, keyOf(8)); // for Command and C
+    try std.testing.expectEqual(window.KeyboardKey.left_shift, keyOf(56));
+    try std.testing.expectEqual(window.KeyboardKey.right_shift, keyOf(60));
+    try std.testing.expectEqual(window.KeyboardKey.left_ctrl, keyOf(59));
+    try std.testing.expectEqual(window.KeyboardKey.right_alt, keyOf(61));
+    try std.testing.expectEqual(window.KeyboardKey.left_super, keyOf(55));
+    try std.testing.expectEqual(window.KeyboardKey.caps_lock, keyOf(57));
+    try std.testing.expectEqual(window.KeyboardKey.f13, keyOf(105));
+    try std.testing.expectEqual(window.KeyboardKey.f20, keyOf(90));
+    try std.testing.expectEqual(window.KeyboardKey.menu, keyOf(110));
+    // Every modifier key with a flag has a key.
+    for ([_]u16{ 54, 55, 56, 58, 59, 60, 61, 62 }) |mac| {
+        try std.testing.expect(deviceModifierFlag(mac) != null);
+        try std.testing.expect(keyOf(mac) != .other);
+    }
     try std.testing.expect(linuxKey(200) == null);
+}
+
+test "macOS modifier keys go down and up, and keys are let go of" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const testing = std.testing;
+    const w = MacWindow.open(testing.allocator, testing.io, .empty, .{ .title = "kete test", .size = .{ 300, 200 } }) catch return error.SkipZigTest;
+    defer w.close();
+    const pool = objc.push();
+    defer objc.pop(pool);
+    try testing.expect(key_up_monitor != null);
+
+    const number = msg(isize, w.win, "windowNumber", .{});
+    const Ev = struct {
+        number: isize,
+        fn of(e: @This(), kind: u64, flags: u64, code: u16, chars: []const u8) Id {
+            return msg(Id, objc.class("NSEvent"), "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:", .{
+                kind,                 objc.Point{ .x = 0, .y = 0 }, flags,   @as(f64, 0), e.number, @as(Id, null),
+                objc.nsString(chars), objc.nsString(chars),         objc.no, code,
+            });
+        }
+    };
+    const ev: Ev = .{ .number = number };
+    const key_down = 10;
+    const key_up = 11;
+    const flags_changed = 12;
+    w.input.clearRetainingCapacity();
+
+    // Left Shift, then ; typing :, then right Shift too; left let go of
+    // (Shift still held), then right.
+    MacWindow.modifierKey(w.view, ev.of(flags_changed, flag_shift | 0x2, 56, ""));
+    MacWindow.key(w.view, ev.of(key_down, flag_shift | 0x2, 41, ":"), true);
+    MacWindow.key(w.view, ev.of(key_up, flag_shift | 0x2, 41, ":"), false);
+    MacWindow.modifierKey(w.view, ev.of(flags_changed, flag_shift | 0x6, 60, ""));
+    MacWindow.modifierKey(w.view, ev.of(flags_changed, flag_shift | 0x4, 56, ""));
+    MacWindow.modifierKey(w.view, ev.of(flags_changed, 0, 60, ""));
+    const Key = @FieldType(InputEvent, "key");
+    const want = [_]Key{
+        .{ .key = .left_shift, .pressed = true, .shift = true },
+        .{ .key = .semicolon, .pressed = true, .char = ':', .shift = true },
+        .{ .key = .semicolon, .pressed = false, .shift = true },
+        .{ .key = .right_shift, .pressed = true, .shift = true },
+        .{ .key = .left_shift, .pressed = false, .shift = true },
+        .{ .key = .right_shift, .pressed = false },
+    };
+    try testing.expectEqual(want.len, w.input.items.len);
+    for (want, w.input.items) |k, got| try testing.expectEqual(k, got.key);
+    try testing.expect(w.keys_down.count() == 0);
+    w.input.clearRetainingCapacity();
+
+    // Command and A: A's release comes (with Command held) by the monitor,
+    // and only for a key the window heard go down.
+    MacWindow.modifierKey(w.view, ev.of(flags_changed, flag_command | 0x8, 55, ""));
+    MacWindow.key(w.view, ev.of(key_down, flag_command | 0x8, 0, "a"), true);
+    try testing.expect(MacWindow.keyUpWithCommand(&key_up_block, ev.of(key_up, flag_command | 0x8, 0, "a")) == null);
+    const q_up = ev.of(key_up, flag_command | 0x8, 12, "q");
+    try testing.expect(MacWindow.keyUpWithCommand(&key_up_block, q_up) == q_up);
+    const plain_up = ev.of(key_up, 0, 0, "a");
+    try testing.expect(MacWindow.keyUpWithCommand(&key_up_block, plain_up) == plain_up);
+    try testing.expectEqual(@as(usize, 3), w.input.items.len);
+    try testing.expectEqual(Key{ .key = .left_super, .pressed = true, .ctrl = true }, w.input.items[0].key);
+    try testing.expectEqual(Key{ .key = .a, .pressed = true, .ctrl = true }, w.input.items[1].key);
+    try testing.expectEqual(Key{ .key = .a, .pressed = false, .ctrl = true }, w.input.items[2].key);
+    w.input.clearRetainingCapacity();
+
+    // Losing the keyboard lets go of what is still down (Command).
+    w.releaseKeys();
+    try testing.expectEqual(@as(usize, 1), w.input.items.len);
+    try testing.expectEqual(Key{ .key = .left_super, .pressed = false }, w.input.items[0].key);
+
+    // Caps Lock: each change is a press and release.
+    w.input.clearRetainingCapacity();
+    MacWindow.modifierKey(w.view, ev.of(flags_changed, 1 << 16, 57, ""));
+    try testing.expectEqual(@as(usize, 2), w.input.items.len);
+    try testing.expectEqual(Key{ .key = .caps_lock, .pressed = true }, w.input.items[0].key);
+    try testing.expectEqual(Key{ .key = .caps_lock, .pressed = false }, w.input.items[1].key);
+    try testing.expect(w.keys_down.count() == 0);
 }
 
 test "a menu popup opens where the positioner puts it, on the screen, and shows what is drawn" {

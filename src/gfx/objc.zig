@@ -120,6 +120,7 @@ pub fn msg(comptime Ret: type, target: anytype, name: [*:0]const u8, args: anyty
         4 => @as(*const fn (Id, Sel, @TypeOf(args[0]), @TypeOf(args[1]), @TypeOf(args[2]), @TypeOf(args[3])) callconv(.c) Ret, @ptrCast(@alignCast(f)))(t, s, args[0], args[1], args[2], args[3]),
         5 => @as(*const fn (Id, Sel, @TypeOf(args[0]), @TypeOf(args[1]), @TypeOf(args[2]), @TypeOf(args[3]), @TypeOf(args[4])) callconv(.c) Ret, @ptrCast(@alignCast(f)))(t, s, args[0], args[1], args[2], args[3], args[4]),
         9 => @as(*const fn (Id, Sel, @TypeOf(args[0]), @TypeOf(args[1]), @TypeOf(args[2]), @TypeOf(args[3]), @TypeOf(args[4]), @TypeOf(args[5]), @TypeOf(args[6]), @TypeOf(args[7]), @TypeOf(args[8])) callconv(.c) Ret, @ptrCast(@alignCast(f)))(t, s, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8]),
+        10 => @as(*const fn (Id, Sel, @TypeOf(args[0]), @TypeOf(args[1]), @TypeOf(args[2]), @TypeOf(args[3]), @TypeOf(args[4]), @TypeOf(args[5]), @TypeOf(args[6]), @TypeOf(args[7]), @TypeOf(args[8]), @TypeOf(args[9])) callconv(.c) Ret, @ptrCast(@alignCast(f)))(t, s, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9]),
         else => @compileError("too many arguments"),
     };
 }
@@ -182,6 +183,27 @@ pub fn symbol(comptime T: type, name: [*:0]const u8) ?T {
         if (dlsym(h, name)) |p| return @ptrCast(@alignCast(p));
     }
     return null;
+}
+
+/// A block (`^`) without captures: what an API that takes one is given.
+pub const Block = extern struct {
+    isa: ?*const anyopaque,
+    flags: c_int,
+    reserved: c_int = 0,
+    invoke: *const anyopaque,
+    descriptor: *const BlockDescriptor,
+};
+const BlockDescriptor = extern struct { reserved: c_ulong = 0, size: c_ulong };
+const block_descriptor: BlockDescriptor = .{ .size = @sizeOf(Block) };
+
+/// Makes `block` a global block (one that is never copied or freed, so it
+/// must live as long as it is used) that calls `invoke`, whose first
+/// argument is the block. Null without the blocks runtime.
+pub fn globalBlock(block: *Block, invoke: *const anyopaque) ?*Block {
+    const isa = symbol(*const anyopaque, "_NSConcreteGlobalBlock") orelse return null;
+    const block_is_global = 1 << 28;
+    block.* = .{ .isa = isa, .flags = block_is_global, .invoke = invoke, .descriptor = &block_descriptor };
+    return block;
 }
 
 /// The value of a framework's constant object (`NSDefaultRunLoopMode`).
