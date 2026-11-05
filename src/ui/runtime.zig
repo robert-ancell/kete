@@ -1742,14 +1742,11 @@ pub const WindowUi = struct {
     /// A key went down or up, with what it types (if anything) and the
     /// modifiers held.
     pub fn key(ui: *WindowUi, k: widget.Event.Key) void {
-        switch (k.key) {
-            // Modifiers only change what other keys do.
-            .left_shift, .right_shift, .left_ctrl, .right_ctrl, .right_alt => return,
-            .escape => if (k.pressed and ui.menu != null) {
-                ui.closeMenu();
-                return;
-            },
-            else => {},
+        // Modifiers go to what has the focus too (an app may pass them on, to
+        // a remote machine or an emulator): widgets that type ignore them.
+        if (k.key == .escape and k.pressed and ui.menu != null) {
+            ui.closeMenu();
+            return;
         }
         // Tab moves the focus (Control and Tab, from what takes Tab).
         if (k.key == .tab) {

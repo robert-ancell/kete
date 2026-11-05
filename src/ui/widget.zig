@@ -143,6 +143,16 @@ pub const Event = union(enum) {
         /// Modifiers held.
         ctrl: bool = false,
         shift: bool = false,
+
+        /// Whether it is a modifier (Shift, Control, Alt, Super) or Caps
+        /// Lock: a key that changes what others do, which a widget that types
+        /// ignores.
+        pub fn isModifier(k: Key) bool {
+            return switch (k.key) {
+                .left_shift, .right_shift, .left_ctrl, .right_ctrl, .left_alt, .right_alt, .left_super, .right_super, .caps_lock => true,
+                else => false,
+            };
+        }
     };
 };
 

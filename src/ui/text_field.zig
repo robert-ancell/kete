@@ -651,6 +651,7 @@ pub const TextField = struct {
                 st.preedit_len = 0;
             },
             .key => |k| {
+                if (k.isModifier()) return false;
                 if (!k.pressed) return true;
                 n.ui.needs_frame = true;
                 if (k.key == .enter or k.key == .keypad_enter) {

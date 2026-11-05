@@ -555,6 +555,7 @@ pub const TextArea = struct {
                 st.preedit_len = 0;
             },
             .key => |k| {
+                if (k.isModifier()) return false;
                 if (!k.pressed) return true;
                 st.last_change_other = true;
                 if (self.key(n, st, k)) st.changed() else n.ui.needs_frame = true;

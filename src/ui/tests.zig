@@ -3712,3 +3712,70 @@ test "a window with no size given opens at its content's, and can be kept from b
     filled.setSize(640, 480);
     try testing.expectEqual([2]u32{ 640, 480 }, display.windows[3].asked_size.?);
 }
+
+/// Takes the keyboard, and keeps the keys it gets (as an emulator passing
+/// them on would).
+const KeyLog = struct {
+    log: *std.ArrayList(ui.Event.Key),
+    child: ?Widget = null,
+
+    pub fn focusable(_: *const KeyLog, _: *Node) bool {
+        return true;
+    }
+
+    pub fn event(self: *const KeyLog, _: *Node, e: ui.Event) bool {
+        switch (e) {
+            .key => |k| {
+                self.log.append(testing.allocator, k) catch {};
+                return true;
+            },
+            else => return false,
+        }
+    }
+};
+
+test "modifier keys go to what has the focus, and past fields that type" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    var log: std.ArrayList(ui.Event.Key) = .empty;
+    defer log.deinit(testing.allocator);
+
+    const App = struct {
+        log: *std.ArrayList(ui.Event.Key),
+        pub fn build(self: *const @This(), cx: *Context) Widget {
+            return cx.make(KeyLog{ .log = self.log, .child = cx.make(ui.Align{
+                .alignment = .top_left,
+                .child = cx.make(ui.TextField{ .initial = "hi" }),
+            }) });
+        }
+    };
+    const root: App = .{ .log = &log };
+    u.frame(300, 100, 0, root);
+
+    // Shift, Control and AltGr reach the widget with the focus.
+    u.focus(find(u.root.?, KeyLog).?);
+    for ([_]ui.KeyboardKey{ .left_shift, .right_ctrl, .right_alt }) |key| {
+        u.key(.{ .key = key, .pressed = true });
+        u.key(.{ .key = key, .pressed = false });
+    }
+    try testing.expectEqual(@as(usize, 6), log.items.len);
+    try testing.expectEqual(ui.KeyboardKey.left_shift, log.items[0].key);
+    try testing.expect(log.items[0].pressed);
+    try testing.expect(!log.items[1].pressed);
+    try testing.expectEqual(ui.KeyboardKey.right_alt, log.items[5].key);
+
+    // A field types what Shift makes, and leaves Shift to what it is in.
+    log.clearRetainingCapacity();
+    const field = find(u.root.?, ui.TextField).?;
+    u.focus(field);
+    u.key(.{ .key = .left_shift, .pressed = true });
+    u.key(.{ .key = .a, .pressed = true, .char = 'A', .shift = true });
+    u.key(.{ .key = .a, .pressed = false, .shift = true });
+    u.key(.{ .key = .left_shift, .pressed = false });
+    u.frame(300, 100, 1, root);
+    try testing.expectEqualStrings("hiA", field.state(ui.TextField.State).text());
+    try testing.expectEqual(@as(usize, 2), log.items.len);
+    try testing.expectEqual(ui.KeyboardKey.left_shift, log.items[0].key);
+    try testing.expectEqual(ui.KeyboardKey.left_shift, log.items[1].key);
+}
