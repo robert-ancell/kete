@@ -764,3 +764,32 @@ test "dashed lines are broken as their pattern says, and only the dashes in view
     for (c.batches.items) |*b| floats += b.floats.items.len;
     try testing.expect(floats > 0 and floats < 20_000);
 }
+
+test "a transform moves, scales and turns what is drawn" {
+    var c = Canvas.init(testing.allocator);
+    defer c.deinit();
+    c.begin(64, 64);
+    // Twice as big, about the square's middle (16, 16): 16 to 48.
+    c.setTransform(canvas_mod.Affine.scaling(2, 2).about(.{ 16, 16 }).then(.translation(16, 16)));
+    c.fillRect(.{ .x = 8, .y = 8, .w = 16, .h = 16 }, Color.rgb(0xff0000));
+    var pixels: [64 * 64]u32 = @splat(0xff000000);
+    const img: Image = .{ .pixels = &pixels, .width = 64, .height = 64 };
+    try render(&c, img);
+    try expectNear(0xffff0000, img.at(17, 17), 1);
+    try expectNear(0xffff0000, img.at(46, 46), 1);
+    try expectNear(0xff000000, img.at(14, 32), 1);
+    try expectNear(0xff000000, img.at(49, 32), 1);
+
+    // An eighth of a turn about its middle: a diamond, its corners
+    // reaching out past the square's sides and its own corners clear.
+    c.begin(64, 64);
+    c.setTransform(canvas_mod.Affine.rotation(std.math.pi / 4.0).about(.{ 32, 32 }));
+    c.fillRect(.{ .x = 16, .y = 16, .w = 32, .h = 32 }, Color.rgb(0xff0000));
+    @memset(&pixels, 0xff000000);
+    try render(&c, img);
+    try expectNear(0xffff0000, img.at(32, 32), 1);
+    try expectNear(0xffff0000, img.at(32, 12), 1);
+    try expectNear(0xffff0000, img.at(12, 32), 1);
+    try expectNear(0xff000000, img.at(17, 17), 1);
+    try expectNear(0xff000000, img.at(46, 46), 1);
+}

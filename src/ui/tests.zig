@@ -3857,3 +3857,83 @@ test "a menu too tall for the window scrolls, with its pinned items below in vie
     try testing.expectEqual(st.maxOffset(), st.offset);
     try testing.expect(findText(menu, "Item 29").?.position()[1] + 20 <= scroll.position()[1] + scroll.size.h);
 }
+
+const Transformed = struct {
+    transform: gfx.Affine,
+
+    pub const State = struct {
+        presses: u32 = 0,
+        fn press(s: *State) void {
+            s.presses += 1;
+        }
+    };
+
+    pub fn build(self: *const Transformed, cx: *Context, state: *State) Widget {
+        return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.Row{ .children = cx.makeAll(.{
+            ui.Transform{ .transform = self.transform, .child = cx.make(ui.Pressable{
+                .on_press = .of(state, State.press),
+                .child = cx.make(ui.SizedBox{ .width = 40, .height = 40, .child = cx.make(ui.RoundedBox{ .color = red }) }),
+            }) },
+            ui.SizedBox{ .width = 40, .height = 40, .child = cx.make(ui.RoundedBox{ .color = blue }) },
+        }) }) });
+    }
+};
+
+test "a transformed widget is drawn, hit and damaged where it is moved, and laid out where it was" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    const moved: Transformed = .{ .transform = .translation(100, 50) };
+    u.frame(200, 100, 0, moved);
+    // Laid out where it was: the box beside it is not moved.
+    const row = find(u.root.?, ui.Row).?;
+    try testing.expectEqual(@as(f32, 40), row.child(1).offset[0]);
+    const img = try Image.init(u, 200, 100);
+    try testing.expectEqual(@as(u32, 0xffff0000), img.at(120, 70));
+    try testing.expectEqual(@as(u32, 0xff0000ff), img.at(60, 20));
+    try testing.expectEqual(@as(u32, 0xff000000), img.at(20, 20));
+    img.deinit();
+
+    // Hit where it is drawn, not where it was laid out.
+    const st = u.root.?.state(Transformed.State);
+    clickAt(u, .{ 20, 20 });
+    try testing.expectEqual(@as(u32, 0), st.presses);
+    clickAt(u, .{ 120, 70 });
+    try testing.expectEqual(@as(u32, 1), st.presses);
+    const pressable = find(u.root.?, ui.Pressable).?;
+    try testing.expectEqual(ui.Point{ 20, 20 }, pressable.fromWindow(.{ 120, 70 }).?);
+
+    // Moved back: where it was and where it is now are damaged, and
+    // nothing else.
+    u.frame(200, 100, 1, moved);
+    try testing.expect(!u.changed());
+    u.frame(200, 100, 2, Transformed{ .transform = .translation(0, 50) });
+    var old = false;
+    var new = false;
+    for (u.damaged()) |r| {
+        old = old or r.intersects(.{ .x = 100, .y = 50, .w = 40, .h = 40 });
+        new = new or r.intersects(.{ .x = 0, .y = 50, .w = 40, .h = 40 });
+        try testing.expect(!r.intersects(.{ .x = 40, .y = 0, .w = 40, .h = 40 }));
+    }
+    try testing.expect(old and new);
+}
+
+test "a widget scaled about its middle grows every way, and is hit all over" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    const big: Transformed = .{ .transform = .scaling(2, 2) };
+    u.frame(200, 100, 0, big);
+    // From (-20, -20) to (60, 60), over the blue box beside it.
+    const img = try Image.init(u, 200, 100);
+    defer img.deinit();
+    try testing.expectEqual(@as(u32, 0xffff0000), img.at(55, 55));
+    try testing.expectEqual(@as(u32, 0xffff0000), img.at(2, 2));
+    try testing.expectEqual(@as(u32, 0xff0000ff), img.at(70, 20));
+    const st = u.root.?.state(Transformed.State);
+    clickAt(u, .{ 55, 55 });
+    try testing.expectEqual(@as(u32, 1), st.presses);
+    // Its own coordinates are half as big.
+    const pressable = find(u.root.?, ui.Pressable).?;
+    try testing.expectEqual(ui.Point{ 37.5, 37.5 }, pressable.fromWindow(.{ 55, 55 }).?);
+}

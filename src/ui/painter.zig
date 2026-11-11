@@ -43,6 +43,10 @@ pub const Painter = struct {
     origin: Point = .{ 0, 0 },
     /// What may be drawn on, in the frame's pixels.
     clip: ?Rect = null,
+    /// How what is painted is transformed (by the widgets it is in that
+    /// transform their children): `origin` and the widgets' boxes are
+    /// where they would be without it.
+    transform: ?gfx.Affine = null,
     /// What the node being painted draws (see `damage.zig`).
     rec: ?*gfx.Record = null,
     /// Whether what is painted damages the window (not in a popup, which
@@ -59,6 +63,7 @@ pub const Painter = struct {
     pub fn canvas(p: *Painter) *gfx.Canvas {
         const c = p.ui.currentCanvas();
         c.setOrigin(p.origin);
+        c.setTransform(p.transform);
         c.clip = if (p.clip) |r| scaleRect(r, c.scale) else null;
         c.recorder = p.rec;
         return c;
@@ -90,7 +95,7 @@ pub const Painter = struct {
     /// with what this returns.
     pub fn clipTo(p: *Painter, r: Rect) ?Rect {
         const old = p.clip;
-        p.clip = intersect(p.clip, .{ .x = r.x + p.origin[0], .y = r.y + p.origin[1], .w = r.w, .h = r.h });
+        p.clip = intersect(p.clip, p.toFrame(.{ .x = r.x + p.origin[0], .y = r.y + p.origin[1], .w = r.w, .h = r.h }));
         p.syncCanvasClip();
         return old;
     }
@@ -136,14 +141,16 @@ pub const Painter = struct {
         const FnInfo = @typeInfo(@TypeOf(f)).@"fn";
         const TargetPtr = FnInfo.param_types[1].?;
         const s: f32 = @floatFromInt(@max(p.ui.scale, 1));
-        const box = p.boxRect();
+        // Moved and scaled with what it is in, but not turned: the box
+        // it ends up in.
+        const box = p.toFrame(p.boxRect());
         const vp = viewport(scaleRect(box, s)) orelse return;
         var scissor: ?gfx.Viewport = null;
         if (p.clip) |clip| scissor = viewport(scaleRect(intersect(clip, box).?, s)) orelse return;
         if (p.rec) |rec| {
             const key = options.key orelse p.ui.frame_no;
             rec.hash.update(std.mem.asBytes(&key));
-            const b = if (options.bounds) |r| intersect(box, .{ .x = r.x + p.origin[0], .y = r.y + p.origin[1], .w = r.w, .h = r.h }).? else box;
+            const b = if (options.bounds) |r| intersect(box, p.toFrame(.{ .x = r.x + p.origin[0], .y = r.y + p.origin[1], .w = r.w, .h = r.h })).? else box;
             if (intersect(p.clip, b)) |area| if (area.w > 0 and area.h > 0) {
                 const scaled_area = scaleRect(area, s);
                 rec.bounds = if (rec.bounds) |old| old.unite(scaled_area) else scaled_area;
@@ -182,26 +189,40 @@ pub const Painter = struct {
         return .{ .x = p.origin[0], .y = p.origin[1], .w = p.node.size.w, .h = p.node.size.h };
     }
 
+    /// Where `r` (in the frame, as if not transformed) is painted: the
+    /// rectangle it fits in once transformed.
+    fn toFrame(p: *const Painter, r: Rect) Rect {
+        return if (p.transform) |m| m.mapRect(r) else r;
+    }
+
     /// Paints a node (laid out this frame) and everything below it.
     pub fn paintNode(p: *Painter, n: *Node) void {
         if (n.laid_out != p.ui.frame_no) return;
         const saved_origin = p.origin;
         const saved_clip = p.clip;
         const saved_node = p.node;
+        const saved_transform = p.transform;
         defer {
             p.origin = saved_origin;
             p.clip = saved_clip;
             p.node = saved_node;
+            p.transform = saved_transform;
         }
         p.node = n;
         p.origin = .{ p.origin[0] + n.offset[0], p.origin[1] + n.offset[1] };
+        if (n.widget.vtable.paint_transform) |f| {
+            // Its own, about its top left, before those of what it is in.
+            const m = f(n.widget.ptr, n).about(p.origin);
+            p.transform = if (p.transform) |outer| m.then(outer) else m;
+        }
         const box = p.boxRect();
+        const shown = p.toFrame(box);
         if (p.clip) |c| {
-            const visible = intersect(c, box).?;
+            const visible = intersect(c, shown).?;
             if (visible.w <= 0 or visible.h <= 0) return;
         }
         const overflowing = n.overflow.any();
-        if (overflowing or n.widget.vtable.clips_children) p.clip = intersect(p.clip, box);
+        if (overflowing or n.widget.vtable.clips_children) p.clip = intersect(p.clip, shown);
         if (p.clip) |c| if (c.w <= 0 or c.h <= 0) return;
 
         var rec: gfx.Record = .{};
@@ -213,7 +234,12 @@ pub const Painter = struct {
 
         const vt = n.widget.vtable;
         if (vt.paint) |f| f(n.widget.ptr, n, p);
-        for (n.children.items) |ch| p.paintNode(ch);
+        var reaches_out = false;
+        for (n.children.items) |ch| {
+            p.paintNode(ch);
+            reaches_out = reaches_out or ch.reaches_out or ch.overhangs or ch.widget.vtable.paint_transform != null;
+        }
+        n.reaches_out = reaches_out and !(overflowing or n.widget.vtable.clips_children);
         p.node = n;
         p.rec = &rec;
         if (vt.paint_over) |f| f(n.widget.ptr, n, p);
@@ -234,10 +260,11 @@ pub const Painter = struct {
 
     /// Diagonal black and yellow stripes over `r` (in logical frame pixels).
     pub fn stripes(p: *Painter, r: Rect) void {
-        const clip = intersect(p.clip, r) orelse return;
+        const clip = intersect(p.clip, p.toFrame(r)) orelse return;
         if (clip.w <= 0 or clip.h <= 0) return;
         const c = p.ui.currentCanvas();
         c.setOrigin(.{ 0, 0 });
+        c.setTransform(p.transform);
         c.clip = scaleRect(clip, c.scale);
         c.recorder = p.rec;
         c.fillRect(r, stripe_colors[1]);

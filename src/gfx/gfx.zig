@@ -44,6 +44,7 @@ pub const Color = canvas.Color;
 pub const Rect = canvas.Rect;
 pub const CornerRadii = canvas.CornerRadii;
 pub const Point = canvas.Point;
+pub const Affine = canvas.Affine;
 pub const Atlas = atlas.Atlas;
 pub const Record = canvas.Record;
 

@@ -105,6 +105,114 @@ pub const Rect = struct {
     }
 };
 
+/// A 2D affine transform: (x, y) goes to (a·x + c·y + tx, b·x + d·y + ty).
+/// It moves, scales, turns and skews, keeping straight lines straight and
+/// parallel ones parallel.
+pub const Affine = struct {
+    a: f32 = 1,
+    b: f32 = 0,
+    c: f32 = 0,
+    d: f32 = 1,
+    tx: f32 = 0,
+    ty: f32 = 0,
+
+    pub const identity: Affine = .{};
+
+    /// Moves by (`x`, `y`).
+    pub fn translation(x: f32, y: f32) Affine {
+        return .{ .tx = x, .ty = y };
+    }
+
+    /// Scales by `x` across and `y` down, about the origin.
+    pub fn scaling(x: f32, y: f32) Affine {
+        return .{ .a = x, .d = y };
+    }
+
+    /// Turns by `radians` about the origin, clockwise on the screen (y
+    /// increases downwards).
+    pub fn rotation(radians: f32) Affine {
+        const cos = @cos(radians);
+        const sin = @sin(radians);
+        return .{ .a = cos, .b = sin, .c = -sin, .d = cos };
+    }
+
+    /// Skews by `x` across (each point moves across by `x` times its y)
+    /// and `y` down.
+    pub fn skewing(x: f32, y: f32) Affine {
+        return .{ .b = y, .c = x };
+    }
+
+    /// `first`, then `second`.
+    pub fn then(first: Affine, second: Affine) Affine {
+        return .{
+            .a = second.a * first.a + second.c * first.b,
+            .b = second.b * first.a + second.d * first.b,
+            .c = second.a * first.c + second.c * first.d,
+            .d = second.b * first.c + second.d * first.d,
+            .tx = second.a * first.tx + second.c * first.ty + second.tx,
+            .ty = second.b * first.tx + second.d * first.ty + second.ty,
+        };
+    }
+
+    /// `m` done about `pivot` instead of the origin (a scale from a
+    /// widget's middle, say).
+    pub fn about(m: Affine, pivot: Point) Affine {
+        return translation(-pivot[0], -pivot[1]).then(m).then(translation(pivot[0], pivot[1]));
+    }
+
+    /// Where `p` goes.
+    pub fn apply(m: Affine, p: Point) Point {
+        return .{ m.a * p[0] + m.c * p[1] + m.tx, m.b * p[0] + m.d * p[1] + m.ty };
+    }
+
+    /// The transform that undoes it, or null if it squashes the plane flat
+    /// (a scale by 0).
+    pub fn invert(m: Affine) ?Affine {
+        const det = m.a * m.d - m.b * m.c;
+        if (!(@abs(det) > 1e-12) or !std.math.isFinite(det)) return null;
+        const inv = 1 / det;
+        return .{
+            .a = m.d * inv,
+            .b = -m.b * inv,
+            .c = -m.c * inv,
+            .d = m.a * inv,
+            .tx = (m.c * m.ty - m.d * m.tx) * inv,
+            .ty = (m.b * m.tx - m.a * m.ty) * inv,
+        };
+    }
+
+    /// The smallest rectangle `r` fits in once transformed.
+    pub fn mapRect(m: Affine, r: Rect) Rect {
+        if (m.b == 0 and m.c == 0) {
+            const x0 = m.a * r.x + m.tx;
+            const y0 = m.d * r.y + m.ty;
+            const x1 = m.a * (r.x + r.w) + m.tx;
+            const y1 = m.d * (r.y + r.h) + m.ty;
+            return .{ .x = @min(x0, x1), .y = @min(y0, y1), .w = @abs(x1 - x0), .h = @abs(y1 - y0) };
+        }
+        const corners = [4]Point{ m.apply(.{ r.x, r.y }), m.apply(.{ r.x + r.w, r.y }), m.apply(.{ r.x + r.w, r.y + r.h }), m.apply(.{ r.x, r.y + r.h }) };
+        var lo = corners[0];
+        var hi = lo;
+        for (corners[1..]) |k| {
+            lo = .{ @min(lo[0], k[0]), @min(lo[1], k[1]) };
+            hi = .{ @max(hi[0], k[0]), @max(hi[1], k[1]) };
+        }
+        return .{ .x = lo[0], .y = lo[1], .w = hi[0] - lo[0], .h = hi[1] - lo[1] };
+    }
+
+    /// The same transform for coordinates `s` times as big (logical
+    /// pixels to a buffer's, say).
+    pub fn scaledBy(m: Affine, s: f32) Affine {
+        return .{ .a = m.a, .b = m.b, .c = m.c, .d = m.d, .tx = m.tx * s, .ty = m.ty * s };
+    }
+
+    /// Only moves, and scales the same both ways (by `a`, more than 0):
+    /// text can then be drawn at the size it ends up, as sharp as any.
+    fn isUniformScale(m: Affine) bool {
+        return m.b == 0 and m.c == 0 and m.a == m.d and m.a > 0;
+    }
+};
+
 /// Corner radii: top left, top right, bottom right, bottom left.
 pub const CornerRadii = struct {
     /// The radius of the top left corner, in pixels.
@@ -257,6 +365,9 @@ pub const Canvas = struct {
     clip: ?Rect = null,
     /// Added to every coordinate (see `setOrigin`).
     origin: Point = .{ 0, 0 },
+    /// Applied to everything drawn, last (in the target's pixels: see
+    /// `setTransform`), or nothing.
+    transform: ?Affine = null,
     /// Set if a shape could not be recorded (out of memory); the frame is
     /// missing it.
     failed: bool = false,
@@ -313,6 +424,7 @@ pub const Canvas = struct {
         c.batches.clearRetainingCapacity();
         c.clip = null;
         c.origin = .{ 0, 0 };
+        c.transform = null;
         c.failed = false;
         c.atlas = null;
         c.recorder = null;
@@ -322,13 +434,20 @@ pub const Canvas = struct {
     /// origin), or not at all.
     pub fn setClip(c: *Canvas, clip: ?Rect) void {
         const s = c.scale;
-        c.clip = if (clip) |r| .{ .x = (r.x + c.origin[0]) * s, .y = (r.y + c.origin[1]) * s, .w = r.w * s, .h = r.h * s } else null;
+        c.clip = if (clip) |r| c.mapped(.{ .x = (r.x + c.origin[0]) * s, .y = (r.y + c.origin[1]) * s, .w = r.w * s, .h = r.h * s }) else null;
     }
 
     /// Moves the origin: later coordinates are relative to this point (in
     /// logical coordinates).
     pub fn setOrigin(c: *Canvas, origin: Point) void {
         c.origin = origin;
+    }
+
+    /// Transforms what is drawn after (with the origin applied first: `m`
+    /// works in logical coordinates of the whole canvas), or not at all.
+    /// Clips set after are transformed too, to the rectangle they fit in.
+    pub fn setTransform(c: *Canvas, m: ?Affine) void {
+        c.transform = if (m) |t| t.scaledBy(c.scale) else null;
     }
 
     // --- Shapes -------------------------------------------------------------
@@ -487,6 +606,7 @@ pub const Canvas = struct {
         // Where the dashes can show, in the points' terms.
         var view: Rect = .{ .x = 0, .y = 0, .w = c.width, .h = c.height };
         if (c.clip) |cl| view = view.intersect(cl) orelse return;
+        if (c.transform) |m| view = (m.invert() orelse return).mapRect(view);
         view = view.outset(reach);
         const visible = [4]f32{ view.x / s - c.origin[0], view.y / s - c.origin[1], (view.x + view.w) / s - c.origin[0], (view.y + view.h) / s - c.origin[1] };
         const Each = struct {
@@ -547,7 +667,7 @@ pub const Canvas = struct {
                 continue;
             }
             // Short chords: about two pixels each, at most 32 a corner.
-            const steps: usize = @intFromFloat(std.math.clamp(@ceil(k.radius * c.scale * std.math.pi / 4), 1, 32));
+            const steps: usize = @intFromFloat(std.math.clamp(@ceil(k.radius * c.scale * std.math.pi / 4.0), 1, 32));
             for (0..steps + 1) |i| {
                 const a = k.from + 0.5 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(steps));
                 pts[n] = .{ k.cx + k.radius * @cos(a), k.cy + k.radius * @sin(a) };
@@ -602,16 +722,24 @@ pub const Canvas = struct {
 
     /// Draws `text` from `from` (where its baseline starts), running in
     /// `direction`, with its glyphs turned with it; where the baseline ends.
-    /// Turned by quarters, its glyphs stay as sharp as upright ones.
+    /// Turned by quarters, its glyphs stay as sharp as upright ones, and
+    /// so do they when the canvas's transform only moves and scales it the
+    /// same both ways (they are drawn at the size they end up).
     pub fn drawTextRunning(c: *Canvas, atlas: *Atlas, style: font.Style, from: Point, direction: TextDirection, text: []const u8, color: Color) Point {
         c.atlas = atlas;
-        const s = c.scale;
+        const transform = c.transform;
+        const upright = if (transform) |m| m.isUniformScale() else false;
+        // Drawn at the size it ends up, untransformed.
+        if (upright) c.transform = null;
+        defer c.transform = transform;
+        const s = if (upright) c.scale * transform.?.a else c.scale;
         const run = atlas.runs.get(style, text);
         const width = if (run) |r| r.width else font.measure(style, text);
         // Physical pixels: along the text (`along`, increasing as it runs),
         // and across it (the baseline, a whole pixel, increasing downwards
         // in the glyphs' own terms).
-        const px: Point = .{ (from[0] + c.origin[0]) * s, (from[1] + c.origin[1]) * s };
+        const unmoved: Point = .{ (from[0] + c.origin[0]) * c.scale, (from[1] + c.origin[1]) * c.scale };
+        const px = if (upright) transform.?.apply(unmoved) else unmoved;
         const turn: Turn = .{ .direction = direction };
         const start = turn.along(px);
         const base = @round(turn.across(px));
@@ -622,7 +750,9 @@ pub const Canvas = struct {
             .down => .{ from[0], from[1] + width },
         };
         if (color.a <= 0 or text.len == 0) return end;
-        const phys_size = style.size * s;
+        // Scaled, in quarter pixels: a size changing smoothly (text
+        // growing) makes fewer glyphs anew.
+        const phys_size = if (upright) @round(style.size * s * 4) / 4 else style.size * s;
         // Glyphs reach about an em above and below the baseline at most, and
         // an em before and after the text.
         const bounds = turn.rect(start - phys_size, start + (width + style.size) * s, base - 1.5 * phys_size, base + phys_size);
@@ -715,7 +845,8 @@ pub const Canvas = struct {
         var quad: [4][shaders.text_floats]f32 = undefined;
         for (corners, &quad) |k, *out| {
             const p = turn.point(k.a, k.b);
-            out.* = .{ c.clipX(p[0]), c.clipY(p[1]), k.u, k.v, color.r, color.g, color.b, color.a };
+            const q = c.toClip(p);
+            out.* = .{ q[0], q[1], k.u, k.v, color.r, color.g, color.b, color.a };
         }
         const out = c.vertices(b, shaders.text_floats, 6) orelse return false;
         out[0] = quad[0];
@@ -738,7 +869,10 @@ pub const Canvas = struct {
         const b = c.batchForImage(img, r) orelse return;
         const corners = [4][4]f32{ .{ r.x, r.y, 0, 0 }, .{ r.x + r.w, r.y, 1, 0 }, .{ r.x + r.w, r.y + r.h, 1, 1 }, .{ r.x, r.y + r.h, 0, 1 } };
         var verts: [4][shaders.text_floats]f32 = undefined;
-        for (corners, &verts) |k, *out| out.* = .{ c.clipX(k[0]), c.clipY(k[1]), k[2], k[3], 1, 1, 1, alpha };
+        for (corners, &verts) |k, *out| {
+            const q = c.toClip(.{ k[0], k[1] });
+            out.* = .{ q[0], q[1], k[2], k[3], 1, 1, 1, alpha };
+        }
         const out = c.vertices(b, shaders.text_floats, 6) orelse return;
         for ([_]usize{ 0, 1, 2, 0, 2, 3 }, out) |k, *o| o.* = verts[k];
     }
@@ -766,7 +900,8 @@ pub const Canvas = struct {
         const n = corners.len / 3 * 3;
         const out = c.vertices(b, shaders.text_floats, n) orelse return;
         for (corners[0..n], out) |k, *o| {
-            o.* = .{ c.clipX((k[0] + c.origin[0]) * s), c.clipY((k[1] + c.origin[1]) * s), k[2], k[3], 1, 1, 1, alpha };
+            const q = c.toClip(.{ (k[0] + c.origin[0]) * s, (k[1] + c.origin[1]) * s });
+            o.* = .{ q[0], q[1], k[2], k[3], 1, 1, 1, alpha };
         }
     }
 
@@ -839,14 +974,17 @@ pub const Canvas = struct {
         for (corners) |k| {
             const quad = [4]Point{ .{ k[0], k[1] }, .{ k[2], k[1] }, .{ k[2], k[3] }, .{ k[0], k[3] } };
             var verts: [4][shaders.shape_floats]f32 = undefined;
-            for (quad, &verts) |p, *out| out.* = .{
-                c.clipX(p[0]), c.clipY(p[1]),
-                p[0] - cx,     p[1] - cy,
-                hw,            hh,
-                k[4],          stroke,
-                color.r,       color.g,
-                color.b,       color.a,
-            };
+            for (quad, &verts) |p, *out| {
+                const q = c.toClip(p);
+                out.* = .{
+                    q[0],      q[1],
+                    p[0] - cx, p[1] - cy,
+                    hw,        hh,
+                    k[4],      stroke,
+                    color.r,   color.g,
+                    color.b,   color.a,
+                };
+            }
             c.append(b, &.{ verts[0], verts[1], verts[2], verts[0], verts[2], verts[3] });
         }
     }
@@ -884,8 +1022,10 @@ pub const Canvas = struct {
     /// Notes a shape in the recorder: what it is (its operation, the
     /// fixed-size `params` and the variable `data`, with the clip) and the
     /// area it can touch.
-    fn note(c: *Canvas, op: Op, bounds: Rect, params: anytype, data: []const u8) void {
+    fn note(c: *Canvas, op: Op, bounds_in: Rect, params: anytype, data: []const u8) void {
         const rec = c.recorder orelse return;
+        const bounds = c.mapped(bounds_in);
+        if (c.transform) |m| rec.hash.update(std.mem.asBytes(&m));
         var buf: [128]u8 = undefined;
         buf[0] = @backingInt(op);
         var len: usize = 1;
@@ -918,12 +1058,17 @@ pub const Canvas = struct {
         return .{ .x = (r.x + c.origin[0]) * s, .y = (r.y + c.origin[1]) * s, .w = r.w * s, .h = r.h * s };
     }
 
-    inline fn clipX(c: *const Canvas, x: f32) f32 {
-        return x * c.inv_w - 1;
+    /// Where a point (in the target's pixels, before the transform) is in
+    /// clip space.
+    inline fn toClip(c: *const Canvas, p_in: Point) Point {
+        const p = if (c.transform) |m| m.apply(p_in) else p_in;
+        return .{ p[0] * c.inv_w - 1, 1 - p[1] * c.inv_h };
     }
 
-    inline fn clipY(c: *const Canvas, y: f32) f32 {
-        return 1 - y * c.inv_h;
+    /// Where a rectangle (in the target's pixels) ends up once
+    /// transformed: the rectangle it fits in.
+    fn mapped(c: *const Canvas, r: Rect) Rect {
+        return if (c.transform) |m| m.mapRect(r) else r;
     }
 
     /// How far back `batchFor` looks for a batch to add to.
@@ -946,7 +1091,8 @@ pub const Canvas = struct {
         return c.batchOf(.image, img, bounds);
     }
 
-    fn batchOf(c: *Canvas, kind: BatchKind, image: ?*const Image, bounds: Rect) ?*Batch {
+    fn batchOf(c: *Canvas, kind: BatchKind, image: ?*const Image, bounds_in: Rect) ?*Batch {
+        const bounds = c.mapped(bounds_in);
         const items = c.batches.items;
         var found: ?*Batch = null;
         var i = items.len;
@@ -1042,7 +1188,8 @@ const SolidSink = struct {
         const target = s.batch(opaque_triangle) orelse return;
         const out = c.vertices(target, shaders.solid_floats, 3) orelse return;
         for ([_]geometry.Vertex{ a, b, cc }, out) |vert, *o| {
-            o.* = .{ c.clipX(vert.x + s.offset[0]), c.clipY(vert.y + s.offset[1]), s.color.r, s.color.g, s.color.b, s.color.a * vert.alpha };
+            const q = c.toClip(.{ vert.x + s.offset[0], vert.y + s.offset[1] });
+            o.* = .{ q[0], q[1], s.color.r, s.color.g, s.color.b, s.color.a * vert.alpha };
         }
     }
 };
@@ -1196,4 +1343,45 @@ test "colour emoji renders multi-coloured layers through the text shader" {
     }
     try std.testing.expect(has_yellow);
     try std.testing.expect(has_red);
+}
+
+test "affine transforms compose, undo and bound rectangles" {
+    const turn = Affine.rotation(std.math.pi / 2.0);
+    // A quarter turn clockwise on the screen: right goes down.
+    const down = turn.apply(.{ 1, 0 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0), down[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), down[1], 1e-6);
+    // Scaled, then moved: in that order.
+    const m = Affine.scaling(2, 3).then(.translation(10, 20));
+    try std.testing.expectEqual(Point{ 12, 23 }, m.apply(.{ 1, 1 }));
+    const back = m.invert().?.apply(.{ 12, 23 });
+    try std.testing.expectApproxEqAbs(@as(f32, 1), back[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), back[1], 1e-6);
+    try std.testing.expectEqual(@as(?Affine, null), Affine.scaling(0, 1).invert());
+    // About a point: it stays put.
+    try std.testing.expectEqual(Point{ 50, 20 }, Affine.scaling(2, 2).about(.{ 50, 20 }).apply(.{ 50, 20 }));
+    // A square turned an eighth fits in a bigger one, about the same middle.
+    const r = Affine.rotation(std.math.pi / 4.0).about(.{ 10, 10 }).mapRect(.{ .x = 0, .y = 0, .w = 20, .h = 20 });
+    try std.testing.expectApproxEqAbs(@as(f32, 20 * std.math.sqrt2), r.w, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 10 - 10 * std.math.sqrt2), r.x, 1e-4);
+    // Flipped: still a rectangle the right way round.
+    try std.testing.expectEqual(Rect{ .x = -30, .y = 0, .w = 20, .h = 10 }, Affine.scaling(-1, 1).mapRect(.{ .x = 10, .y = 0, .w = 20, .h = 10 }));
+}
+
+test "a transform moves what is recorded, and changes its fingerprint" {
+    var c = Canvas.init(std.testing.allocator);
+    defer c.deinit();
+    var plain: Record = .{};
+    c.begin(200, 100);
+    c.recorder = &plain;
+    c.fillRect(.{ .x = 10, .y = 10, .w = 20, .h = 20 }, Color.rgb(0));
+    var moved: Record = .{};
+    c.begin(200, 100);
+    c.recorder = &moved;
+    c.setTransform(.translation(100, 0));
+    c.fillRect(.{ .x = 10, .y = 10, .w = 20, .h = 20 }, Color.rgb(0));
+    try std.testing.expect(plain.final() != moved.final());
+    try std.testing.expectEqual(plain.bounds.?.x + 100, moved.bounds.?.x);
+    // Batched where they end up.
+    try std.testing.expect(c.batches.items[0].bounds.x >= 100);
 }

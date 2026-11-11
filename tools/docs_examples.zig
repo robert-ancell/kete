@@ -423,6 +423,14 @@ fn alignWidget(cx: *BuildContext) Widget {
     }) });
 }
 
+fn transformWidget(cx: *BuildContext) Widget {
+    return cx.make(kete.Padding{ .padding = .all(16), .child = cx.make(kete.Row{ .spacing = 32, .children = cx.makeAll(.{
+        kete.Transform.rotate(-std.math.pi / 12.0, box(cx, "Turned", 80, 48)),
+        kete.Transform.scale(1.25, box(cx, "Scaled", 80, 48)),
+        kete.Transform.translate(0, 12, box(cx, "Moved", 80, 48)),
+    }) }) });
+}
+
 fn sizedBox(cx: *BuildContext) Widget {
     return cx.make(kete.RoundedBox{
         .border_color = cx.theme().outline,
@@ -533,6 +541,7 @@ pub const all = .{
     Example("Expanded", expanded, .{}),
     Example("Padding", paddingWidget, .{}),
     Example("Align", alignWidget, .{}),
+    Example("Transform", transformWidget, .{}),
     Example("SizedBox", sizedBox, .{}),
     Example("ConstrainedBox", constrainedBox, .{}),
     Example("RoundedBox", roundedBox, .{}),

@@ -1,5 +1,6 @@
 //! Animation: widgets made afresh each frame from how far through their time
-//! they are, eased by the easing functions.
+//! they are, eased by the easing functions, and widgets transformed as they
+//! go (shaken, pulsed, spun).
 
 const std = @import("std");
 const kete = @import("kete");
@@ -7,15 +8,61 @@ const common = @import("common.zig");
 
 pub const State = struct {
     plays: u64 = 0,
+    shakes: u64 = 0,
+    spins: u64 = 0,
 
     fn play(s: *State) void {
         s.plays += 1;
+    }
+
+    fn shake(s: *State) void {
+        s.shakes += 1;
+    }
+
+    fn spin(s: *State) void {
+        s.spins += 1;
     }
 };
 
 pub fn build(cx: *kete.BuildContext, s: *State) kete.Widget {
     const anim = common.section(cx, "Animation", "A widget made afresh each frame from how far through its time it is, eased by a tweening function", animation(cx, s));
-    return common.page(cx, &.{anim});
+    const moved = common.section(cx, "Transform", "Drawn moved, scaled or turned, laid out as if not", transforms(cx, s));
+    return common.page(cx, &.{ anim, moved });
+}
+
+fn transforms(cx: *kete.BuildContext, s: *State) []const kete.Widget {
+    return cx.makeAll(.{kete.Row{ .spacing = 24, .cross_axis_alignment = .center, .children = cx.makeAll(.{
+        kete.AnimatedWidget{ .duration_ns = 500 * std.time.ns_per_ms, .restart = s.shakes, .builder = .of(s, shaking) },
+        kete.AnimatedWidget{ .duration_ns = 800 * std.time.ns_per_ms, .repeat = .reverse, .builder = .func(pulsing) },
+        kete.AnimatedWidget{ .duration_ns = 600 * std.time.ns_per_ms, .restart = s.spins, .builder = .of(s, spinning) },
+    }) }});
+}
+
+/// A button shaken side to side, less and less.
+fn shaking(s: *State, cx: *kete.BuildContext, t: f32) kete.Widget {
+    const x = 8 * @sin(t * 6 * std.math.pi) * (1 - t);
+    return cx.make(kete.Transform.translate(x, 0, cx.make(kete.OutlinedButton{ .label = "Shake", .on_press = .of(s, State.shake) })));
+}
+
+/// A badge growing a little and back, over and over.
+fn pulsing(cx: *kete.BuildContext, t: f32) kete.Widget {
+    const th = cx.theme();
+    return cx.make(kete.Transform.scale(kete.Easing.inOutSine.lerp(@as(f32, 1), 1.15, t), cx.make(kete.RoundedBox{
+        .color = th.@"error",
+        .radius = .all(14),
+        .child = cx.make(kete.Padding{ .padding = .symmetric(14, 6), .child = cx.make(kete.Text{
+            .text = "Live",
+            .style = .{ .color = th.on_error },
+            .wrap = false,
+        }) }),
+    })));
+}
+
+/// A button turned once round.
+fn spinning(s: *State, cx: *kete.BuildContext, t: f32) kete.Widget {
+    // Back upright at the end, exactly.
+    const turn = if (t >= 1) 0 else kete.Easing.inOutCubic.lerp(@as(f32, 0), 2 * std.math.pi, t);
+    return cx.make(kete.Transform.rotate(turn, cx.make(kete.FilledButton{ .label = "Spin", .icon = .refresh, .on_press = .of(s, State.spin) })));
 }
 
 const Named = struct { []const u8, kete.Easing };

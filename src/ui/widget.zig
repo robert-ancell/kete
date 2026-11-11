@@ -247,6 +247,10 @@ pub const VTable = struct {
     /// counting the rest as overflow (`pub const clips_children = true`:
     /// a scroll view).
     clips_children: bool,
+    /// How it and its children are drawn moved, scaled or turned
+    /// (`pub fn paintTransform(self, n) gfx.Affine`, in its own coordinates):
+    /// drawn and hit there, laid out as if not.
+    paint_transform: ?*const fn (*const anyopaque, *const WidgetNode) gfx.Affine,
 };
 
 pub const StateOps = struct {
@@ -318,6 +322,9 @@ fn makeVTable(comptime T: type) VTable {
         fn realize(ptr: *const anyopaque, n: *WidgetNode, visible: Rect) void {
             T.realize(self(ptr), n, visible);
         }
+        fn paintTransform(ptr: *const anyopaque, n: *const WidgetNode) gfx.Affine {
+            return T.paintTransform(self(ptr), n);
+        }
         fn initState(ptr: *const anyopaque, state: *anyopaque) void {
             const st: *T.State = @ptrCast(@alignCast(state));
             st.* = if (@hasDecl(T, "initState")) T.initState(self(ptr)) else .{};
@@ -345,6 +352,7 @@ fn makeVTable(comptime T: type) VTable {
         .realize = if (@hasDecl(T, "realize")) S.realize else null,
         .scrolls = @hasDecl(T, "scrolls") and T.scrolls,
         .clips_children = @hasDecl(T, "clips_children") and T.clips_children,
+        .paint_transform = if (@hasDecl(T, "paintTransform")) S.paintTransform else null,
         .state = if (@hasDecl(T, "State")) .{
             .size = @sizeOf(T.State),
             .alignment = .of(T.State),
@@ -536,6 +544,10 @@ pub const WidgetNode = struct {
     /// corner): not counted as the parent's overflow. Its parent's layout
     /// sets it, each time it places it.
     overhangs: bool = false,
+    /// Something in it is drawn outside it, and not clipped (a child
+    /// transformed or overhanging, or one in it): hit testing looks in it
+    /// past its edges. Set when it is painted.
+    reaches_out: bool = false,
     /// The frame it was last laid out in.
     laid_out: u64 = 0,
     /// Whatever the widget's layout wants to keep for its paint, in the
@@ -805,9 +817,11 @@ pub const WidgetNode = struct {
 
     /// Adds the nodes under `p` (relative to this node) that handle events
     /// to `path`, deepest first. Returns whether anything here was hit.
-    pub fn hitTest(n: *WidgetNode, p: Point, path: *std.ArrayList(*WidgetNode)) bool {
+    pub fn hitTest(n: *WidgetNode, p_in: Point, path: *std.ArrayList(*WidgetNode)) bool {
         if (n.laid_out != n.ui.frame_no) return false;
-        if (p[0] < 0 or p[1] < 0 or p[0] >= n.size.w or p[1] >= n.size.h) return false;
+        const p = n.untransform(p_in) orelse return false;
+        const inside = p[0] >= 0 and p[1] >= 0 and p[0] < n.size.w and p[1] < n.size.h;
+        if (!inside and !n.reaches_out) return false;
         var hit = false;
         var i = n.children.items.len;
         while (i > 0) {
@@ -819,7 +833,7 @@ pub const WidgetNode = struct {
             }
         }
         const vt = n.widget.vtable;
-        if (!hit) hit = if (vt.hit_test) |f| f(n.widget.ptr, n, p) else (vt.event != null or vt.cursor != null);
+        if (!hit and inside) hit = if (vt.hit_test) |f| f(n.widget.ptr, n, p) else (vt.event != null or vt.cursor != null);
         if (hit and (vt.event != null or vt.cursor != null)) path.append(n.ui.gpa, n) catch {};
         return hit;
     }
@@ -836,7 +850,25 @@ pub const WidgetNode = struct {
         }
     }
 
-    /// Where the node's top left is in the window (as last laid out).
+    /// Where `p` (relative to the node's top left as laid out) is in the
+    /// node's own coordinates, those it is drawn in: through its
+    /// transform, if it has one. Null if the transform squashes it flat.
+    pub fn untransform(n: *const WidgetNode, p: Point) ?Point {
+        const f = n.widget.vtable.paint_transform orelse return p;
+        const inv = f(n.widget.ptr, n).invert() orelse return null;
+        return inv.apply(p);
+    }
+
+    /// Where `p` (in the window) is in the node's own coordinates: as
+    /// relative to `position`, and through any transforms of it and the
+    /// nodes it is in. Null if one squashes it flat.
+    pub fn fromWindow(n: *const WidgetNode, p: Point) ?Point {
+        const outer = if (n.parent) |up| up.fromWindow(p) orelse return null else p;
+        return n.untransform(.{ outer[0] - n.offset[0], outer[1] - n.offset[1] });
+    }
+
+    /// Where the node's top left is in the window (as last laid out,
+    /// leaving out any transforms).
     pub fn position(n: *const WidgetNode) Point {
         var p = n.offset;
         var up = n.parent;

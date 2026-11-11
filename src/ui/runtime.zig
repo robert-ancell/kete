@@ -1838,8 +1838,8 @@ pub const WindowUi = struct {
     }
 
     fn local(n: *const Node, pos: Point) Point {
-        const at = n.position();
-        return .{ pos[0] - at[0], pos[1] - at[1] };
+        // Squashed flat by a transform: nowhere near it.
+        return n.fromWindow(pos) orelse .{ -1e9, -1e9 };
     }
 
     fn overMenu(ui: *const WindowUi) bool {
