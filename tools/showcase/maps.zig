@@ -92,6 +92,7 @@ pub fn build(cx: *kete.BuildContext, s: *State) kete.Widget {
     // They tell the time on the app's clock.
     s.vector.io = cx.ui.io;
     s.images.io = cx.ui.io;
+    s.images.font = cx.ui.font;
     const source: kete.MapSource = switch (s.kind) {
         .vector => .of(&s.vector, .{ .max_level = max_zoom, .attribution = "Vector tiles made by the showcase" }),
         .images => .of(&s.images, .{ .max_level = max_zoom, .attribution = "Images drawn by the showcase" }),
@@ -450,6 +451,8 @@ const VectorTiles = struct {
 const ImageTiles = struct {
     cache: Cache(Picture) = .{},
     io: std.Io = undefined,
+    /// The app's font, the labels are drawn in.
+    font: ?*const kete.font.Font = null,
     drawing: ?Drawing = null,
     /// The style they are drawn in (its layers `gpa`'s), and its colours.
     style: ?kete.MapStyle = null,
@@ -512,7 +515,7 @@ const ImageTiles = struct {
         const style = &(p.style orelse return error.NoStyle);
         if (p.drawing == null) {
             p.drawing = .{
-                .font = try kete.font.Font.init(kete.font.default_font_data),
+                .font = (p.font orelse return error.NoFont).*,
                 .atlas = try kete.gfx.Atlas.init(gpa),
                 .canvas = kete.gfx.Canvas.init(gpa),
             };

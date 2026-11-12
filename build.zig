@@ -20,6 +20,7 @@ fn runSubsetIcons(b: *std.Build, names: std.Build.LazyPath) struct {
         .target = b.graph.host,
         .optimize = .safe,
     });
+    host_font.addImport("kete_options", fontOptions(b, true));
     host_font.addAnonymousImport("FiraSans-Regular.ttf", .{ .root_source_file = b.path("fonts/FiraSans-Regular.ttf") });
     host_font.addAnonymousImport("TwemojiMozilla.ttf", .{ .root_source_file = b.path("fonts/TwemojiMozilla.ttf") });
     const tool = b.addExecutable(.{
@@ -232,7 +233,19 @@ pub const ModuleOptions = struct {
     /// own, and draws with the software renderer or a `gfx.Renderer` of
     /// its own.
     backends: bool = true,
+    /// Whether kete includes its fonts (Fira Sans and Twemoji Mozilla,
+    /// about 1.6 MB). Without them it reads fonts from files: the app's
+    /// (`App.Options.font_path`), or else its own found on the system.
+    embed_fonts: bool = true,
 };
+
+/// The options the font module is built with: just whether it has its
+/// fonts.
+fn fontOptions(b: *std.Build, embed_fonts: bool) *std.Build.Module {
+    const o = b.addOptions();
+    o.addOption(bool, "embed_fonts", embed_fonts);
+    return o.createModule();
+}
 
 pub fn createModules(
     b: *std.Build,
@@ -244,6 +257,7 @@ pub fn createModules(
 ) Modules {
     const build_options = b.addOptions();
     build_options.addOption(bool, "backends", options.backends);
+    build_options.addOption(bool, "embed_fonts", options.embed_fonts);
     const kete_options = build_options.createModule();
 
     const wayland = b.createModule(.{
@@ -256,6 +270,7 @@ pub fn createModules(
         .root_source_file = b.path("src/font/font.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "kete_options", .module = kete_options }},
     });
     font.addAnonymousImport("FiraSans-Regular.ttf", .{ .root_source_file = b.path("fonts/FiraSans-Regular.ttf") });
     font.addAnonymousImport("TwemojiMozilla.ttf", .{ .root_source_file = b.path("fonts/TwemojiMozilla.ttf") });
@@ -344,7 +359,8 @@ pub fn build(b: *std.Build) void {
 
     const icon_font = addIconFont(b);
     const backends = b.option(bool, "backends", "Build kete's own window and render backends (default); without them it needs nothing of the system, and the app gives its own") orelse true;
-    const mods = createModules(b, "kete", target, optimize, icon_font, .{ .backends = backends });
+    const embed_fonts = b.option(bool, "embed-fonts", "Include kete's fonts, Fira Sans and Twemoji Mozilla (default); without them it reads them from the system's font files") orelse true;
+    const mods = createModules(b, "kete", target, optimize, icon_font, .{ .backends = backends, .embed_fonts = embed_fonts });
     const polyhedron_gl_spv = addSpirv(b, "polyhedron_gl", "examples/shaders/polyhedron.zig", .opengl);
     const polyhedron_vk_spv = addSpirv(b, "polyhedron_vk", "examples/shaders/polyhedron.zig", .vulkan);
 

@@ -32,6 +32,8 @@ exe.root_module.addImport("kete", kete_dep.module("kete"));
 
 To give your app its own window and render backends (SDL, a framebuffer, a game engine) instead of Kete's, pass `.backends = false`: Kete then needs nothing of the system, not even libc (see [examples/custom_backend.zig](examples/custom_backend.zig)).
 
+Kete includes its fonts, Fira Sans and Twemoji Mozilla (about 1.6 MB). To leave them out, pass `.@"embed-fonts" = false` (or `-Dembed-fonts=false`): Kete then reads fonts from files, the app's own (`App.Options.font_path` and `emoji_font_path`) or else its own found among the system's fonts (and in the directories `KETE_FONT_PATH` names).
+
 Then build your UI in `src/main.zig`:
 
 ```zig

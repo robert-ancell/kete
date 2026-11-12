@@ -46,6 +46,8 @@ jobs:
         run: zig build test --summary all
       - name: Build and test without kete's own backends
         run: zig build examples test -Dbackends=false --summary all
+      - name: Build without kete's own fonts
+        run: zig build -Dembed-fonts=false --summary all
 
   site:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

@@ -120,6 +120,9 @@ pub const SharedResources = struct {
     font: ?*const font.Font,
     owned_font: ?font.Font = null,
     emoji_font: ?font.Font = null,
+    /// The fonts' bytes, when read from files (see `Fonts`).
+    font_bytes: ?[]u8 = null,
+    emoji_font_bytes: ?[]u8 = null,
     /// Icons are drawn with it (see `Icon`).
     icon_font: font.Font,
     atlas: gfx.Atlas,
@@ -196,23 +199,70 @@ pub const SharedResources = struct {
     }
 
     /// What the app's windows share, using the bundled default Fira Sans and
-    /// Twemoji Mozilla fallback fonts.
+    /// Twemoji Mozilla fallback fonts (or, if kete was built without them,
+    /// the same fonts found on the system: see `Fonts`).
     pub fn createDefault(gpa: std.mem.Allocator, io: std.Io) !*SharedResources {
-        return createWithFontData(gpa, io, font.default_font_data);
+        return createWithFonts(gpa, io, .empty, .{});
     }
 
     /// What the app's windows share, drawing text in the OpenType or
     /// TrueType font in `data` (which must outlive it), falling back to the
     /// bundled Twemoji Mozilla font for emoji.
     pub fn createWithFontData(gpa: std.mem.Allocator, io: std.Io, data: []const u8) !*SharedResources {
+        return createWithFonts(gpa, io, .empty, .{ .data = data });
+    }
+
+    /// The fonts text is drawn in: the text font, and the emoji font text
+    /// falls back to. Each is the one given (`data`, or the file at a path),
+    /// or else kete's own (Fira Sans and Twemoji Mozilla): included in it,
+    /// or, if kete was built without them (`-Dembed-fonts=false`), found
+    /// among the system's fonts (see `font.system`, which `environ` says
+    /// where to look for). Without a text font it is `error.NoFont`;
+    /// without an emoji font, emoji are not drawn.
+    pub const Fonts = struct {
+        /// The text font's bytes, which must outlive the app.
+        data: ?[]const u8 = null,
+        /// The text font's file, if not `data`.
+        path: ?[]const u8 = null,
+        /// The emoji font's file.
+        emoji_path: ?[]const u8 = null,
+    };
+
+    /// What the app's windows share, drawing text in `fonts`.
+    pub fn createWithFonts(gpa: std.mem.Allocator, io: std.Io, environ: std.process.Environ, fonts: Fonts) !*SharedResources {
         const s = try create(gpa, io, null);
         errdefer s.destroy();
+        if (fonts.path) |p| if (fonts.data == null) {
+            s.font_bytes = try font.system.read(io, gpa, p);
+        };
+        if (fonts.emoji_path) |p| s.emoji_font_bytes = try font.system.read(io, gpa, p);
+        if (comptime !font.has_embedded_fonts) try s.findSystemFonts(environ, fonts.data == null and s.font_bytes == null, s.emoji_font_bytes == null);
+
+        const data: []const u8 = fonts.data orelse s.font_bytes orelse if (comptime font.has_embedded_fonts) font.default_font_data else return error.NoFont;
         s.owned_font = try font.Font.init(data);
-        s.emoji_font = font.Font.init(font.emoji_font_data) catch null;
+        const emoji_data: ?[]const u8 = s.emoji_font_bytes orelse if (comptime font.has_embedded_fonts) font.emoji_font_data else null;
+        if (emoji_data) |d| s.emoji_font = font.Font.init(d) catch null;
         const f = &s.owned_font.?;
         if (s.emoji_font) |*ef| f.fallback = ef;
         s.font = f;
         return s;
+    }
+
+    /// Reads kete's own fonts (those wanted) from the system's font files,
+    /// if they are there.
+    fn findSystemFonts(s: *SharedResources, environ: std.process.Environ, text: bool, emoji: bool) !void {
+        if (!text and !emoji) return;
+        const dirs = try font.system.searchDirs(s.gpa, environ);
+        defer font.system.freeDirs(s.gpa, dirs);
+        var found: [2]?[]u8 = undefined;
+        try font.system.find(s.io, s.gpa, dirs, &.{ font.default_font_file, font.emoji_font_file }, &found);
+        defer for (found) |f| if (f) |p| s.gpa.free(p);
+        if (text) if (found[0]) |p| {
+            s.font_bytes = try font.system.read(s.io, s.gpa, p);
+        };
+        if (emoji) if (found[1]) |p| {
+            s.emoji_font_bytes = font.system.read(s.io, s.gpa, p) catch null;
+        };
     }
 
     /// Lets it go: the windows' UIs must be destroyed first.
@@ -225,6 +275,8 @@ pub const SharedResources = struct {
         s.local_clipboard.deinit(s.gpa);
         if (s.owns_renderer) if (s.renderer) |r| r.deinit();
         s.atlas.deinit();
+        if (s.font_bytes) |b| s.gpa.free(b);
+        if (s.emoji_font_bytes) |b| s.gpa.free(b);
         s.gpa.destroy(s);
     }
 
@@ -2004,8 +2056,14 @@ pub const App = struct {
         app_id: ?[]const u8 = null,
         /// The OpenType or TrueType font text is drawn in (the file's
         /// bytes, which must outlive the app); the bundled Fira Sans if
-        /// null.
+        /// null (see `SharedResources.Fonts`).
         font_data: ?[]const u8 = null,
+        /// The file to read the font text is drawn in from, if not
+        /// `font_data`.
+        font_path: ?[]const u8 = null,
+        /// The file to read the font emoji are drawn in from; the bundled
+        /// Twemoji Mozilla if null.
+        emoji_font_path: ?[]const u8 = null,
         /// What its windows are on (a custom backend's, or
         /// `window.Display.single` for a custom backend's one window),
         /// which stays the caller's to close after the app; the system's
@@ -2068,7 +2126,7 @@ pub const App = struct {
         else
             return error.NoDisplay;
         errdefer if (owns_display) display.close();
-        const shared = if (options.font_data) |data| try SharedResources.createWithFontData(gpa, io, data) else try SharedResources.createDefault(gpa, io);
+        const shared = try SharedResources.createWithFonts(gpa, io, environ, .{ .data = options.font_data, .path = options.font_path, .emoji_path = options.emoji_font_path });
         errdefer shared.destroy();
         const a = try gpa.create(App);
         a.* = .{
