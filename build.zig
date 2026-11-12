@@ -88,9 +88,50 @@ pub fn addIconFontScanned(b: *std.Build, scan_dirs: []const std.Build.LazyPath) 
     scan.addFileArg(b.path("fonts/MaterialIcons-Regular.codepoints"));
     const names = scan.addOutputFileArg("names.zig");
     scan.addDirectoryArg(b.path("src")); // kete's own icons (e.g. .expand_more)
-    for (scan_dirs) |dir| scan.addDirectoryArg(dir);
+    addZigInputs(b, scan, b.path("src"));
+    for (scan_dirs) |dir| {
+        scan.addDirectoryArg(dir);
+        addZigInputs(b, scan, dir);
+    }
     const out = runSubsetIcons(b, names);
     return .{ .ttf = out.ttf, .codepoints = out.codepoints, .names = names };
+}
+
+/// Makes `run` depend on the `.zig` files in `dir` (as `scan_icons` reads
+/// them: not in directories whose names start with a dot), so that it runs
+/// again when one changes, is added or goes: a directory argument alone is
+/// cached by its path, not what is in it. They are listed each time the
+/// build is configured. A directory made by the build (not in a source
+/// tree) is left as it is.
+fn addZigInputs(b: *std.Build, run: *std.Build.Step.Run, dir: std.Build.LazyPath) void {
+    const src = switch (dir) {
+        .src_path => |p| p,
+        else => return,
+    };
+    const io = b.graph.io;
+    const root = src.owner.root.joinString(b.allocator, src.sub_path) catch @panic("OOM");
+    var d = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return;
+    defer d.close(io);
+    addZigInputsIn(b, run, src.owner, src.sub_path, d);
+}
+
+fn addZigInputsIn(b: *std.Build, run: *std.Build.Step.Run, owner: *std.Build, sub_path: []const u8, dir: std.Io.Dir) void {
+    const io = b.graph.io;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        switch (entry.kind) {
+            .file => if (std.mem.endsWith(u8, entry.name, ".zig")) {
+                run.addFileInput(owner.path(b.pathJoin(&.{ sub_path, entry.name })));
+            },
+            .directory => {
+                if (entry.name[0] == '.') continue; // .zig-cache and the like
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                addZigInputsIn(b, run, owner, b.pathJoin(&.{ sub_path, entry.name }), sub);
+            },
+            else => {},
+        }
+    }
 }
 
 fn addSpirv(b: *std.Build, name: []const u8, source: []const u8, os_tag: std.Target.Os.Tag) std.Build.LazyPath {
