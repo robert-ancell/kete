@@ -1499,6 +1499,12 @@ test "HiDPI scale factor renders text and shapes at physical buffer resolution w
         width: u32 = 200,
         height: u32 = 80,
         scale: u32 = 2,
+        pub fn size(w: *const @This()) [2]u32 {
+            return .{ w.width, w.height };
+        }
+        pub fn getScale(w: *const @This()) u32 {
+            return w.scale;
+        }
     };
     var win: HiDpiWin = .{};
     u.attachWindow(&win, null);
@@ -1669,6 +1675,9 @@ test "any window can show frames and give the clipboard, not only Wayland's" {
         shown: u32 = 0,
         copied: [16]u8 = undefined,
         copied_len: usize = 0,
+        pub fn size(w: *const @This()) [2]u32 {
+            return .{ w.width, w.height };
+        }
         pub fn beginSoftwareFrame(w: *@This()) !gfx.software.Image {
             return .{ .pixels = &w.pixels, .width = w.width, .height = w.height };
         }
@@ -1718,6 +1727,10 @@ const PopupWin = struct {
     shown: u32 = 0,
     /// Where popups go: past the window's right edge, as a popup can.
     const at: [2]i32 = .{ 350, 40 };
+
+    pub fn size(w: *const PopupWin) [2]u32 {
+        return .{ w.width, w.height };
+    }
 
     fn deinit(w: *PopupWin) void {
         w.opened.deinit(testing.allocator);
@@ -1869,6 +1882,9 @@ const DmabufWin = struct {
     pixels: [200 * 100]u32 = @splat(0),
     cpu_frames: u32 = 0,
     shown: u32 = 0,
+    pub fn size(w: *const DmabufWin) [2]u32 {
+        return .{ w.width, w.height };
+    }
     pub fn beginSoftwareFrame(w: *DmabufWin) !gfx.software.Image {
         w.cpu_frames += 1;
         return .{ .pixels = &w.pixels, .width = w.width, .height = w.height };
@@ -2463,6 +2479,9 @@ const TwoBufferWin = struct {
     frames: u64 = 0,
     back: usize = 0,
 
+    pub fn size(win: *const TwoBufferWin) [2]u32 {
+        return .{ win.width, win.height };
+    }
     pub fn beginSoftwareFrame(win: *TwoBufferWin) !gfx.software.Image {
         win.back = @intCast(win.frames % 2);
         return .{ .pixels = &win.pixels[win.back], .width = w, .height = h };
@@ -2898,6 +2917,13 @@ const AppDisplay = struct {
             size: [2]?u32 = .{ null, null },
             resizable: bool = true,
         };
+        pub fn size(w: *const AppWin) [2]u32 {
+            return .{ w.width, w.height };
+        }
+        pub fn takeCloseRequest(w: *AppWin) bool {
+            defer w.close_requested = false;
+            return w.close_requested;
+        }
         pub fn setSize(w: *AppWin, width: u32, height: u32) void {
             w.asked_size = .{ width, height };
         }
@@ -3403,6 +3429,10 @@ const GbmWin = struct {
 
     fn init(dev: *const window.wayland.DmaBufDevice, width: u32, height: u32) !GbmWin {
         return .{ .dev = dev, .buf = try dev.alloc(width, height, ar24), .width = width, .height = height };
+    }
+
+    pub fn size(w: *const GbmWin) [2]u32 {
+        return .{ w.width, w.height };
     }
 
     fn deinit(w: *GbmWin) void {

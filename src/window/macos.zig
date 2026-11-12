@@ -152,8 +152,12 @@ pub const MacWindow = struct {
         pixels: []u32 = &.{},
     };
 
-    pub const platform: window.WindowPlatform = .macos;
-    pub const decorations: window.WindowDecorations = .system;
+    pub fn platform(_: *const MacWindow) window.WindowPlatform {
+        return .macos;
+    }
+    pub fn decorations(_: *const MacWindow) window.WindowDecorations {
+        return .system;
+    }
 
     const Buffer = struct {
         pixels: ?*Pixels = null,
@@ -350,6 +354,27 @@ pub const MacWindow = struct {
 
     pub fn getTitle(w: *const MacWindow) []const u8 {
         return w.title_buf;
+    }
+
+    /// Whether closing it was asked for since the last call.
+    pub fn takeCloseRequest(w: *MacWindow) bool {
+        defer w.close_requested = false;
+        return w.close_requested;
+    }
+
+    /// Filling the screen (see `setMaximized`).
+    pub fn isMaximized(w: *const MacWindow) bool {
+        return w.maximized;
+    }
+
+    /// On the whole screen (see `setFullscreen`).
+    pub fn isFullscreen(w: *const MacWindow) bool {
+        return w.fullscreen;
+    }
+
+    /// A frame was shown that has not reached the screen yet.
+    pub fn isFramePending(w: *const MacWindow) bool {
+        return w.frame_pending;
     }
 
     /// Sets the title the window's title bar shows.
@@ -1289,7 +1314,9 @@ pub const MacDisplay = struct {
     /// The app was asked to quit (Quit in its menu, Command and Q).
     quit_requested: bool = false,
 
-    pub const platform: window.WindowPlatform = .macos;
+    pub fn platform(_: *const MacDisplay) window.WindowPlatform {
+        return .macos;
+    }
 
     /// A source, its CFFileDescriptor and run loop source, and whether its
     /// fd has been readable since it was last read.

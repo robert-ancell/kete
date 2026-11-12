@@ -310,6 +310,9 @@ test "what is drawn again on every page matches drawing it all, in buffers given
         back: usize = 0,
         rng: std.Random.DefaultPrng = .init(7),
 
+        pub fn size(win: *const @This()) [2]u32 {
+            return .{ win.width, win.height };
+        }
         pub fn beginSoftwareFrame(win: *@This()) !kete.gfx.software.Image {
             win.back = win.rng.random().uintLessThan(usize, win.pixels.len);
             return .{ .pixels = win.pixels[win.back], .width = w, .height = h };

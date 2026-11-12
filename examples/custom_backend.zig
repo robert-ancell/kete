@@ -42,6 +42,10 @@ const PictureWindow = struct {
     taken: std.ArrayList(kete.window.InputEvent) = .empty,
     closing: bool = false,
 
+    pub fn size(w: *const PictureWindow) [2]u32 {
+        return .{ w.width, w.height };
+    }
+
     pub fn beginSoftwareFrame(w: *PictureWindow) !kete.gfx.software.Image {
         return .{ .pixels = w.pixels, .width = w.width, .height = w.height };
     }

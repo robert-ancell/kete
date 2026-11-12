@@ -379,12 +379,25 @@ test "WindowUi automatically adds TitleBar when the toolkit draws the decoration
     defer u.destroy();
 
     const MockWaylandWin = struct {
-        pub const platform: window_mod.WindowPlatform = .wayland;
-        pub const buffer_transport: window_mod.WindowBufferTransport = .memory;
         title: []const u8 = "Kete Test",
-        decorations: window_mod.WindowDecorations = .toolkit,
+        drawn_by: window_mod.WindowDecorations = .toolkit,
         width: u32 = 800,
         height: u32 = 600,
+        pub fn platform(_: *const @This()) window_mod.WindowPlatform {
+            return .wayland;
+        }
+        pub fn bufferTransport(_: *const @This()) window_mod.WindowBufferTransport {
+            return .memory;
+        }
+        pub fn getTitle(self: *const @This()) []const u8 {
+            return self.title;
+        }
+        pub fn decorations(self: *const @This()) window_mod.WindowDecorations {
+            return self.drawn_by;
+        }
+        pub fn size(self: *const @This()) [2]u32 {
+            return .{ self.width, self.height };
+        }
     };
     var mock_win: MockWaylandWin = .{};
     var controls: WindowControls = .init(&mock_win);
@@ -412,7 +425,7 @@ test "WindowUi automatically adds TitleBar when the toolkit draws the decoration
 
     // When the system draws the decorations, TitleBar is not added.
     controls.close_requested = false;
-    mock_win.decorations = .system;
+    mock_win.drawn_by = .system;
     u.syncWindow(&mock_win);
     u.frame(800, 600, 1, Root{});
     try testing.expect(u.title_bar_root == null);
@@ -430,12 +443,25 @@ test "a window whose content is in its title bar has the buttons over it, report
     defer u.destroy();
 
     const MockWaylandWin = struct {
-        pub const platform: window_mod.WindowPlatform = .wayland;
-        pub const buffer_transport: window_mod.WindowBufferTransport = .memory;
         title: []const u8 = "Kete Test",
-        decorations: window_mod.WindowDecorations = .toolkit,
+        drawn_by: window_mod.WindowDecorations = .toolkit,
         width: u32 = 800,
         height: u32 = 600,
+        pub fn platform(_: *const @This()) window_mod.WindowPlatform {
+            return .wayland;
+        }
+        pub fn bufferTransport(_: *const @This()) window_mod.WindowBufferTransport {
+            return .memory;
+        }
+        pub fn getTitle(self: *const @This()) []const u8 {
+            return self.title;
+        }
+        pub fn decorations(self: *const @This()) window_mod.WindowDecorations {
+            return self.drawn_by;
+        }
+        pub fn size(self: *const @This()) [2]u32 {
+            return .{ self.width, self.height };
+        }
     };
     var mock_win: MockWaylandWin = .{};
     var controls: WindowControls = .init(&mock_win);
@@ -470,7 +496,7 @@ test "a window whose content is in its title bar has the buttons over it, report
 
     // Where the system draws the decorations, the content is not under them.
     controls.close_requested = false;
-    mock_win.decorations = .system;
+    mock_win.drawn_by = .system;
     u.syncWindow(&mock_win);
     u.frame(800, 600, 1, Root{});
     try testing.expect(u.title_bar_root == null);
@@ -489,13 +515,25 @@ test "the parts a window system draws over the content are reported, as the tool
     // A window like macOS's: its system draws the decorations, and its buttons
     // are over the content, in the top left corner.
     const MockMacWin = struct {
-        pub const platform: window_mod.WindowPlatform = .macos;
-        pub const buffer_transport: window_mod.WindowBufferTransport = .memory;
-        pub const decorations: window_mod.WindowDecorations = .system;
         title: []const u8 = "Kete Test",
         width: u32 = 800,
         height: u32 = 600,
         buttons: bool = true,
+        pub fn platform(_: *const @This()) window_mod.WindowPlatform {
+            return .macos;
+        }
+        pub fn bufferTransport(_: *const @This()) window_mod.WindowBufferTransport {
+            return .memory;
+        }
+        pub fn decorations(_: *const @This()) window_mod.WindowDecorations {
+            return .system;
+        }
+        pub fn getTitle(self: *const @This()) []const u8 {
+            return self.title;
+        }
+        pub fn size(self: *const @This()) [2]u32 {
+            return .{ self.width, self.height };
+        }
         pub fn cutouts(self: *const @This(), out: *[window_mod.max_cutouts]geometry.Rect) usize {
             if (!self.buttons) return 0;
             out[0] = .{ .x = 8, .y = 6, .w = 60, .h = 20 };
@@ -535,13 +573,23 @@ test "a long title ends in an ellipsis before the buttons, and the bar sets the 
     defer u.destroy();
 
     const MockWin = struct {
-        pub const platform: window_mod.WindowPlatform = .wayland;
         title: []const u8 = "A very long window title that cannot possibly fit in a narrow window",
-        decorations: window_mod.WindowDecorations = .toolkit,
         width: u32 = 300,
         height: u32 = 200,
         min_size: [2]u32 = .{ 0, 0 },
         minimized: u32 = 0,
+        pub fn platform(_: *const @This()) window_mod.WindowPlatform {
+            return .wayland;
+        }
+        pub fn decorations(_: *const @This()) window_mod.WindowDecorations {
+            return .toolkit;
+        }
+        pub fn getTitle(self: *const @This()) []const u8 {
+            return self.title;
+        }
+        pub fn size(self: *const @This()) [2]u32 {
+            return .{ self.width, self.height };
+        }
         pub fn setMaximized(_: *@This(), _: bool) void {}
         pub fn setMinimized(self: *@This()) void {
             self.minimized += 1;
@@ -593,11 +641,21 @@ test "a window that cannot be minimized has no minimize button" {
     const u = try WindowUi.createDefault(testing.allocator, testing.io);
     defer u.destroy();
     const MockWin = struct {
-        pub const platform: window_mod.WindowPlatform = .wayland;
         title: []const u8 = "Title",
-        decorations: window_mod.WindowDecorations = .toolkit,
         width: u32 = 400,
         height: u32 = 200,
+        pub fn platform(_: *const @This()) window_mod.WindowPlatform {
+            return .wayland;
+        }
+        pub fn decorations(_: *const @This()) window_mod.WindowDecorations {
+            return .toolkit;
+        }
+        pub fn getTitle(self: *const @This()) []const u8 {
+            return self.title;
+        }
+        pub fn size(self: *const @This()) [2]u32 {
+            return .{ self.width, self.height };
+        }
         pub fn setMaximized(_: *@This(), _: bool) void {}
         pub fn setMinimized(_: *@This()) void {}
         pub fn canMinimize(_: *const @This()) bool {

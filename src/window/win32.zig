@@ -175,7 +175,9 @@ pub const Win32Display = struct {
     /// The app was asked to quit (the session ending).
     quit_requested: bool = false,
 
-    pub const platform: window.WindowPlatform = .windows;
+    pub fn platform(_: *const Win32Display) window.WindowPlatform {
+        return .windows;
+    }
     const max_windows = 32;
 
     /// Ready to open windows (each monitor's own DPI told as it changes,
@@ -400,8 +402,12 @@ pub const Win32Window = struct {
         shown: bool = false,
     };
 
-    pub const platform: window.WindowPlatform = .windows;
-    pub const decorations: window.WindowDecorations = .system;
+    pub fn platform(_: *const Win32Window) window.WindowPlatform {
+        return .windows;
+    }
+    pub fn decorations(_: *const Win32Window) window.WindowDecorations {
+        return .system;
+    }
 
     pub const Options = struct {
         title: []const u8,
@@ -532,6 +538,22 @@ pub const Win32Window = struct {
 
     pub fn getTitle(w: *const Win32Window) []const u8 {
         return w.title_buf;
+    }
+
+    /// Whether closing it was asked for since the last call.
+    pub fn takeCloseRequest(w: *Win32Window) bool {
+        defer w.close_requested = false;
+        return w.close_requested;
+    }
+
+    /// Filling the screen (see `setMaximized`).
+    pub fn isMaximized(w: *const Win32Window) bool {
+        return w.maximized;
+    }
+
+    /// A frame was shown that has not reached the screen yet.
+    pub fn isFramePending(w: *const Win32Window) bool {
+        return w.frame_pending;
     }
 
     pub fn setTitle(w: *Win32Window, title: []const u8) void {

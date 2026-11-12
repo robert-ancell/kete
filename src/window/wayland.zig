@@ -622,7 +622,9 @@ pub const WaylandDisplay = struct {
     /// the session bus is not available or the portal does not respond).
     portal: ?*dbus.Connection = null,
 
-    pub const platform: window_mod.WindowPlatform = .wayland;
+    pub fn platform(_: *const WaylandDisplay) window_mod.WindowPlatform {
+        return .wayland;
+    }
 
     /// Connects to the compositor named in `environ` (`WAYLAND_DISPLAY`
     /// under `XDG_RUNTIME_DIR`), doing its I/O (and waiting) through `io`.
@@ -1534,7 +1536,9 @@ fn pointerButtonOf(code: u32) window_mod.PointerButton {
 }
 
 pub const WaylandWindow = struct {
-    pub const platform: window_mod.WindowPlatform = .wayland;
+    pub fn platform(_: *const WaylandWindow) window_mod.WindowPlatform {
+        return .wayland;
+    }
 
     pub fn usingDmabuf(w: *const WaylandWindow) bool {
         const dev_present = if (w.display) |d| d.dmabuf_dev != null else w.dmabuf_dev != null;
@@ -1616,6 +1620,52 @@ pub const WaylandWindow = struct {
 
     pub fn getTitle(w: *const WaylandWindow) []const u8 {
         return w.title_buf[0..w.title_len];
+    }
+
+    /// Its size, in logical pixels.
+    pub fn size(w: *const WaylandWindow) [2]u32 {
+        return .{ w.width, w.height };
+    }
+
+    /// How many buffer pixels there are to a logical one.
+    pub fn getScale(w: *const WaylandWindow) u32 {
+        return w.scale;
+    }
+
+    /// Whether closing it was asked for since the last call.
+    pub fn takeCloseRequest(w: *WaylandWindow) bool {
+        defer w.close_requested = false;
+        return w.close_requested;
+    }
+
+    /// Hidden: there is no point drawing.
+    pub fn isSuspended(w: *const WaylandWindow) bool {
+        return w.suspended;
+    }
+
+    /// Filling the screen (see `setMaximized`).
+    pub fn isMaximized(w: *const WaylandWindow) bool {
+        return w.maximized;
+    }
+
+    /// On the whole screen (see `setFullscreen`).
+    pub fn isFullscreen(w: *const WaylandWindow) bool {
+        return w.fullscreen;
+    }
+
+    /// Against the screen's edges or other windows: no shadow or rounded corners.
+    pub fn isTiled(w: *const WaylandWindow) bool {
+        return w.tiled;
+    }
+
+    /// A frame was shown that has not reached the screen yet.
+    pub fn isFramePending(w: *const WaylandWindow) bool {
+        return w.frame_pending;
+    }
+
+    /// The time between the display's refreshes (0 if unknown).
+    pub fn refreshNs(w: *const WaylandWindow) u64 {
+        return w.refresh_ns;
     }
 
     /// Sets the title the compositor shows (`getTitle` keeps the start of it).
@@ -2818,22 +2868,22 @@ pub const WaylandWindow = struct {
         // not given, on the first configure) two thirds of what the
         // compositor suggests for windows, or its minimum size.
         const own = [2]u32{ w.width, w.height };
-        var size: [2]u32 = undefined;
-        for (&size, 0..) |*side, i| {
+        var new_size: [2]u32 = undefined;
+        for (&new_size, 0..) |*side, i| {
             side.* = if (w.next_size[i] > 0) @intCast(w.next_size[i]) else if (own[i] > 0) own[i] else if (w.bounds[i] > 0) w.bounds[i] * 2 / 3 else @max(w.min_size[i], 1);
         }
         if (w.isFloating()) {
-            size[0] = @max(size[0], w.min_size[0]);
-            size[1] = @max(size[1], w.min_size[1]);
+            new_size[0] = @max(new_size[0], w.min_size[0]);
+            new_size[1] = @max(new_size[1], w.min_size[1]);
             // Not resized: its own size, whatever is suggested.
-            if (!w.resizable) size = .{ w.width, w.height };
+            if (!w.resizable) new_size = .{ w.width, w.height };
         }
         var m = try w.xdg_surface.request(p.xdg_surface.request.ack_configure);
         m.uint(serial).end();
-        if (size[0] == w.width and size[1] == w.height and !dec_changed) return null;
-        w.width = size[0];
-        w.height = size[1];
-        return size;
+        if (new_size[0] == w.width and new_size[1] == w.height and !dec_changed) return null;
+        w.width = new_size[0];
+        w.height = new_size[1];
+        return new_size;
     }
 
     /// Acquires a free `linux_dmabuf` (or `wl_shm` fallback) buffer of the
@@ -3268,20 +3318,20 @@ pub const WaylandWindow = struct {
 
     fn allocShmBuffer(w: *WaylandWindow, slot: *?Buffer, bw: u32, bh: u32, cw: u32, ch: u32, m_px: u32, s: u32, alpha: bool) !Buffer {
         const stride = bw * 4;
-        const size: usize = @as(usize, stride) * @as(usize, bh);
+        const bytes: usize = @as(usize, stride) * @as(usize, bh);
         const rc = linux.memfd_create("kete-shm", linux.MFD.CLOEXEC);
         if (linux.errno(rc) != .SUCCESS) return error.OutOfMemory;
         const fd: linux.fd_t = @intCast(rc);
         errdefer _ = linux.close(fd);
-        if (linux.errno(linux.ftruncate(fd, @intCast(size))) != .SUCCESS) return error.OutOfMemory;
-        const map_rc = linux.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+        if (linux.errno(linux.ftruncate(fd, @intCast(bytes))) != .SUCCESS) return error.OutOfMemory;
+        const map_rc = linux.mmap(null, bytes, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
         if (linux.errno(map_rc) != .SUCCESS) return error.OutOfMemory;
-        const pixels: []align(std.heap.page_size_min) u8 = @as([*]align(std.heap.page_size_min) u8, @ptrFromInt(map_rc))[0..size];
-        errdefer _ = linux.munmap(pixels.ptr, size);
+        const pixels: []align(std.heap.page_size_min) u8 = @as([*]align(std.heap.page_size_min) u8, @ptrFromInt(map_rc))[0..bytes];
+        errdefer _ = linux.munmap(pixels.ptr, bytes);
 
         const pool = try w.conn.newObject(null);
         var m = try w.shm.request(p.wl_shm.request.create_pool);
-        m.uint(pool.id).fd(fd).int(@intCast(size)).end();
+        m.uint(pool.id).fd(fd).int(@intCast(bytes)).end();
 
         const proxy = try w.conn.newObject(.{ .ptr = slot, .handler = bufferEvent });
         m = try pool.request(p.wl_shm_pool.request.create_buffer);
@@ -3742,8 +3792,8 @@ pub const WaylandWindow = struct {
                 const fd = r.fd() catch return;
                 defer _ = linux.close(fd);
                 _ = r.uint() catch return;
-                const size = r.uint() catch return;
-                if (keymapFrom(w.gpa, fd, size)) |km| {
+                const keymap_size = r.uint() catch return;
+                if (keymapFrom(w.gpa, fd, keymap_size)) |km| {
                     if (w.keymap) |*old| old.deinit();
                     w.keymap = km;
                     w.xkb_state = .{};

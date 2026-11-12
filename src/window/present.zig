@@ -94,6 +94,9 @@ test "a frame is drawn where its buffer's age says, and what changed is shown" {
         shown: [4]Viewport = undefined,
         shown_len: usize = 0,
 
+        pub fn size(win: *const @This()) [2]u32 {
+            return .{ win.width, win.height };
+        }
         pub fn beginSoftwareFrame(win: *@This()) !gfx.software.Image {
             return .{ .pixels = &win.pixels, .width = w, .height = h };
         }

@@ -678,61 +678,81 @@ pub const Window = struct {
         prefersDark: ?*const fn (ptr: *anyopaque) ?bool = null,
     };
 
+    /// What a window says with methods, by the fields a window might keep
+    /// it in: a window with one of these fields and not its method has
+    /// forgotten the method, and `of` does not build (it would read as the
+    /// default: not maximized, say).
+    const state_methods = [_]struct { []const u8, []const u8 }{
+        .{ "platform", "platform" },
+        .{ "buffer_transport", "bufferTransport" },
+        .{ "buffer_sync", "bufferSync" },
+        .{ "frame_sync", "frameSync" },
+        .{ "refresh_ns", "refreshNs" },
+        .{ "decorations", "decorations" },
+        .{ "title", "getTitle" },
+        .{ "width", "size" },
+        .{ "height", "size" },
+        .{ "scale", "getScale" },
+        .{ "close_requested", "takeCloseRequest" },
+        .{ "suspended", "isSuspended" },
+        .{ "maximized", "isMaximized" },
+        .{ "fullscreen", "isFullscreen" },
+        .{ "tiled", "isTiled" },
+        .{ "frame_pending", "isFramePending" },
+        .{ "clipboard", "copy" },
+        .{ "clipboard", "paste" },
+    };
+
+    fn checkStateMethods(T: type) void {
+        for (state_methods) |sm| {
+            if (@hasField(T, sm[0]) and !@hasDecl(T, sm[1]))
+                @compileError(@typeName(T) ++ " has a `" ++ sm[0] ++ "` field but no `" ++ sm[1] ++ "` method: Window.of reads only methods");
+        }
+    }
+
     /// `win` as a `Window`: either one already, or a pointer to a type
     /// `of` takes.
     pub fn from(win: anytype) Window {
         return if (@TypeOf(win) == Window) win else of(win);
     }
 
-    /// A `Window` for any backend: `impl` is a pointer to a struct that has
-    /// what it supports as declarations (`poll`, `beginSoftwareFrame`, ...) or fields
-    /// (`width`, `height`, ...). What it leaves out gets a default (no input,
-    /// not maximized, no popups, ...), and it must outlive the `Window`.
+    /// A `Window` for any backend: `impl` is a pointer to a struct with a
+    /// method for each thing it supports (`size`, `poll`, `isMaximized`,
+    /// `beginSoftwareFrame`, ...); `size` is the one it must have. What it
+    /// leaves out gets a default (no input, not maximized, no popups, ...).
+    /// It must outlive the `Window`.
     pub fn of(impl: anytype) Window {
         const Ptr = @TypeOf(impl);
         const T = @typeInfo(Ptr).pointer.child;
+        comptime checkStateMethods(T);
         const gen = struct {
             fn self(p: *anyopaque) *T {
                 return @ptrCast(@alignCast(p));
             }
             fn platformFn(p: *anyopaque) WindowPlatform {
-                if (@hasDecl(T, "platform")) {
-                    if (@TypeOf(T.platform) == WindowPlatform) return T.platform;
-                    return self(p).platform();
-                }
-                if (@hasField(T, "platform")) return self(p).platform;
+                if (@hasDecl(T, "platform")) return self(p).platform();
                 return .custom;
             }
             fn bufferTransportFn(p: *anyopaque) WindowBufferTransport {
                 if (@hasDecl(T, "bufferTransport")) return self(p).bufferTransport();
-                if (@hasDecl(T, "buffer_transport")) return T.buffer_transport;
-                if (@hasField(T, "buffer_transport")) return self(p).buffer_transport;
                 return .custom;
             }
             fn bufferSyncFn(p: *anyopaque) WindowBufferSync {
                 if (@hasDecl(T, "bufferSync")) return self(p).bufferSync();
-                if (@hasField(T, "buffer_sync")) return self(p).buffer_sync;
                 return .none;
             }
             fn frameSyncFn(p: *anyopaque) WindowFrameSync {
                 if (@hasDecl(T, "frameSync")) return self(p).frameSync();
-                if (@hasField(T, "frame_sync")) return self(p).frame_sync;
                 return .{};
             }
             fn refreshHzFn(p: *anyopaque) f32 {
                 if (@hasDecl(T, "refreshHz")) return self(p).refreshHz();
-                if (@hasField(T, "refresh_ns")) {
-                    const r = self(p).refresh_ns;
-                    if (r > 0) return @as(f32, @floatFromInt(std.time.ns_per_s)) / @as(f32, @floatFromInt(r));
-                }
+                const r = refreshNsFn(p);
+                if (r > 0) return @as(f32, @floatFromInt(std.time.ns_per_s)) / @as(f32, @floatFromInt(r));
                 return 0.0;
             }
             fn decorationsFn(p: *anyopaque) WindowDecorations {
-                if (@hasDecl(T, "decorations")) {
-                    if (@TypeOf(T.decorations) == WindowDecorations) return T.decorations;
-                    return self(p).decorations();
-                }
-                if (@hasField(T, "decorations")) return self(p).decorations;
+                if (@hasDecl(T, "decorations")) return self(p).decorations();
                 return switch (platformFn(p)) {
                     .wayland => .toolkit,
                     .headless => .none,
@@ -741,7 +761,6 @@ pub const Window = struct {
             }
             fn titleFn(p: *anyopaque) []const u8 {
                 if (@hasDecl(T, "getTitle")) return self(p).getTitle();
-                if (@hasField(T, "title")) return self(p).title;
                 return "";
             }
             fn setTitleFn(p: *anyopaque, text: []const u8) void {
@@ -758,48 +777,34 @@ pub const Window = struct {
                 return &.{};
             }
             fn sizeFn(p: *anyopaque) [2]u32 {
-                const s = self(p);
-                if (@hasDecl(T, "size")) return s.size();
-                return .{ s.width, s.height };
+                return self(p).size();
             }
             fn scaleFn(p: *anyopaque) u32 {
-                const s = self(p);
-                if (@hasDecl(T, "getScale")) return s.getScale();
-                if (@hasField(T, "scale")) return s.scale;
+                if (@hasDecl(T, "getScale")) return self(p).getScale();
                 return 1;
             }
             fn takeCloseRequestFn(p: *anyopaque) bool {
-                const s = self(p);
-                if (@hasDecl(T, "takeCloseRequest")) return s.takeCloseRequest();
-                if (@hasField(T, "close_requested")) {
-                    defer s.close_requested = false;
-                    return s.close_requested;
-                }
+                if (@hasDecl(T, "takeCloseRequest")) return self(p).takeCloseRequest();
                 return false;
             }
             fn isSuspendedFn(p: *anyopaque) bool {
-                const s = self(p);
-                if (@hasField(T, "suspended")) return s.suspended;
+                if (@hasDecl(T, "isSuspended")) return self(p).isSuspended();
                 return false;
             }
             fn isMaximizedFn(p: *anyopaque) bool {
-                const s = self(p);
-                if (@hasField(T, "maximized")) return s.maximized;
+                if (@hasDecl(T, "isMaximized")) return self(p).isMaximized();
                 return false;
             }
             fn isFullscreenFn(p: *anyopaque) bool {
-                const s = self(p);
-                if (@hasField(T, "fullscreen")) return s.fullscreen;
+                if (@hasDecl(T, "isFullscreen")) return self(p).isFullscreen();
                 return false;
             }
             fn isTiledFn(p: *anyopaque) bool {
-                const s = self(p);
-                if (@hasField(T, "tiled")) return s.tiled;
+                if (@hasDecl(T, "isTiled")) return self(p).isTiled();
                 return false;
             }
             fn isFramePendingFn(p: *anyopaque) bool {
-                const s = self(p);
-                if (@hasField(T, "frame_pending")) return s.frame_pending;
+                if (@hasDecl(T, "isFramePending")) return self(p).isFramePending();
                 return false;
             }
             fn setCursorFn(p: *anyopaque, cursor: PointerCursor) void {
@@ -876,7 +881,6 @@ pub const Window = struct {
             }
             fn refreshNsFn(p: *anyopaque) u64 {
                 if (@hasDecl(T, "refreshNs")) return self(p).refreshNs();
-                if (@hasField(T, "refresh_ns")) return self(p).refresh_ns;
                 return 0;
             }
             fn applyConfigureFn(p: *anyopaque) anyerror!?[2]u32 {
@@ -938,12 +942,10 @@ pub const Window = struct {
                 if (@hasDecl(T, "close")) self(p).close();
             }
             fn copyFn(p: *anyopaque, text: []const u8) void {
-                const s = self(p);
-                if (@hasDecl(T, "copy")) s.copy(text) else if (@hasField(T, "clipboard")) s.clipboard.copy(text);
+                if (@hasDecl(T, "copy")) self(p).copy(text);
             }
             fn pasteFn(p: *anyopaque, sink: clipboard.Sink) void {
-                const s = self(p);
-                if (@hasDecl(T, "paste")) s.paste(sink) else if (@hasField(T, "clipboard")) s.clipboard.paste(sink);
+                if (@hasDecl(T, "paste")) self(p).paste(sink);
             }
             fn prefersDarkFn(p: *anyopaque) ?bool {
                 return self(p).prefersDark();
@@ -1006,8 +1008,8 @@ pub const Window = struct {
                 .popupPosition = popupPositionFn,
                 .beginSoftwarePopupFrame = beginSoftwarePopupFrameFn,
                 .showPopup = showPopupFn,
-                .copy = if (@hasDecl(T, "copy") or @hasField(T, "clipboard")) copyFn else null,
-                .paste = if (@hasDecl(T, "paste") or @hasField(T, "clipboard")) pasteFn else null,
+                .copy = if (@hasDecl(T, "copy")) copyFn else null,
+                .paste = if (@hasDecl(T, "paste")) pasteFn else null,
                 .prefersDark = if (@hasDecl(T, "prefersDark")) prefersDarkFn else null,
             };
         };
@@ -1374,8 +1376,8 @@ pub const Display = struct {
         close: *const fn (ptr: *anyopaque) void,
     };
 
-    /// A `Display` for any backend: `impl` is a pointer to a struct that has
-    /// what it supports as declarations (`openWindow`, `wait`, `poll`,
+    /// A `Display` for any backend: `impl` is a pointer to a struct with a
+    /// method for each thing it supports (`openWindow`, `wait`, `poll`,
     /// `watch`, `takeQuitRequest`, `close`, `platform`). Its `openWindow`
     /// takes its windows' own options (those of `WindowOptions` it has are
     /// filled in), and returns a pointer to one of them.
@@ -1385,8 +1387,8 @@ pub const Display = struct {
             fn self(p: *anyopaque) *T {
                 return @ptrCast(@alignCast(p));
             }
-            fn platformFn(_: *anyopaque) WindowPlatform {
-                if (@hasDecl(T, "platform")) return T.platform;
+            fn platformFn(p: *anyopaque) WindowPlatform {
+                if (@hasDecl(T, "platform")) return self(p).platform();
                 return .custom;
             }
             const open_fn = if (@hasDecl(T, "openWindow")) @typeInfo(@TypeOf(T.openWindow)).@"fn" else undefined;
@@ -1714,12 +1716,16 @@ test "a display opens its windows with their own options, on it" {
     const Win = struct {
         const Win = @This();
         title: []const u8,
-        size: [2]u32,
+        opened_size: [2]u32,
         parent: ?*Win,
         closed: bool = false,
-        width: u32 = 1,
-        height: u32 = 1,
 
+        pub fn getTitle(w: *const @This()) []const u8 {
+            return w.title;
+        }
+        pub fn size(w: *const @This()) [2]u32 {
+            return w.opened_size;
+        }
         pub const Options = struct {
             title: []const u8,
             size: [2]u32 = .{ 100, 50 },
@@ -1735,7 +1741,7 @@ test "a display opens its windows with their own options, on it" {
         waited: u64 = 0,
 
         pub fn openWindow(d: *@This(), o: Win.Options) !*Win {
-            d.windows[d.len] = .{ .title = o.title, .size = o.size, .parent = o.parent };
+            d.windows[d.len] = .{ .title = o.title, .opened_size = o.size, .parent = o.parent };
             d.len += 1;
             return &d.windows[d.len - 1];
         }
@@ -1750,8 +1756,8 @@ test "a display opens its windows with their own options, on it" {
     const a = try d.openWindow(.{ .title = "a" });
     const b = try d.openWindow(.{ .title = "b", .size = .{ 30, 20 }, .parent = a });
     try testing.expectEqualStrings("a", impl.windows[0].title);
-    try testing.expectEqual([2]u32{ 100, 50 }, impl.windows[0].size);
-    try testing.expectEqual([2]u32{ 30, 20 }, impl.windows[1].size);
+    try testing.expectEqual([2]u32{ 100, 50 }, impl.windows[0].opened_size);
+    try testing.expectEqual([2]u32{ 30, 20 }, impl.windows[1].opened_size);
     try testing.expectEqual(&impl.windows[0], impl.windows[1].parent.?);
     try testing.expectEqual(&impl.windows[1], b.as(Win).?);
     try d.wait(5);
@@ -1759,7 +1765,11 @@ test "a display opens its windows with their own options, on it" {
     try testing.expect(!d.takeQuitRequest());
 
     // A parent from elsewhere is not one of its windows.
-    var other: struct { width: u32 = 1, height: u32 = 1 } = .{};
+    var other: struct {
+        pub fn size(_: *const @This()) [2]u32 {
+            return .{ 1, 1 };
+        }
+    } = .{};
     try testing.expectError(error.ParentNotOnDisplay, d.openWindow(.{ .title = "c", .parent = .of(&other) }));
 
     // A window of its own waits for itself.
@@ -1793,4 +1803,23 @@ test {
             _ = macos;
         },
     }
+}
+
+test "a window's state is read from its methods" {
+    const Win = struct {
+        maximized: bool = true,
+        pub fn size(_: *const @This()) [2]u32 {
+            return .{ 1, 1 };
+        }
+        pub fn isMaximized(w: *const @This()) bool {
+            return w.maximized;
+        }
+    };
+    var win: Win = .{};
+    const w = Window.of(&win);
+    try std.testing.expect(w.isMaximized());
+    win.maximized = false;
+    try std.testing.expect(!w.isMaximized());
+    // What it has no method for has its default.
+    try std.testing.expect(!w.isFullscreen());
 }
