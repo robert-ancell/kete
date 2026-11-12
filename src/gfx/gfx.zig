@@ -15,6 +15,19 @@
 //!     _ = canvas.drawText(&atlas, .{ .font = &fira, .size = 16 }, 16, 120, "Hello", .rgb(0x1d1b20));
 //!     try software.render(&canvas, img);
 
+/// Whether kete was built with its own backends (`-Dbackends`, on by
+/// default): without them, the GPU renderers here (`VulkanRenderer`,
+/// `OpenGlRenderer`, `MetalRenderer`, `D3D11Renderer` and their contexts)
+/// are not, and frames are drawn by `SoftwareRenderer` or a `Renderer` of
+/// the app's own.
+pub const has_backends = @import("kete_options").backends;
+
+/// A backend kete was built without (`-Dbackends=false`): naming it is an
+/// error.
+pub fn Unbuilt(comptime name: []const u8) type {
+    @compileError(name ++ " is one of kete's own backends, which it was built without (-Dbackends=false)");
+}
+
 pub const geometry = @import("geometry.zig");
 pub const dash = @import("dash.zig");
 pub const Dash = dash.Dash;
@@ -59,14 +72,14 @@ pub const RenderBackend = renderer.RenderBackend;
 pub const Renderer = renderer.Renderer;
 pub const Frame = frame.Frame;
 pub const SoftwareRenderer = software.SoftwareRenderer;
-pub const OpenGlRenderer = opengl.OpenGlRenderer;
-pub const OpenGlContext = opengl.OffscreenContext;
-pub const VulkanRenderer = vulkan.VulkanRenderer;
-pub const VulkanContext = vulkan.OffscreenContext;
-pub const MetalRenderer = metal.MetalRenderer;
-pub const MetalContext = metal.OffscreenContext;
-pub const D3D11Renderer = d3d11.D3D11Renderer;
-pub const D3D11Context = d3d11.OffscreenContext;
+pub const OpenGlRenderer = if (has_backends) opengl.OpenGlRenderer else Unbuilt("OpenGlRenderer");
+pub const OpenGlContext = if (has_backends) opengl.OffscreenContext else Unbuilt("OpenGlContext");
+pub const VulkanRenderer = if (has_backends) vulkan.VulkanRenderer else Unbuilt("VulkanRenderer");
+pub const VulkanContext = if (has_backends) vulkan.OffscreenContext else Unbuilt("VulkanContext");
+pub const MetalRenderer = if (has_backends) metal.MetalRenderer else Unbuilt("MetalRenderer");
+pub const MetalContext = if (has_backends) metal.OffscreenContext else Unbuilt("MetalContext");
+pub const D3D11Renderer = if (has_backends) d3d11.D3D11Renderer else Unbuilt("D3D11Renderer");
+pub const D3D11Context = if (has_backends) d3d11.OffscreenContext else Unbuilt("D3D11Context");
 pub const D3D11Target = renderer.D3D11Target;
 pub const DrmNode = renderer.DrmNode;
 

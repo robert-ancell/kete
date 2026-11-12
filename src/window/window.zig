@@ -29,11 +29,16 @@ pub const wayland = @import("wayland.zig");
 
 pub const Clipboard = clipboard.Clipboard;
 pub const DroppedData = clipboard.DroppedData;
-pub const WaylandWindow = wayland.WaylandWindow;
+/// Whether kete was built with its own window backends (`-Dbackends`, on
+/// by default): without them, `WaylandWindow`, `MacWindow`, `Win32Window`
+/// (and their displays, and `NativeWindow` and `NativeDisplay`) are not,
+/// and an app's windows are of a backend of its own (`Display.of`).
+pub const has_backends = gfx.has_backends;
+pub const WaylandWindow = if (has_backends) wayland.WaylandWindow else gfx.Unbuilt("WaylandWindow");
 pub const macos = @import("macos.zig");
-pub const MacWindow = macos.MacWindow;
+pub const MacWindow = if (has_backends) macos.MacWindow else gfx.Unbuilt("MacWindow");
 pub const win32 = @import("win32.zig");
-pub const Win32Window = win32.Win32Window;
+pub const Win32Window = if (has_backends) win32.Win32Window else gfx.Unbuilt("Win32Window");
 /// The window backend for the system being built for: AppKit's on macOS,
 /// Win32's on Windows, Wayland's elsewhere.
 pub const NativeWindow = switch (@import("builtin").os.tag) {
@@ -41,9 +46,9 @@ pub const NativeWindow = switch (@import("builtin").os.tag) {
     .windows => Win32Window,
     else => WaylandWindow,
 };
-pub const WaylandDisplay = wayland.WaylandDisplay;
-pub const MacDisplay = macos.MacDisplay;
-pub const Win32Display = win32.Win32Display;
+pub const WaylandDisplay = if (has_backends) wayland.WaylandDisplay else gfx.Unbuilt("WaylandDisplay");
+pub const MacDisplay = if (has_backends) macos.MacDisplay else gfx.Unbuilt("MacDisplay");
+pub const Win32Display = if (has_backends) win32.Win32Display else gfx.Unbuilt("Win32Display");
 /// The display for the system being built for (that `NativeWindow`s are
 /// opened on).
 pub const NativeDisplay = switch (@import("builtin").os.tag) {

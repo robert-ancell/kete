@@ -123,10 +123,10 @@ pub const SharedResources = struct {
     /// Icons are drawn with it (see `Icon`).
     icon_font: font.Font,
     atlas: gfx.Atlas,
-    vulkan_renderer: ?gfx.VulkanRenderer = null,
-    opengl_renderer: ?gfx.OpenGlRenderer = null,
-    metal_renderer: ?gfx.MetalRenderer = null,
-    d3d11_renderer: ?gfx.D3D11Renderer = null,
+    vulkan_renderer: ?(if (gfx.has_backends) gfx.VulkanRenderer else void) = null,
+    opengl_renderer: ?(if (gfx.has_backends) gfx.OpenGlRenderer else void) = null,
+    metal_renderer: ?(if (gfx.has_backends) gfx.MetalRenderer else void) = null,
+    d3d11_renderer: ?(if (gfx.has_backends) gfx.D3D11Renderer else void) = null,
     software_renderer: gfx.SoftwareRenderer = .{},
     renderer: ?gfx.Renderer = null,
     owns_renderer: bool = false,
@@ -150,8 +150,8 @@ pub const SharedResources = struct {
     /// What the app's windows share, with the given `font` (`null` for no
     /// text font; icons still use the bundled Material Icons font). The
     /// renderer is the Metal one (on macOS), the Direct3D 11 one (on
-    /// Windows), or the Vulkan one, then OpenGL (elsewhere), or else the
-    /// software one.
+    /// Windows), or the Vulkan one, then OpenGL (elsewhere), or else (or
+    /// if kete was built without its own backends) the software one.
     pub fn create(gpa: std.mem.Allocator, io: std.Io, f: ?*const font.Font) !*SharedResources {
         const s = try gpa.create(SharedResources);
         errdefer gpa.destroy(s);
@@ -163,7 +163,9 @@ pub const SharedResources = struct {
             .icon_font = try font.Font.init(@import("icons").font_data),
             .atlas = try gfx.Atlas.init(gpa),
         };
-        if (comptime builtin.os.tag == .macos) {
+        if (comptime !gfx.has_backends) {
+            s.renderer = s.software_renderer.renderer();
+        } else if (comptime builtin.os.tag == .macos) {
             if (gfx.MetalRenderer.initDefault(gpa)) |mtl| {
                 s.metal_renderer = mtl;
                 s.renderer = s.metal_renderer.?.renderer();
@@ -268,6 +270,7 @@ pub const SharedResources = struct {
     /// start, before any window is opened, and stays while the renderer
     /// does. It may be called from any thread.
     pub fn gpuDevice(s: *const SharedResources) ?gfx.GpuDevice {
+        if (comptime !gfx.has_backends) return null;
         const r = s.renderer orelse return null;
         if (s.vulkan_renderer) |*x| if (r.ptr == @as(*const anyopaque, @ptrCast(x))) return .{ .vulkan = x.sharedDevice() orelse return null };
         if (s.opengl_renderer) |*x| if (r.ptr == @as(*const anyopaque, @ptrCast(x))) return .{ .opengl = x.sharedDisplay() orelse return null };
@@ -651,7 +654,7 @@ pub const WindowUi = struct {
     /// The Wayland extensions `w` uses, if it is a Wayland window.
     fn waylandExtensionsOf(w: window_mod.Window) []const []const u8 {
         // There is no Wayland backend to be on Windows.
-        if (comptime builtin.os.tag == .windows) return &.{};
+        if (comptime builtin.os.tag == .windows or !gfx.has_backends) return &.{};
         const wl = w.as(window_mod.WaylandWindow) orelse return &.{};
         return wl.waylandExtensions();
     }
@@ -2055,11 +2058,15 @@ pub const App = struct {
 
     /// Makes an app with no windows yet (opened by `openWindow`): on the
     /// system's display (connecting to the Wayland compositor in
-    /// `environ`, on Linux; AppKit, on macOS), unless `options` gives one.
-    /// It does its I/O through `io`.
+    /// `environ`, on Linux; AppKit, on macOS), unless `options` gives one
+    /// (which it must, `error.NoDisplay`, if kete was built without its own
+    /// backends). It does its I/O through `io`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, environ: std.process.Environ, options: Options) !*App {
         const owns_display = options.display == null;
-        const display: window_mod.Display = options.display orelse .of(try window_mod.NativeDisplay.open(gpa, io, environ));
+        const display: window_mod.Display = options.display orelse if (comptime gfx.has_backends)
+            .of(try window_mod.NativeDisplay.open(gpa, io, environ))
+        else
+            return error.NoDisplay;
         errdefer if (owns_display) display.close();
         const shared = if (options.font_data) |data| try SharedResources.createWithFontData(gpa, io, data) else try SharedResources.createDefault(gpa, io);
         errdefer shared.destroy();

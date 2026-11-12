@@ -30,6 +30,8 @@ const kete_dep = b.dependency("kete", .{ .target = target, .optimize = optimize 
 exe.root_module.addImport("kete", kete_dep.module("kete"));
 ```
 
+To give your app its own window and render backends (SDL, a framebuffer, a game engine) instead of Kete's, pass `.backends = false`: Kete then needs nothing of the system, not even libc (see [examples/custom_backend.zig](examples/custom_backend.zig)).
+
 Then build your UI in `src/main.zig`:
 
 ```zig

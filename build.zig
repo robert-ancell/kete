@@ -200,6 +200,18 @@ fn findFxc(b: *std.Build) ?[]const u8 {
     return S.found;
 }
 
+/// The GPU renderers' shaders, embedded in `gfx`: SPIR-V for Vulkan and
+/// OpenGL, and DXBC for Direct3D 11 (on Windows).
+fn addGpuShaders(b: *std.Build, gfx: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag == .windows) addCanvasDxbc(b, gfx);
+    for ([_][]const u8{ "shape", "solid", "text", "image", "window" }) |shader_name| {
+        const spv = addSpirv(b, shader_name, b.fmt("src/gfx/shaders/{s}.zig", .{shader_name}), .vulkan);
+        gfx.addAnonymousImport(b.fmt("{s}.spv", .{shader_name}), .{ .root_source_file = spv });
+        const gl_spv = addSpirv(b, b.fmt("{s}_gl", .{shader_name}), b.fmt("src/gfx/shaders/{s}.zig", .{shader_name}), .opengl);
+        gfx.addAnonymousImport(b.fmt("{s}_gl.spv", .{shader_name}), .{ .root_source_file = gl_spv });
+    }
+}
+
 pub const Modules = struct {
     kete: *std.Build.Module,
     ui: *std.Build.Module,
@@ -210,13 +222,30 @@ pub const Modules = struct {
     wayland: *std.Build.Module,
 };
 
+/// What `createModules` builds kete with.
+pub const ModuleOptions = struct {
+    /// Whether kete has its own window and render backends (Wayland,
+    /// AppKit and Win32 windows; Vulkan, OpenGL, Metal and Direct3D 11
+    /// renderers, and the widgets drawing with them). Without them it
+    /// needs nothing of the system (not even libc, and not fxc to build
+    /// for Windows): the app gives `App.init` a `window.Display` of its
+    /// own, and draws with the software renderer or a `gfx.Renderer` of
+    /// its own.
+    backends: bool = true,
+};
+
 pub fn createModules(
     b: *std.Build,
     name: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
     icon_font: IconFont,
+    options: ModuleOptions,
 ) Modules {
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "backends", options.backends);
+    const kete_options = build_options.createModule();
+
     const wayland = b.createModule(.{
         .root_source_file = b.path("src/wayland/wayland.zig"),
         .target = target,
@@ -255,24 +284,19 @@ pub fn createModules(
         .root_source_file = b.path("src/gfx/gfx.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
+        .link_libc = options.backends,
         .imports = &.{
             .{ .name = "font", .module = font },
+            .{ .name = "kete_options", .module = kete_options },
         },
     });
-    if (target.result.os.tag == .windows) addCanvasDxbc(b, gfx);
-    for ([_][]const u8{ "shape", "solid", "text", "image", "window" }) |shader_name| {
-        const spv = addSpirv(b, shader_name, b.fmt("src/gfx/shaders/{s}.zig", .{shader_name}), .vulkan);
-        gfx.addAnonymousImport(b.fmt("{s}.spv", .{shader_name}), .{ .root_source_file = spv });
-        const gl_spv = addSpirv(b, b.fmt("{s}_gl", .{shader_name}), b.fmt("src/gfx/shaders/{s}.zig", .{shader_name}), .opengl);
-        gfx.addAnonymousImport(b.fmt("{s}_gl.spv", .{shader_name}), .{ .root_source_file = gl_spv });
-    }
+    if (options.backends) addGpuShaders(b, gfx, target);
 
     const window = b.createModule(.{
         .root_source_file = b.path("src/window/window.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
+        .link_libc = options.backends,
         .imports = &.{
             .{ .name = "wayland", .module = wayland },
             .{ .name = "gfx", .module = gfx },
@@ -319,7 +343,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const icon_font = addIconFont(b);
-    const mods = createModules(b, "kete", target, optimize, icon_font);
+    const backends = b.option(bool, "backends", "Build kete's own window and render backends (default); without them it needs nothing of the system, and the app gives its own") orelse true;
+    const mods = createModules(b, "kete", target, optimize, icon_font, .{ .backends = backends });
     const polyhedron_gl_spv = addSpirv(b, "polyhedron_gl", "examples/shaders/polyhedron.zig", .opengl);
     const polyhedron_vk_spv = addSpirv(b, "polyhedron_vk", "examples/shaders/polyhedron.zig", .vulkan);
 
@@ -335,6 +360,8 @@ pub fn build(b: *std.Build) void {
         /// HLSL compiled to DXBC (on Windows), embedded as `<name>_vs.dxbc`
         /// and `<name>_ps.dxbc`: its source, and its two entry points.
         hlsl: ?struct { name: []const u8, source: []const u8 } = null,
+        /// Built without kete's own backends too (it has its own).
+        own_backend: bool = false,
     }{
         .{ .name = "hello", .source = "examples/hello.zig", .desc = "Run the interactive counter example" },
         .{ .name = "navigation", .source = "examples/navigation.zig", .desc = "Run the inbox navigation, dialog, and snackbar example" },
@@ -343,6 +370,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "canvas", .source = "examples/canvas_and_qr.zig", .desc = "Run the animated wave viewer and QR code generator example" },
         .{ .name = "fetch", .source = "examples/fetch.zig", .desc = "Run the example fetching over HTTP in the background on the app's std.Io" },
         .{ .name = "windows", .source = "examples/windows.zig", .desc = "Run the example with more than one window" },
+        .{ .name = "custom-backend", .source = "examples/custom_backend.zig", .desc = "Run the example with a window backend of its own, saving custom_backend.png", .own_backend = true },
         .{ .name = "opengl", .source = "examples/opengl.zig", .desc = "Run the OpenGL 3D Platonic solid viewer example", .polyhedron_spv = polyhedron_gl_spv, .not_windows = true },
         .{ .name = "vulkan", .source = "examples/vulkan.zig", .desc = "Run the Vulkan 3D Platonic solid viewer example", .polyhedron_spv = polyhedron_vk_spv, .not_windows = true },
         .{ .name = "metal", .source = "examples/metal.zig", .desc = "Run the Metal 3D Platonic solid viewer example (macOS)", .not_windows = true },
@@ -355,6 +383,7 @@ pub fn build(b: *std.Build) void {
     for (examples) |ex| {
         const windows = target.result.os.tag == .windows;
         if (ex.not_windows and windows or ex.only_windows and !windows) continue;
+        if (!backends and !ex.own_backend) continue;
         const mod = b.createModule(.{
             .root_source_file = b.path(ex.source),
             .target = target,
@@ -379,6 +408,10 @@ pub fn build(b: *std.Build) void {
         const ex_test = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(ex_test).step);
     }
+
+    // Without its own backends, kete builds only what has its own (the
+    // tools, the website and the module tests use them).
+    if (!backends) return;
 
     // Tools: one reporting the backends kete picks on this system, and a
     // tour of every widget.

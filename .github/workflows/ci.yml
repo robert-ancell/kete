@@ -1,5 +1,6 @@
 # Checks the Zig code is formatted (`zig fmt`), builds kete, its examples
-# and tools, and runs its tests, on Linux, macOS and Windows, and publishes
+# and tools, and runs its tests, on Linux, macOS and Windows (and again
+# without kete's own backends, with only an app's own), and publishes
 # the website (its page, images and the API reference) to GitHub Pages on
 # main. Each builds for itself (kete is not cross-compiled): on Windows its
 # Direct3D 11 shaders are compiled by the Windows SDK's fxc.
@@ -43,6 +44,8 @@ jobs:
         run: zig build examples --summary all
       - name: Test
         run: zig build test --summary all
+      - name: Build and test without kete's own backends
+        run: zig build examples test -Dbackends=false --summary all
 
   site:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
