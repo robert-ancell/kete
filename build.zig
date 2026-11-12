@@ -54,11 +54,18 @@ pub fn addIconFont(b: *std.Build) IconFont {
 }
 
 /// Returns an `IconFont` subsetted to only the icons referenced in the given
-/// source directories, by scanning for two unambiguous patterns:
+/// source directories, by scanning for patterns unambiguous about the type
+/// (see `tools/scan_icons.zig`):
 ///
 ///   1. `IconName.name` — explicit type qualification.
-///   2. `.icon = .name`, `.leading_icon = .name`, `.trailing_icon = .name` —
-///      enum inference on known `IconName`-typed fields.
+///   2. `.icon = <expr>`, `.leading_icon = <expr>`, `.trailing_icon = <expr>`
+///      — enum inference on known `IconName`-typed fields.
+///   3. `x: ?IconName = <expr>` — a declaration of the type.
+///   4. `[_]IconName{ .a, .b }` — a list of them.
+///
+/// In 2 and 3 every `.name` in the expression counts (`if (on) .a else .b`).
+/// An icon missed is a compile error (`IconName` has no such member), not a
+/// blank icon, unless it is chosen at run time by name (`IconName.fromName`).
 ///
 /// Kete's own `src/` directory is always scanned in addition to `scan_dirs`,
 /// so icons used internally by kete (e.g. `.expand_more` in the dropdown) are
@@ -548,4 +555,10 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{ .root_module = m });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+    // The icon scanner (`addIconFontScanned`), which runs on the host.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/scan_icons.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) })).step);
 }

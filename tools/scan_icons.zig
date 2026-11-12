@@ -1,11 +1,18 @@
 //! Scans Zig source files for `IconName` references and generates a subset
 //! `names.zig` containing only the icons actually used.
 //!
-//! Two patterns are recognised (both unambiguous about the type):
+//! Three patterns are recognised (all unambiguous about the type):
 //!
 //!   1. `IconName.name` — explicit type qualification.
-//!   2. `.field = .name` — enum inference when `field` is a known `IconName`-
+//!   2. `.field = <expr>` — enum inference when `field` is a known `IconName`-
 //!      typed field: `icon`, `leading_icon`, `trailing_icon`.
+//!   3. `name: ?IconName = <expr>` — a declaration of type `IconName` (or
+//!      `?IconName`, however qualified).
+//!
+//!   4. `[_]IconName{ .name, ... }` — a list of them.
+//!
+//! In 2 and 3 every `.name` in the expression counts, so choices such as
+//! `if (on) .visibility_off else .visibility` or `x orelse .close` are found.
 //!
 //! For icons chosen dynamically (e.g. stored in a variable or selected at
 //! runtime), add a no-op reference anywhere in your source:
@@ -145,6 +152,32 @@ fn scanFile(
             collectName(src, &i, valid, found, arena);
             continue;
         }
+        // Pattern 3: `: ?IconName = <expr>`.
+        if (std.mem.startsWith(u8, src[i..], "IconName") and (i == 0 or !isIdentChar(src[i - 1]))) {
+            var j = i + "IconName".len;
+            if (j < src.len and isIdentChar(src[j])) {
+                i = j;
+                continue;
+            }
+            while (j < src.len and isSpace(src[j])) j += 1;
+            // Pattern 4: a list, `[_]IconName{ .a, .b }`.
+            if (j < src.len and src[j] == '{') {
+                j += 1;
+                while (true) {
+                    j = collectExpr(src, j, valid, found, arena);
+                    if (j >= src.len or src[j] != ',') break;
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            if (j < src.len and src[j] == '=' and !(j + 1 < src.len and src[j + 1] == '=')) {
+                i = collectExpr(src, j + 1, valid, found, arena);
+                continue;
+            }
+            i = j;
+            continue;
+        }
         // Pattern 2: `.field = .name` for known IconName-typed fields.
         if (src[i] == '.') {
             if (tryFieldAssign(src, i, valid, found, arena)) |next| {
@@ -179,13 +212,50 @@ fn tryFieldAssign(
         j += 1;
         // Don't match `==`.
         if (j < src.len and src[j] == '=') continue;
-        while (j < src.len and isSpace(src[j])) j += 1;
-        if (j >= src.len or src[j] != '.') continue;
-        j += 1;
-        collectName(src, &j, valid, found, arena);
-        return j;
+        return collectExpr(src, j, valid, found, arena);
     }
     return null;
+}
+
+/// Records every `.name` in the expression starting at `i` (up to a `,` or
+/// `;`, or a bracket closing one opened before it), and returns the position
+/// after it.
+fn collectExpr(
+    src: []const u8,
+    start: usize,
+    valid: *const std.StringHashMapUnmanaged(void),
+    found: *std.StringHashMapUnmanaged(void),
+    arena: std.mem.Allocator,
+) usize {
+    var i = start;
+    var depth: usize = 0;
+    while (i < src.len) {
+        switch (src[i]) {
+            '(', '[', '{' => depth += 1,
+            ')', ']', '}' => {
+                if (depth == 0) return i;
+                depth -= 1;
+            },
+            ',', ';' => if (depth == 0) return i,
+            '"' => {
+                // Skip strings (a `.` in one is not an enum literal).
+                i += 1;
+                while (i < src.len and src[i] != '"' and src[i] != '\n') : (i += 1) {
+                    if (src[i] == '\\') i += 1;
+                }
+            },
+            '.' => if (i + 1 < src.len and (isIdentChar(src[i + 1]) or src[i + 1] == '@') and
+                (i == 0 or !isIdentChar(src[i - 1]) and src[i - 1] != ')' and src[i - 1] != ']'))
+            {
+                i += 1;
+                collectName(src, &i, valid, found, arena);
+                continue;
+            },
+            else => {},
+        }
+        i += 1;
+    }
+    return i;
 }
 
 /// Reads an icon name (plain or `@"quoted"`) at `i`, records it if valid.
@@ -227,4 +297,33 @@ fn needsQuote(name: []const u8) bool {
     if (name.len > 0 and std.ascii.isDigit(name[0])) return true;
     if (std.zig.Token.getKeyword(name) != null) return true;
     return false;
+}
+
+test "icons are found in each pattern, and only icons" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var valid: std.StringHashMapUnmanaged(void) = .empty;
+    for ([_][]const u8{ "add", "close", "menu", "home", "visibility", "visibility_off", "arrow_right", "crop_square", "filter_none", "cloud", "download", "10k", "search", "unused" }) |n| try valid.put(arena, n, {});
+    var found: std.StringHashMapUnmanaged(void) = .empty;
+    scanFile(
+        \\const a = IconName.add;
+        \\const b = Button{ .icon = .close, .label = "x.home" };
+        \\const c = Item{ .trailing_icon = if (it.sub) .arrow_right else it.trailing_icon };
+        \\const d: ?icons.IconName = if (st.revealed) .visibility_off else .visibility;
+        \\const e = Bar{ .icon = if (maximized) .filter_none else .crop_square, .size = .search };
+        \\comptime { _ = &[_]kete.IconName{ .cloud, .download, .@"10k" }; }
+        \\const f = x.menu; const g = .home; if (s == .unused) {}
+    , &valid, &found, arena);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = found.keyIterator();
+    while (it.next()) |k| try names.append(arena, k.*);
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    const want = [_][]const u8{ "10k", "add", "arrow_right", "close", "cloud", "crop_square", "download", "filter_none", "visibility", "visibility_off" };
+    try std.testing.expectEqual(want.len, names.items.len);
+    for (want, names.items) |w, n| try std.testing.expectEqualStrings(w, n);
 }
