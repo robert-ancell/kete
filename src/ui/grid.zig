@@ -1,11 +1,14 @@
-//! Grid: a grid of many items all the same size, as many cells to a row as
-//! fit its width, of which only those that show are made. The items are
+//! Grid: a grid of many items all the same size, as many to a row as it
+//! takes for none to be wider than `cell.w`, sharing its width (as
+//! Material's grids, and Flutter's `GridView.extent`, are), of which only
+//! those that show are made. The items are
 //! made by a function, given their index, and only for the rows in view
 //! (and a row either side) of the scroll view it is in. `Grid.fixed` is a
 //! grid of widgets already made, and `Grid.list` a list: one column of
 //! items as wide as it (a cell width of `Grid.fill`).
 //! Because every cell is the same size, how big the grid is, and where
-//! each item goes, is known without making them.
+//! each item goes, is known without making them. Without a width to fill
+//! (in a row, say), its cells are `cell.w` wide, all in one row.
 //!
 //!     cx.make(ui.ScrollView{ .child = cx.make(ui.Grid{
 //!         .count = files.len,
@@ -33,8 +36,9 @@ const Widget = widget.Widget;
 const Node = widget.WidgetNode;
 const Context = widget.BuildContext;
 
-/// A grid of equal cells, as many to a row as fit its width, left to right and
-/// top to bottom, that makes only the items in view when it is in a scroll view.
+/// A grid of equal cells, left to right and top to bottom, as many to a row as
+/// keep them no wider than `cell.w` and as wide as share the grid's width,
+/// that makes only the items in view when it is in a scroll view.
 ///
 /// ![The Grid example](images/Grid.png)
 ///
@@ -53,8 +57,10 @@ const Context = widget.BuildContext;
 pub const Grid = struct {
     /// How many items there are.
     count: usize,
-    /// The size every cell is (and so every item). A width of `fill` makes
-    /// a list: one column, its items as wide as the grid.
+    /// The size of every cell (and so every item): the widest it is (cells
+    /// share the grid's width, as many to a row as keep them this wide or
+    /// narrower), and how high. A width of `fill` makes a list: one
+    /// column, its items as wide as the grid.
     cell: Size,
     /// Space between cells, across and down.
     spacing: f32 = 0,
@@ -156,11 +162,23 @@ pub const Grid = struct {
         return !std.math.isFinite(self.cell.w);
     }
 
+    /// How many to a row: as many as keep each no wider than `cell.w`
+    /// (Flutter's `SliverGridDelegateWithMaxCrossAxisExtent`), or, without
+    /// a width to share, all of them.
     fn columns(self: *const Grid, width: f32) usize {
         if (self.isList()) return 1;
         if (!std.math.isFinite(width)) return @max(self.count, 1);
-        const cw = @max(self.cell.w, 0);
-        return @max(1, @as(usize, @intFromFloat(@max(@floor((width + self.gap()) / (cw + self.gap())), 0))));
+        const pitch = @max(self.cell.w, 0) + self.gap();
+        if (!(pitch > 0)) return @max(self.count, 1);
+        return @max(1, @as(usize, @intFromFloat(@min(@ceil(@max(width, 0) / pitch), 1e9))));
+    }
+
+    /// How wide each cell is, `cols` sharing `width` (less the spacing
+    /// between them).
+    fn cellWidth(self: *const Grid, width: f32, cols: usize) f32 {
+        if (!std.math.isFinite(width)) return if (self.isList()) 0 else @max(self.cell.w, 0);
+        const n: f32 = @floatFromInt(cols);
+        return @max((width - self.gap() * (n - 1)) / n, 0);
     }
 
     pub fn layout(self: *const Grid, n: *Node, c: Constraints) Size {
@@ -193,7 +211,7 @@ pub const Grid = struct {
     /// Lays out the items made, each in its cell.
     fn place(self: *const Grid, n: *Node, cols: usize) void {
         const st = n.state(State);
-        const cell: Size = .{ .w = if (self.isList()) n.size.w else @max(self.cell.w, 0), .h = @max(self.cell.h, 0) };
+        const cell: Size = .{ .w = self.cellWidth(n.size.w, cols), .h = @max(self.cell.h, 0) };
         for (n.children.items, 0..) |child, k| {
             const i = index(st.*, k);
             _ = child.layout(.tight(cell));

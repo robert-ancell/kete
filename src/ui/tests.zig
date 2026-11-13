@@ -639,21 +639,22 @@ test "a grid puts as many cells in a row as fit" {
         fn f(cx: *Context) Widget {
             var cells: [7]Widget = undefined;
             for (&cells) |*c| c.* = cx.make(ui.RoundedBox{ .color = red });
-            return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.SizedBox{ .width = 250, .child = cx.make(ui.Grid.fixed(cx, &cells, .{ .w = 60, .h = 40 }, 10)) }) });
+            return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.SizedBox{ .width = 260, .child = cx.make(ui.Grid.fixed(cx, &cells, .{ .w = 90, .h = 40 }, 10)) }) });
         }
     }.f;
     u.frame(400, 300, 0, Root(build){});
     var cells: std.ArrayList(*Node) = .empty;
     defer cells.deinit(testing.allocator);
     try findAll(u.root.?, ui.RoundedBox, &cells);
-    // 250 wide: three 60-wide cells with 10 between (four would need 270).
+    // 260 wide: three cells sharing it, 80 wide with 10 between (two
+    // would be wider than 90).
     try testing.expectEqual(@as(usize, 7), cells.items.len);
-    try testing.expectEqual(ui.Point{ 140, 0 }, cells.items[2].offset);
+    try testing.expectEqual(ui.Point{ 180, 0 }, cells.items[2].offset);
     try testing.expectEqual(ui.Point{ 0, 50 }, cells.items[3].offset);
     try testing.expectEqual(ui.Point{ 0, 100 }, cells.items[6].offset);
-    try testing.expectEqual(ui.Size{ .w = 60, .h = 40 }, cells.items[6].size);
+    try testing.expectEqual(ui.Size{ .w = 80, .h = 40 }, cells.items[6].size);
     const grid = find(u.root.?, ui.Grid).?;
-    try testing.expectEqual(ui.Size{ .w = 250, .h = 140 }, grid.size);
+    try testing.expectEqual(ui.Size{ .w = 260, .h = 140 }, grid.size);
 }
 
 const VirtualItems = struct {
@@ -680,7 +681,7 @@ const VirtualApp = struct {
     items: *VirtualItems,
     in_scroll_view: bool = true,
     pub fn build(self: *const @This(), cx: *Context) Widget {
-        const grid = cx.make(ui.Grid{ .count = 100, .cell = .{ .w = 50, .h = 40 }, .spacing = 10, .item = .of(self.items, VirtualItems.item) });
+        const grid = cx.make(ui.Grid{ .count = 100, .cell = .{ .w = 70, .h = 40 }, .spacing = 10, .item = .of(self.items, VirtualItems.item) });
         return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.SizedBox{ .width = 200, .height = 300, .child = if (self.in_scroll_view) cx.make(ui.ScrollView{ .child = grid }) else grid }) });
     }
 };
@@ -692,12 +693,13 @@ test "a virtual grid makes only the rows that show, as it scrolls" {
     u.frame(400, 400, 0, VirtualApp{ .items = &items });
     const view = find(u.root.?, ui.ScrollView).?;
     const grid = view.child(0);
-    // 188 wide beside the bar: three columns; 34 rows of 50.
+    // 188 wide beside the bar: three columns (two would be wider than
+    // 70), 56 wide; 34 rows of 50.
     try testing.expectEqual(ui.Size{ .w = 188, .h = 34 * 50 - 10 }, grid.size);
     // Rows 0 to 5 show (300 of 50 each), and one more is made.
     try testing.expectEqual(@as(usize, 21), grid.childCount());
-    try testing.expectEqual(ui.Point{ 60, 50 }, grid.child(4).offset);
-    try testing.expectEqual(ui.Size{ .w = 50, .h = 40 }, grid.child(4).size);
+    try testing.expectEqual(ui.Point{ 66, 50 }, grid.child(4).offset);
+    try testing.expectEqual(ui.Size{ .w = 56, .h = 40 }, grid.child(4).size);
     // The next frame makes the same ones, with the rest of the tree.
     items.made = 0;
     u.frame(400, 400, 1, VirtualApp{ .items = &items });
