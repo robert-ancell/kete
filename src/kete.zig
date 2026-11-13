@@ -89,6 +89,7 @@ pub const TextArea = ui.TextArea;
 pub const TextDocument = ui.TextDocument;
 pub const MenuItem = ui.MenuItem;
 pub const ScrollView = ui.ScrollView;
+pub const ScrollController = ui.ScrollController;
 pub const Icon = ui.Icon;
 pub const IconName = ui.IconName;
 pub const Image = ui.Image;

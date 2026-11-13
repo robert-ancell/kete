@@ -726,55 +726,66 @@ test "a virtual grid makes only the rows that show, as it scrolls" {
 
 const ListApp = struct {
     items: *VirtualItems,
-    reveal: ?usize = null,
-
-    /// Item `i`, keyed 1000 + i for the scroll view to reveal.
-    fn row(items: *VirtualItems, cx: *Context, i: usize) Widget {
-        return VirtualItems.item(items, cx, i).withKey(1000 + @as(u64, i));
-    }
+    scroll: *ui.ScrollController,
 
     pub fn build(self: *const @This(), cx: *Context) Widget {
-        var list = ui.Grid.list(100, 30, .of(self.items, row));
-        list.keep = self.reveal;
         return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.SizedBox{ .width = 200, .height = 300, .child = cx.make(ui.ScrollView{
-            .reveal = if (self.reveal) |r| 1000 + @as(u64, r) else null,
-            .child = cx.make(list),
+            .controller = self.scroll,
+            .child = cx.make(ui.Padding{ .padding = .all(5), .child = cx.make(ui.Grid.list(100, 30, .of(self.items, VirtualItems.item))) }),
         }) }) });
     }
 };
 
-test "a grid list's items are as wide as it, and one far down can be revealed" {
+test "a grid list's items are as wide as it, and its scroll controller reveals one not made" {
     const u = try ui.WindowUi.create(testing.allocator, testing.io, null);
     defer u.destroy();
     var items: VirtualItems = .{};
-    u.frame(400, 400, 0, ListApp{ .items = &items });
+    var scroll: ui.ScrollController = .{};
+    u.frame(400, 400, 0, ListApp{ .items = &items, .scroll = &scroll });
     const view = find(u.root.?, ui.ScrollView).?;
-    const list = view.child(0);
-    // One column, each row as wide as the list: ten rows show, and one
-    // more is made.
+    const list = find(view, ui.Grid).?;
+    // One column, each row as wide as the list: ten rows show (less the
+    // padding above), and one more is made.
     try testing.expectEqual(@as(usize, 11), list.childCount());
     try testing.expectEqual(list.size.w, list.child(3).size.w);
     try testing.expectEqual(@as(f32, 30), list.child(3).size.h);
     try testing.expectEqual(ui.Point{ 0, 90 }, list.child(3).offset);
     try testing.expectEqual(@as(f32, 3000), list.size.h);
+    // The controller says where the view is.
+    try testing.expectEqual(@as(f32, 0), scroll.offset);
+    try testing.expectEqual(@as(f32, 3010), scroll.content);
+    try testing.expectEqual(@as(f32, 300), scroll.viewport);
 
-    // Revealing row 80, which is not made: it is kept, so the scroll view
-    // finds it and scrolls to it, and the rows around it are made.
-    u.frame(400, 400, 1, ListApp{ .items = &items, .reveal = 80 });
-    const st = view.state(ui.ScrollView.State);
-    try testing.expectEqual(@as(f32, 81 * 30 - 300), st.offset);
+    // Revealing row 80, which is not made: the view scrolls just far
+    // enough to show it (below the padding), and the rows there are made.
+    scroll.revealItem(80);
+    u.frame(400, 400, 1, ListApp{ .items = &items, .scroll = &scroll });
+    try testing.expectEqual(@as(f32, 5 + 81 * 30 - 300), scroll.offset);
+    try testing.expectEqual(@as(?ui.ScrollController.Request, null), scroll.request);
     var found = false;
-    for (list.children.items) |ch| if (ch.widget.key == 1000 + 80) {
+    for (list.children.items) |ch| if (ch.widget.key == 80) {
         try testing.expectEqual(ui.Point{ 0, 80 * 30 }, ch.offset);
         found = true;
     };
     try testing.expect(found);
-    // Scrolled back to the top, row 80 is still made (and kept last).
-    _ = st.scrollTo(0);
-    u.frame(400, 400, 2, ListApp{ .items = &items, .reveal = 80 });
-    try testing.expectEqual(@as(usize, 12), list.childCount());
-    try testing.expectEqual(@as(?u64, 1000 + 80), list.child(11).widget.key);
-    try testing.expectEqual(ui.Point{ 0, 80 * 30 }, list.child(11).offset);
+    // Revealing one already in view does not move it.
+    scroll.revealItem(75);
+    u.frame(400, 400, 2, ListApp{ .items = &items, .scroll = &scroll });
+    try testing.expectEqual(@as(f32, 5 + 81 * 30 - 300), scroll.offset);
+    // Revealing one above scrolls up to its top.
+    scroll.revealItem(10);
+    u.frame(400, 400, 3, ListApp{ .items = &items, .scroll = &scroll });
+    try testing.expectEqual(@as(f32, 5 + 10 * 30), scroll.offset);
+
+    // Back to the top, and past the end goes only as far as it can.
+    scroll.jumpTo(0);
+    u.frame(400, 400, 4, ListApp{ .items = &items, .scroll = &scroll });
+    try testing.expectEqual(@as(f32, 0), scroll.offset);
+    try testing.expectEqual(@as(?u64, 0), list.child(0).widget.key);
+    scroll.jumpTo(1e9);
+    u.frame(400, 400, 5, ListApp{ .items = &items, .scroll = &scroll });
+    try testing.expectEqual(scroll.maxOffset(), scroll.offset);
+    try testing.expectEqual(@as(f32, 3010 - 300), scroll.offset);
 }
 
 const RevealApp = struct {

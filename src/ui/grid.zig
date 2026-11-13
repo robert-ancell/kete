@@ -69,10 +69,6 @@ pub const Grid = struct {
     /// Rows made beyond those in view, above and below, so a little
     /// scrolling needs nothing made.
     extra_rows: usize = 1,
-    /// An item made even when it does not show: one a scroll view is to
-    /// reveal (see `ScrollView.reveal`), which it can find only if it is
-    /// made.
-    keep: ?usize = null,
 
     /// A cell width that makes the grid a list (see `list`).
     pub const fill = std.math.inf(f32);
@@ -111,46 +107,38 @@ pub const Grid = struct {
     };
 
     pub const State = struct {
-        /// The items made: from `first` up to `end`, and `kept` (made even
-        /// though it does not show).
+        /// The items made: from `first` up to `end`.
         first: usize = 0,
         end: usize = 0,
-        kept: ?usize = null,
     };
 
-    /// The items made with the rest of the tree: those of the last frame
-    /// (and the item to keep).
+    /// The items made with the rest of the tree: those of the last frame.
     pub fn children(self: *const Grid, cx: *Context, n: *Node) []const Widget {
         const st = n.state(State);
         st.end = @min(st.end, self.count);
         st.first = @min(st.first, st.end);
-        st.kept = self.extra(st.first, st.end);
         return self.make(cx, st.*);
     }
 
-    /// The item to keep, if it is not among those from `first` to `end`.
-    fn extra(self: *const Grid, first: usize, end: usize) ?usize {
-        const k = self.keep orelse return null;
-        return if (k < self.count and (k < first or k >= end)) k else null;
-    }
-
-    fn made(st: State) usize {
-        return st.end - st.first + @intFromBool(st.kept != null);
-    }
-
-    /// The index of the `k`th item made: those in view, then the one kept.
-    fn index(st: State, k: usize) usize {
-        return if (k < st.end - st.first) st.first + k else st.kept.?;
-    }
-
     fn make(self: *const Grid, cx: *Context, st: State) []const Widget {
-        const out = cx.arena.alloc(Widget, made(st)) catch return &.{};
-        for (out, 0..) |*w, k| {
-            const i = index(st, k);
+        const out = cx.arena.alloc(Widget, st.end - st.first) catch return &.{};
+        for (out, st.first..) |*w, i| {
             const item = self.item.f(self.item.ctx, cx, i);
             w.* = if (item.key == null) item.withKey(i) else item;
         }
         return out;
+    }
+
+    /// Where item `i` is, made or not (so a scroll view can reveal it:
+    /// see `ScrollController.revealItem`).
+    pub fn itemRect(self: *const Grid, n: *Node, i: usize) ?Rect {
+        if (i >= self.count) return null;
+        const cols = self.columns(n.size.w);
+        const w = self.cellWidth(n.size.w, cols);
+        const h = @max(self.cell.h, 0);
+        const col: f32 = @floatFromInt(i % cols);
+        const row: f32 = @floatFromInt(i / cols);
+        return .{ .x = col * (w + self.gap()), .y = row * (h + self.gap()), .w = w, .h = h };
     }
 
     fn gap(self: *const Grid) f32 {
@@ -212,8 +200,7 @@ pub const Grid = struct {
     fn place(self: *const Grid, n: *Node, cols: usize) void {
         const st = n.state(State);
         const cell: Size = .{ .w = self.cellWidth(n.size.w, cols), .h = @max(self.cell.h, 0) };
-        for (n.children.items, 0..) |child, k| {
-            const i = index(st.*, k);
+        for (n.children.items, st.first..) |child, i| {
             _ = child.layout(.tight(cell));
             const col: f32 = @floatFromInt(i % cols);
             const row: f32 = @floatFromInt(i / cols);
@@ -233,8 +220,7 @@ pub const Grid = struct {
             want.first = @min((top -| self.extra_rows) * cols, self.count);
             want.end = @min((bottom + self.extra_rows) * cols, self.count);
         }
-        want.kept = self.extra(want.first, want.end);
-        const len = made(want);
+        const len = want.end - want.first;
         const st = n.state(State);
         if (std.meta.eql(st.*, want) and n.children.items.len == len) return;
         st.* = want;

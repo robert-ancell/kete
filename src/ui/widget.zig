@@ -239,6 +239,10 @@ pub const VTable = struct {
     /// Told, once laid out in a scroll view, what of it shows (relative to
     /// itself), to make the children there.
     realize: ?*const fn (*const anyopaque, *WidgetNode, Rect) void,
+    /// Where its item `index` is (relative to itself), made or not, for a
+    /// scroll view to reveal it (`pub fn itemRect(self, n, index) ?Rect`:
+    /// see `ScrollController.revealItem`).
+    item_rect: ?*const fn (*const anyopaque, *WidgetNode, usize) ?Rect,
     /// Scrolls its child (`pub const scrolls = true`): it tells the
     /// widgets in it what shows (see `WidgetNode.realizeIn`).
     scrolls: bool,
@@ -322,6 +326,9 @@ fn makeVTable(comptime T: type) VTable {
         fn realize(ptr: *const anyopaque, n: *WidgetNode, visible: Rect) void {
             T.realize(self(ptr), n, visible);
         }
+        fn itemRect(ptr: *const anyopaque, n: *WidgetNode, index: usize) ?Rect {
+            return T.itemRect(self(ptr), n, index);
+        }
         fn paintTransform(ptr: *const anyopaque, n: *const WidgetNode) gfx.Affine {
             return T.paintTransform(self(ptr), n);
         }
@@ -350,6 +357,7 @@ fn makeVTable(comptime T: type) VTable {
         .takes_tab = @hasDecl(T, "takes_tab") and T.takes_tab,
         .make_children = if (@hasDecl(T, "children")) S.makeChildren else null,
         .realize = if (@hasDecl(T, "realize")) S.realize else null,
+        .item_rect = if (@hasDecl(T, "itemRect")) S.itemRect else null,
         .scrolls = @hasDecl(T, "scrolls") and T.scrolls,
         .clips_children = @hasDecl(T, "clips_children") and T.clips_children,
         .paint_transform = if (@hasDecl(T, "paintTransform")) S.paintTransform else null,

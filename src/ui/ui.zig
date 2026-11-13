@@ -181,6 +181,7 @@ pub const MenuItem = menu.Item;
 pub const TitleBar = title_bar.TitleBar;
 pub const BarButton = bar_button.BarButton;
 pub const ScrollView = scroll_view.ScrollView;
+pub const ScrollController = scroll_view.ScrollController;
 pub const Icon = icon.Icon;
 pub const Image = image.Image;
 pub const QrCode = qr_code.QrCode;
