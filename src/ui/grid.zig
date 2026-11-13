@@ -2,7 +2,8 @@
 //! fit its width, of which only those that show are made. The items are
 //! made by a function, given their index, and only for the rows in view
 //! (and a row either side) of the scroll view it is in. `Grid.fixed` is a
-//! grid of widgets already made.
+//! grid of widgets already made, and `Grid.list` a list: one column of
+//! items as wide as it (a cell width of `Grid.fill`).
 //! Because every cell is the same size, how big the grid is, and where
 //! each item goes, is known without making them.
 //!
@@ -11,6 +12,10 @@
 //!         .cell = .{ .w = 128, .h = 124 },
 //!         .item = .of(view, View.tile),
 //!     }) })
+//!
+//! A long list, made as it scrolls:
+//!
+//!     cx.make(ui.ScrollView{ .child = cx.make(ui.Grid.list(lines.len, 22, .of(view, View.line))) })
 //!
 //! The items made are those of the frame before (so they are built with
 //! the rest of the tree); if the scroll view shows other rows once laid
@@ -48,7 +53,8 @@ const Context = widget.BuildContext;
 pub const Grid = struct {
     /// How many items there are.
     count: usize,
-    /// The size every cell is (and so every item).
+    /// The size every cell is (and so every item). A width of `fill` makes
+    /// a list: one column, its items as wide as the grid.
     cell: Size,
     /// Space between cells, across and down.
     spacing: f32 = 0,
@@ -57,6 +63,19 @@ pub const Grid = struct {
     /// Rows made beyond those in view, above and below, so a little
     /// scrolling needs nothing made.
     extra_rows: usize = 1,
+    /// An item made even when it does not show: one a scroll view is to
+    /// reveal (see `ScrollView.reveal`), which it can find only if it is
+    /// made.
+    keep: ?usize = null,
+
+    /// A cell width that makes the grid a list (see `list`).
+    pub const fill = std.math.inf(f32);
+
+    /// A list of `count` items, each `row_height` high and as wide as the
+    /// list, made by `item`: a grid with one column.
+    pub fn list(count: usize, row_height: f32, item: ItemBuilder) Grid {
+        return .{ .count = count, .cell = .{ .w = fill, .h = row_height }, .item = item };
+    }
 
     /// A grid of `widgets` already made (they are copied into the frame's
     /// arena, as `cx.make` copies a `children` slice).
@@ -86,22 +105,42 @@ pub const Grid = struct {
     };
 
     pub const State = struct {
-        /// The items made: from `first` up to `end`.
+        /// The items made: from `first` up to `end`, and `kept` (made even
+        /// though it does not show).
         first: usize = 0,
         end: usize = 0,
+        kept: ?usize = null,
     };
 
-    /// The items made with the rest of the tree: those of the last frame.
+    /// The items made with the rest of the tree: those of the last frame
+    /// (and the item to keep).
     pub fn children(self: *const Grid, cx: *Context, n: *Node) []const Widget {
         const st = n.state(State);
         st.end = @min(st.end, self.count);
         st.first = @min(st.first, st.end);
+        st.kept = self.extra(st.first, st.end);
         return self.make(cx, st.*);
     }
 
+    /// The item to keep, if it is not among those from `first` to `end`.
+    fn extra(self: *const Grid, first: usize, end: usize) ?usize {
+        const k = self.keep orelse return null;
+        return if (k < self.count and (k < first or k >= end)) k else null;
+    }
+
+    fn made(st: State) usize {
+        return st.end - st.first + @intFromBool(st.kept != null);
+    }
+
+    /// The index of the `k`th item made: those in view, then the one kept.
+    fn index(st: State, k: usize) usize {
+        return if (k < st.end - st.first) st.first + k else st.kept.?;
+    }
+
     fn make(self: *const Grid, cx: *Context, st: State) []const Widget {
-        const out = cx.arena.alloc(Widget, st.end - st.first) catch return &.{};
-        for (out, st.first..) |*w, i| {
+        const out = cx.arena.alloc(Widget, made(st)) catch return &.{};
+        for (out, 0..) |*w, k| {
+            const i = index(st, k);
             const item = self.item.f(self.item.ctx, cx, i);
             w.* = if (item.key == null) item.withKey(i) else item;
         }
@@ -112,7 +151,13 @@ pub const Grid = struct {
         return if (std.math.isFinite(self.spacing)) @max(self.spacing, 0) else 0;
     }
 
+    /// A list: one column, its items as wide as it.
+    fn isList(self: *const Grid) bool {
+        return !std.math.isFinite(self.cell.w);
+    }
+
     fn columns(self: *const Grid, width: f32) usize {
+        if (self.isList()) return 1;
         if (!std.math.isFinite(width)) return @max(self.count, 1);
         const cw = @max(self.cell.w, 0);
         return @max(1, @as(usize, @intFromFloat(@max(@floor((width + self.gap()) / (cw + self.gap())), 0))));
@@ -121,7 +166,7 @@ pub const Grid = struct {
     pub fn layout(self: *const Grid, n: *Node, c: Constraints) Size {
         const cols = self.columns(c.max_w);
         const rows = (self.count + cols - 1) / cols;
-        const cw = @max(self.cell.w, 0);
+        const cw = if (self.isList()) 0 else @max(self.cell.w, 0);
         const ch = @max(self.cell.h, 0);
         const used: f32 = @floatFromInt(@min(cols, self.count));
         const r: f32 = @floatFromInt(rows);
@@ -140,7 +185,7 @@ pub const Grid = struct {
 
     pub fn minSize(self: *const Grid, _: *Node, c: Constraints) Size {
         if (self.count == 0) return c.smallest();
-        const cw = @max(self.cell.w, 0);
+        const cw = if (self.isList()) 0 else @max(self.cell.w, 0);
         const ch = @max(self.cell.h, 0);
         return c.constrain(.{ .w = cw, .h = ch });
     }
@@ -148,8 +193,9 @@ pub const Grid = struct {
     /// Lays out the items made, each in its cell.
     fn place(self: *const Grid, n: *Node, cols: usize) void {
         const st = n.state(State);
-        const cell: Size = .{ .w = @max(self.cell.w, 0), .h = @max(self.cell.h, 0) };
-        for (n.children.items, st.first..) |child, i| {
+        const cell: Size = .{ .w = if (self.isList()) n.size.w else @max(self.cell.w, 0), .h = @max(self.cell.h, 0) };
+        for (n.children.items, 0..) |child, k| {
+            const i = index(st.*, k);
             _ = child.layout(.tight(cell));
             const col: f32 = @floatFromInt(i % cols);
             const row: f32 = @floatFromInt(i / cols);
@@ -169,7 +215,8 @@ pub const Grid = struct {
             want.first = @min((top -| self.extra_rows) * cols, self.count);
             want.end = @min((bottom + self.extra_rows) * cols, self.count);
         }
-        const len = want.end - want.first;
+        want.kept = self.extra(want.first, want.end);
+        const len = made(want);
         const st = n.state(State);
         if (std.meta.eql(st.*, want) and n.children.items.len == len) return;
         st.* = want;
