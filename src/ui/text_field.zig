@@ -11,6 +11,11 @@
 //! UI's clipboard: see `WindowUi.copyText` and `WindowUi.pasteText`); the right button, or holding the left down, shows a
 //! menu with the same (`WindowUi.openMenu`). An obscured field's text cannot be
 //! cut or copied.
+//!
+//! The text is kept in a `Document`, as a `TextArea`'s is: one line of
+//! it. An app that sets it from code (clearing it once sent, say), selects
+//! it or gives the field the keyboard keeps the document, given as `doc`;
+//! without one, the field keeps its own.
 
 const a11y = @import("accessibility.zig");
 const std = @import("std");
@@ -23,6 +28,7 @@ const painter_mod = @import("painter.zig");
 const Column = @import("flex.zig").Column;
 const menu = @import("menu.zig");
 const Padding = @import("padding.zig").Padding;
+const Document = @import("text_area.zig").Document;
 
 const Node = widget.WidgetNode;
 const Event = widget.Event;
@@ -44,9 +50,13 @@ const Size = geometry.Size;
 pub const TextField = struct {
     /// Shown, dimmed, while it is empty.
     placeholder: []const u8 = "",
-    /// What it holds when it first appears (give it a new key to start
-    /// again with another).
+    /// What it holds when it first appears, without a `doc` (give it a
+    /// new key to start again with another).
     initial: []const u8 = "",
+    /// The text, with the cursor and selection: the app's, to read and set
+    /// from code and to give the field the keyboard with (`Document.focus`).
+    /// Without it, the field keeps its own.
+    doc: ?*Document = null,
     /// Dots instead of the characters (for passwords).
     obscure: bool = false,
     /// The most bytes it holds.
@@ -67,21 +77,12 @@ pub const TextField = struct {
 
     pub const capacity = 128;
 
-    /// The state it starts with: holding `initial`.
-    pub fn initState(self: *const TextField) State {
-        var st: State = .{};
-        _ = st.insert(self.initial, self.max_len);
-        return st;
-    }
-
     pub const State = struct {
-        buf: [capacity]u8 = undefined,
-        len: usize = 0,
-        /// Where typing goes: a byte index.
-        cursor: usize = 0,
-        /// The other end of the selection (the cursor is one end), if
-        /// there is one.
-        anchor: ?usize = null,
+        /// The app's document (`doc`), or else its own (holding
+        /// `initial` to begin with).
+        ext: ?*Document = null,
+        own: Document = .{ .gpa = undefined },
+        own_ready: bool = false,
         focused: bool = false,
         /// It has taken the keyboard by itself (`autofocus`), once.
         autofocused: bool = false,
@@ -107,8 +108,17 @@ pub const TextField = struct {
         preedit_cursor_end: i32 = 0,
         last_change_other: bool = false,
 
+        pub fn deinit(s: *State) void {
+            if (s.own_ready) s.own.deinit();
+        }
+
+        /// The document edited.
+        pub fn doc(s: *State) *Document {
+            return s.ext orelse &s.own;
+        }
+
         pub fn text(s: *const State) []const u8 {
-            return s.buf[0..s.len];
+            return if (s.ext) |d| d.text() else s.own.text();
         }
 
         pub fn preedit(s: *const State) []const u8 {
@@ -117,141 +127,54 @@ pub const TextField = struct {
 
         /// The selected bytes' start and end, if any are.
         pub fn selection(s: *const State) ?[2]usize {
-            const a = s.anchor orelse return null;
-            if (a == s.cursor) return null;
-            return .{ @min(a, s.cursor), @max(a, s.cursor) };
+            return if (s.ext) |d| d.selection() else s.own.selection();
         }
 
-        /// Removes the selection's text. Returns whether there was any.
         fn deleteSelection(s: *State) bool {
-            const sel = s.selection() orelse return false;
-            std.mem.copyForwards(u8, s.buf[sel[0] .. s.len - (sel[1] - sel[0])], s.buf[sel[1]..s.len]);
-            s.len -= sel[1] - sel[0];
-            s.cursor = sel[0];
-            s.anchor = null;
-            return true;
+            return s.doc().deleteSelection();
         }
 
         /// Deletes `before_len` bytes before the cursor and `after_len` bytes
         /// after it (`zwp_text_input_v3.delete_surrounding_text`).
         pub fn deleteSurrounding(s: *State, before_len: u32, after_len: u32) bool {
-            _ = s.deleteSelection();
-            const from = s.snap(s.cursor -| @min(@as(usize, before_len), s.cursor));
-            const to = s.snap(@min(s.len, s.cursor + @as(usize, after_len)));
-            if (to <= from) return false;
-            s.remove(from, to);
-            s.cursor = from;
-            return true;
+            return s.doc().deleteSurrounding(before_len, after_len);
         }
 
         /// Puts `t` (UTF-8) at the cursor, over the selection: its
         /// printable characters (line breaks and tabs as spaces), as many
         /// as fit (`max` bytes in all). Returns whether the text changed.
         fn insert(s: *State, t: []const u8, max: usize) bool {
-            var changed = s.deleteSelection();
-            var at: usize = 0;
-            while (at < t.len) {
-                const n = std.unicode.utf8ByteSequenceLength(t[at]) catch {
-                    at += 1;
-                    continue;
-                };
-                if (at + n > t.len) break;
-                const c0 = std.unicode.utf8Decode(t[at..][0..n]) catch {
-                    at += 1;
-                    continue;
-                };
-                at += n;
-                const c: u21 = if (c0 == '\n' or c0 == '\t' or c0 == '\r') ' ' else c0;
-                if (c < 0x20 or (c >= 0x7f and c < 0xa0)) continue;
-                var enc: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(c, &enc) catch continue;
-                if (s.len + len > @min(max, capacity)) break;
-                std.mem.copyBackwards(u8, s.buf[s.cursor + len .. s.len + len], s.buf[s.cursor..s.len]);
-                @memcpy(s.buf[s.cursor..][0..len], enc[0..len]);
-                s.len += len;
-                s.cursor += len;
-                changed = true;
-            }
-            return changed;
-        }
-
-        /// Removes the bytes from `from` to `to`.
-        fn remove(s: *State, from: usize, to: usize) void {
-            std.mem.copyForwards(u8, s.buf[from .. s.len - (to - from)], s.buf[to..s.len]);
-            s.len -= to - from;
+            return s.doc().insertWith(t, .{ .single_line = true, .max_len = max });
         }
 
         /// The character boundary at or before byte `i`.
-        pub fn snap(s: *const State, i: usize) usize {
-            if (i >= s.len) return s.len;
-            var j = i;
-            while (j > 0 and s.buf[j] & 0xc0 == 0x80) j -= 1;
-            return j;
+        pub fn snap(s: *State, i: usize) usize {
+            return s.doc().snap(i);
         }
 
-        /// The character boundary before byte `i` (0 at the start).
-        fn before(s: *const State, i: usize) usize {
-            var j = @min(i, s.len) -| 1;
-            while (j > 0 and s.buf[j] & 0xc0 == 0x80) j -= 1;
-            return j;
+        fn before(s: *State, i: usize) usize {
+            return s.doc().before(i);
         }
 
-        /// The character boundary after byte `i` (the end at the end).
-        fn after(s: *const State, i: usize) usize {
-            if (i >= s.len) return s.len;
-            var j = i + 1;
-            while (j < s.len and s.buf[j] & 0xc0 == 0x80) j += 1;
-            return j;
+        fn after(s: *State, i: usize) usize {
+            return s.doc().after(i);
         }
 
         /// Moves the cursor, extending the selection (from where the cursor
         /// was) or dropping it.
         fn moveTo(s: *State, to: usize, extend: bool) void {
-            if (extend) {
-                if (s.anchor == null) s.anchor = s.cursor;
-            } else s.anchor = null;
-            s.cursor = s.snap(to);
+            s.doc().moveTo(to, extend);
         }
 
         pub fn selectAll(s: *State) void {
-            s.anchor = 0;
-            s.cursor = s.len;
+            s.doc().selectAll();
         }
 
         /// Selects the word (or contiguous run of whitespace/punctuation)
-        /// at byte `index`.
+        /// at byte `index` (all of it, if obscured).
         pub fn selectWordAt(s: *State, index: usize) void {
-            if (s.len == 0) {
-                s.anchor = null;
-                s.cursor = 0;
-                return;
-            }
-            if (s.isObscured()) {
-                s.selectAll();
-                return;
-            }
-            const text_slice = s.buf[0..s.len];
-            var pivot = s.snap(@min(index, s.len));
-            if (pivot == s.len) {
-                pivot = s.before(s.len);
-            } else if (pivot > 0 and charClassAt(text_slice, pivot) != .word) {
-                const prev = s.before(pivot);
-                if (charClassAt(text_slice, prev) == .word) pivot = prev;
-            }
-            const cls = charClassAt(text_slice, pivot);
-            var start = pivot;
-            while (start > 0) {
-                const prev = s.before(start);
-                if (charClassAt(text_slice, prev) != cls) break;
-                start = prev;
-            }
-            var end = s.after(pivot);
-            while (end < s.len) {
-                if (charClassAt(text_slice, end) != cls) break;
-                end = s.after(end);
-            }
-            s.anchor = start;
-            s.cursor = end;
+            if (s.isObscured()) return s.selectAll();
+            s.doc().selectWordAt(index);
         }
 
         pub fn isObscured(s: *const State) bool {
@@ -262,7 +185,7 @@ pub const TextField = struct {
         pub fn copy(s: *State) void {
             const sel = s.selection() orelse return;
             if (s.isObscured()) return;
-            if (s.ui) |u| u.copyText(s.buf[sel[0]..sel[1]]);
+            if (s.ui) |u| u.copyText(s.text()[sel[0]..sel[1]]);
         }
 
         pub fn cut(s: *State) void {
@@ -301,21 +224,21 @@ pub const TextField = struct {
                     .v => s.paste(),
                     // Word movement: Ctrl+Left/Right move by word; Shift extends
                     // the selection. Ctrl+Backspace/Delete delete a whole word.
-                    .left => s.moveTo(edit.wordBefore(s.buf[0..s.len], s.cursor), k.shift),
-                    .right => s.moveTo(edit.wordAfter(s.buf[0..s.len], s.cursor), k.shift),
+                    .left => s.moveTo(edit.wordBefore(s.text(), s.doc().cursor), k.shift),
+                    .right => s.moveTo(edit.wordAfter(s.text(), s.doc().cursor), k.shift),
                     .backspace => {
                         if (s.deleteSelection()) return true;
-                        const from = edit.wordBefore(s.buf[0..s.len], s.cursor);
-                        if (from == s.cursor) return false;
-                        s.remove(from, s.cursor);
-                        s.cursor = from;
+                        const from = edit.wordBefore(s.text(), s.doc().cursor);
+                        if (from == s.doc().cursor) return false;
+                        s.doc().remove(from, s.doc().cursor);
+                        s.doc().cursor = from;
                         return true;
                     },
                     .delete => {
                         if (s.deleteSelection()) return true;
-                        const to = edit.wordAfter(s.buf[0..s.len], s.cursor);
-                        if (to == s.cursor) return false;
-                        s.remove(s.cursor, to);
+                        const to = edit.wordAfter(s.text(), s.doc().cursor);
+                        if (to == s.doc().cursor) return false;
+                        s.doc().remove(s.doc().cursor, to);
                         return true;
                     },
                     else => {},
@@ -325,23 +248,23 @@ pub const TextField = struct {
             switch (k.key) {
                 .backspace => {
                     if (s.deleteSelection()) return true;
-                    if (s.cursor == 0) return false;
-                    const from = s.before(s.cursor);
-                    s.remove(from, s.cursor);
-                    s.cursor = from;
+                    if (s.doc().cursor == 0) return false;
+                    const from = s.before(s.doc().cursor);
+                    s.doc().remove(from, s.doc().cursor);
+                    s.doc().cursor = from;
                     return true;
                 },
                 .delete => {
                     if (s.deleteSelection()) return true;
-                    if (s.cursor == s.len) return false;
-                    s.remove(s.cursor, s.after(s.cursor));
+                    if (s.doc().cursor == s.text().len) return false;
+                    s.doc().remove(s.doc().cursor, s.after(s.doc().cursor));
                     return true;
                 },
                 // Without Shift, a selection collapses to its start or end.
-                .left => if (!k.shift and s.selection() != null) s.moveTo(s.selection().?[0], false) else s.moveTo(s.before(s.cursor), k.shift),
-                .right => if (!k.shift and s.selection() != null) s.moveTo(s.selection().?[1], false) else s.moveTo(s.after(s.cursor), k.shift),
+                .left => if (!k.shift and s.selection() != null) s.moveTo(s.selection().?[0], false) else s.moveTo(s.before(s.doc().cursor), k.shift),
+                .right => if (!k.shift and s.selection() != null) s.moveTo(s.selection().?[1], false) else s.moveTo(s.after(s.doc().cursor), k.shift),
                 .home => s.moveTo(0, k.shift),
-                .end => s.moveTo(s.len, k.shift),
+                .end => s.moveTo(s.text().len, k.shift),
                 else => if (k.char) |c| {
                     var enc: [4]u8 = undefined;
                     const n = std.unicode.utf8Encode(c, &enc) catch return false;
@@ -377,6 +300,13 @@ pub const TextField = struct {
             st.toggle_pressed = false;
         }
         st.on_changed = self.on_changed;
+        st.ext = self.doc;
+        if (self.doc == null and !st.own_ready) {
+            st.own_ready = true;
+            st.own = .{ .gpa = n.ui.gpa };
+            _ = st.own.insertWith(self.initial, .{ .single_line = true, .max_len = self.max_len });
+            st.own.version = 0;
+        }
         return st;
     }
 
@@ -395,7 +325,7 @@ pub const TextField = struct {
             // A password field: ARIA has no role of its own for one.
             .roledescription = if (self.obscure) "password" else "",
             .text = value,
-            .caret = std.unicode.utf8CountCodepoints(st.text()[0..@min(st.cursor, st.text().len)]) catch null,
+            .caret = std.unicode.utf8CountCodepoints(st.text()[0..@min(st.doc().cursor, st.text().len)]) catch null,
             .disabled = !self.enabled,
         };
     }
@@ -415,6 +345,10 @@ pub const TextField = struct {
             st.autofocused = true;
             n.ui.focus(n);
         }
+        if (self.doc) |d| if (d.focus_asked) {
+            d.focus_asked = false;
+            if (self.enabled) n.ui.focus(n);
+        };
         return c.constrain(.{ .w = self.width, .h = h });
     }
 
@@ -451,7 +385,7 @@ pub const TextField = struct {
         var cy_px: i32 = 8;
         var ch_px: i32 = @max(1, @as(i32, @intFromFloat(@round(n.size.h))) - 16);
         if (self.fontStyle(n)) |style| {
-            const cursor_x = self.xOf(style, st, st.cursor);
+            const cursor_x = self.xOf(style, st, st.doc().cursor);
             const scroll = self.updateScroll(n, style, st);
             const baseline = @round((n.size.h - style.lineHeight()) / 2 + style.ascent());
             cx_px = @intFromFloat(@round(pad - scroll + cursor_x));
@@ -459,8 +393,8 @@ pub const TextField = struct {
             ch_px = @max(1, @as(i32, @intFromFloat(@round(style.lineHeight()))));
         }
         const surr = if (self.isObscured(st)) "" else st.text();
-        const cur: u32 = if (self.isObscured(st)) 0 else @intCast(st.cursor);
-        const anc: u32 = if (self.isObscured(st)) 0 else @intCast(st.anchor orelse st.cursor);
+        const cur: u32 = if (self.isObscured(st)) 0 else @intCast(st.doc().cursor);
+        const anc: u32 = if (self.isObscured(st)) 0 else @intCast(st.doc().anchor orelse st.doc().cursor);
         return .{
             .surrounding_text = surr,
             .cursor = cur,
@@ -491,8 +425,8 @@ pub const TextField = struct {
     fn updateScroll(self: *const TextField, n: *const Node, style: font.Style, st: *State) f32 {
         const right_pad: f32 = if (self.obscure) toggle_pad else pad;
         const room = @max(n.size.w - pad - right_pad, 0);
-        const cursor_x = self.xOf(style, st, st.cursor);
-        const total_w = self.xOf(style, st, st.len);
+        const cursor_x = self.xOf(style, st, st.doc().cursor);
+        const total_w = self.xOf(style, st, st.text().len);
         if (cursor_x < st.scroll) {
             st.scroll = cursor_x;
         } else if (cursor_x > st.scroll + room) {
@@ -528,7 +462,7 @@ pub const TextField = struct {
         const baseline = @round((n.size.h - style.lineHeight()) / 2 + style.ascent());
         var buf: [capacity * dot.len]u8 = undefined;
         const text = self.shown(st, &buf, st.text());
-        const cursor_x = self.xOf(style, st, st.cursor);
+        const cursor_x = self.xOf(style, st, st.doc().cursor);
         // Long text scrolls to keep the cursor in view.
         const right_pad: f32 = if (self.obscure) toggle_pad else pad;
         const room = @max(n.size.w - pad - right_pad, 0);
@@ -536,8 +470,8 @@ pub const TextField = struct {
         const old = p.clipTo(.{ .x = pad - 2, .y = 0, .w = room + 4, .h = n.size.h });
         defer p.restoreClip(old);
         if (!self.enabled) {
-            const shown_text = if (st.len == 0) self.placeholder else text;
-            _ = p.text(style.size, if (st.len == 0) pad else pad - scroll, baseline, shown_text, t.on_surface.withAlpha(0.38));
+            const shown_text = if (st.text().len == 0) self.placeholder else text;
+            _ = p.text(style.size, if (st.text().len == 0) pad else pad - scroll, baseline, shown_text, t.on_surface.withAlpha(0.38));
             return;
         }
         // The selection behind its text.
@@ -550,7 +484,7 @@ pub const TextField = struct {
                 c.fillRect(.{ .x = sx0, .y = baseline - style.ascent(), .w = sx1 - sx0, .h = style.lineHeight() }, t.primary.withAlpha(if (st.focused) 0.35 else 0.15));
             }
         }
-        if (st.len == 0 and st.preedit_len == 0 and !st.focused) {
+        if (st.text().len == 0 and st.preedit_len == 0 and !st.focused) {
             _ = p.text(style.size, pad, baseline, self.placeholder, t.on_surface_variant);
         } else {
             _ = p.text(style.size, pad - scroll, baseline, text, t.on_surface);
@@ -604,7 +538,7 @@ pub const TextField = struct {
                     1 => {
                         // Dragging selects from where it went down.
                         st.moveTo(self.cursorAt(n, pr.pos[0]), false);
-                        st.anchor = st.cursor;
+                        st.doc().anchor = st.doc().cursor;
                         st.dragging = true;
                     },
                     2 => {
@@ -627,7 +561,7 @@ pub const TextField = struct {
                     n.ui.needs_frame = true;
                 }
                 if (st.dragging) {
-                    st.cursor = self.cursorAt(n, pos[0]);
+                    st.doc().cursor = self.cursorAt(n, pos[0]);
                     st.last_change_other = true;
                     n.ui.needs_frame = true;
                 }
@@ -642,7 +576,7 @@ pub const TextField = struct {
                     return true;
                 }
                 st.dragging = false;
-                if (st.selection() == null) st.anchor = null;
+                if (st.selection() == null) st.doc().anchor = null;
                 return true;
             },
             .focus => st.focused = true,
@@ -698,7 +632,7 @@ pub const TextField = struct {
                     .{ .label = "Cut", .shortcut = "Ctrl+X", .enabled = can_copy, .on_press = .of(st, State.cut) },
                     .{ .label = "Copy", .shortcut = "Ctrl+C", .enabled = can_copy, .on_press = .of(st, State.copy) },
                     .{ .label = "Paste", .shortcut = "Ctrl+V", .on_press = .of(st, State.paste) },
-                    .{ .label = "Select all", .shortcut = "Ctrl+A", .enabled = st.len > 0, .on_press = .of(st, State.selectAll) },
+                    .{ .label = "Select all", .shortcut = "Ctrl+A", .enabled = st.text().len > 0, .on_press = .of(st, State.selectAll) },
                 });
                 return true;
             },
@@ -711,7 +645,7 @@ pub const TextField = struct {
     /// Uses a single forward Layout pass accumulating advance widths (O(N)).
     fn cursorAt(self: *const TextField, n: *const Node, x: f32) usize {
         const st = n.state(State);
-        const style = self.fontStyle(n) orelse return st.len;
+        const style = self.fontStyle(n) orelse return st.text().len;
         const scroll = self.updateScroll(n, style, st);
         var buf: [capacity * dot.len]u8 = undefined;
         const display = self.shown(st, &buf, st.text());
@@ -721,7 +655,7 @@ pub const TextField = struct {
         var best: usize = 0;
         var best_d = @abs(origin - x);
         var display_at: usize = 0; // byte offset into `display`
-        var doc_at: usize = 0; // corresponding byte offset into st.buf
+        var doc_at: usize = 0; // corresponding byte offset into the text
         var lay = font.Layout.init(style, display, 0);
         while (lay.next()) |_| {
             // lay.at is the byte boundary in `display` just after this glyph.
@@ -731,7 +665,7 @@ pub const TextField = struct {
                 // Each dot.len bytes in display == one codepoint in the source.
                 const dots_consumed = (lay.at - display_at) / dot.len;
                 for (0..dots_consumed) |_| {
-                    doc_at += std.unicode.utf8ByteSequenceLength(st.buf[doc_at]) catch 1;
+                    doc_at += std.unicode.utf8ByteSequenceLength(st.text()[doc_at]) catch 1;
                 }
             } else {
                 doc_at = lay.at;
@@ -918,7 +852,7 @@ test "selecting, copying, cutting and pasting, with keys and the menu" {
     T.click(u, .{ 60, rows[1] }, .left);
     T.keys(u, true, false, &.{.v});
     // The text comes later (from another app, say): then it is pasted.
-    try testing.expectEqual(@as(usize, 0), T.field(u, 1).len);
+    try testing.expectEqual(@as(usize, 0), T.field(u, 1).text().len);
     board.deliver();
     try testing.expect(u.needs_frame);
     try testing.expectEqualStrings("hello world", sinks[1].text[0..sinks[1].len]);
@@ -1101,6 +1035,70 @@ test "a field asked for takes the keyboard by itself, once" {
     try testing.expect(u.focused == null);
 }
 
+test "an app's document sets a field's text, selection and focus, and holds what is typed" {
+    const WindowUi = @import("runtime.zig").WindowUi;
+    const f = try font.Font.init(font.default_font_data);
+    const u = try WindowUi.create(testing.allocator, testing.io, &f);
+    defer u.destroy();
+    try u.loadKeymap(@import("window").xkb.testdata.us);
+    const Sink = struct {
+        changes: u32 = 0,
+        fn changed(s: *@This(), _: []const u8) void {
+            s.changes += 1;
+        }
+    };
+    var sink: Sink = .{};
+    var doc = try Document.init(testing.allocator, "hello");
+    defer doc.deinit();
+    doc.moveTo(doc.text().len, false);
+    const App = struct {
+        sink: *Sink,
+        doc: *Document,
+        pub fn build(self: *const @This(), cx: *widget.BuildContext) widget.Widget {
+            return cx.make(Padding{ .padding = .all(20), .child = cx.make(TextField{ .initial = "not this", .doc = self.doc, .on_changed = .of(self.sink, Sink.changed) }) });
+        }
+    };
+    // It shows the document's text, not `initial`.
+    u.frame(400, 200, 0, App{ .sink = &sink, .doc = &doc });
+    const Find = struct {
+        fn field(n: *Node) ?*Node {
+            if (n.widget.is(TextField)) return n;
+            for (n.children.items) |ch| if (field(ch)) |r| return r;
+            return null;
+        }
+    };
+    const field = Find.field(u.root.?).?;
+    try testing.expectEqualStrings("hello", field.state(TextField.State).text());
+    try testing.expect(u.focused == null);
+
+    // Given the keyboard, what is typed (at the end) goes into the document.
+    doc.focus();
+    u.frame(400, 200, 1, App{ .sink = &sink, .doc = &doc });
+    try testing.expect(u.focused == field);
+    u.keyEvent(.s, true);
+    u.keyEvent(.s, false);
+    try testing.expectEqualStrings("hellos", doc.text());
+    try testing.expectEqual(@as(usize, 6), doc.cursor);
+    try testing.expectEqual(@as(u32, 1), sink.changes);
+
+    // Selecting from code: typing replaces the selection.
+    doc.anchor = 1;
+    doc.cursor = 5;
+    u.keyEvent(.a, true);
+    u.keyEvent(.a, false);
+    try testing.expectEqualStrings("has", doc.text());
+
+    // Set from code (as once a message is sent): not a change typed.
+    doc.setText("");
+    u.frame(400, 200, 2, App{ .sink = &sink, .doc = &doc });
+    try testing.expectEqualStrings("", field.state(TextField.State).text());
+    try testing.expectEqual(@as(u32, 2), sink.changes);
+    // Typing goes on from there, on one line.
+    u.keyEvent(.b, true);
+    u.keyEvent(.b, false);
+    try testing.expectEqualStrings("b", doc.text());
+}
+
 test "a UK keyboard types £ and €, and characters are edited whole" {
     const WindowUi = @import("runtime.zig").WindowUi;
     const f = try font.Font.init(font.default_font_data);
@@ -1218,20 +1216,21 @@ test "a password field has a visibility toggle button on the right hand side" {
 
 test "initial text and max_len never split a multi-byte UTF-8 character" {
     // "café" is 5 bytes ('c','a','f', 0xc3, 0xa9); max_len = 4 only fits "caf".
-    const tf: TextField = .{ .initial = "café", .max_len = 4 };
-    var st = tf.initState();
-    try testing.expectEqualStrings("caf", st.text());
-    try testing.expectEqual(@as(usize, 3), st.cursor);
+    var d: Document = .{ .gpa = testing.allocator };
+    defer d.deinit();
+    _ = d.insertWith("café", .{ .single_line = true, .max_len = 4 });
+    try testing.expectEqualStrings("caf", d.text());
+    try testing.expectEqual(@as(usize, 3), d.cursor);
 
     // 2, 3, and 4-byte UTF-8 sequences in initial text, with control chars normalized.
-    const tf2: TextField = .{ .initial = "hé\t€\n🌍", .max_len = 32 };
-    st = tf2.initState();
-    try testing.expectEqualStrings("hé € 🌍", st.text());
+    d.setText("");
+    _ = d.insertWith("hé\t€\n🌍", .{ .single_line = true, .max_len = 32 });
+    try testing.expectEqualStrings("hé € 🌍", d.text());
     // Snapping mid-character byte offsets with moveTo.
-    st.moveTo(2, false); // inside 'é' (bytes 1..3)
-    try testing.expectEqual(@as(usize, 1), st.cursor);
-    st.moveTo(6, true); // inside '€' (bytes 4..7)
-    try testing.expectEqual(@as(usize, 4), st.cursor);
+    d.moveTo(2, false); // inside 'é' (bytes 1..3)
+    try testing.expectEqual(@as(usize, 1), d.cursor);
+    d.moveTo(6, true); // inside '€' (bytes 4..7)
+    try testing.expectEqual(@as(usize, 4), d.cursor);
 }
 
 test "double click selects current word, triple click selects all, and selection is clipped to field bounds" {
@@ -1283,7 +1282,7 @@ test "double click selects current word, triple click selects all, and selection
     // Third click within WindowUi.multi_click_ns selects all text.
     u.pointerButtonAt(click_at, .left, true, 400 * ms);
     u.pointerButtonAt(click_at, .left, false, 410 * ms);
-    try testing.expectEqual([2]usize{ 0, st.len }, st.selection().?);
+    try testing.expectEqual([2]usize{ 0, st.text().len }, st.selection().?);
 
     // A fourth starts over, placing the cursor.
     u.pointerButtonAt(click_at, .left, true, 500 * ms);
@@ -1303,7 +1302,7 @@ test "double click selects current word, triple click selects all, and selection
     try testing.expectEqual([2]usize{ 0, 5 }, st.selection().?);
     u.pointerButtonAt(click_at, .left, true, 2200 * ms);
     u.pointerButtonAt(click_at, .left, false, 2210 * ms);
-    try testing.expectEqual([2]usize{ 0, st.len }, st.selection().?);
+    try testing.expectEqual([2]usize{ 0, st.text().len }, st.selection().?);
 
     // Render frame with full selection on overflowing text and verify no pixels
     // are drawn outside the TextField's horizontal bounds [40, 200).

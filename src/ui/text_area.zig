@@ -35,7 +35,10 @@ const Size = geometry.Size;
 const Point = geometry.Point;
 
 /// The text being edited, with the cursor and selection: the app's, kept
-/// as long as it is edited.
+/// as long as it is edited, by a `TextArea` or (one line of it) a
+/// `TextField`. It is how the app reads the text, sets it (`setText`),
+/// selects it and gives the widget editing it the keyboard (`focus`), as
+/// Flutter's `TextEditingController` is.
 pub const Document = struct {
     /// What allocates its text.
     gpa: std.mem.Allocator,
@@ -47,6 +50,8 @@ pub const Document = struct {
     anchor: ?usize = null,
     /// Counts the changes to the text (the app saves when it changes).
     version: u64 = 0,
+    /// The text area is to take the keyboard (see `focus`).
+    focus_asked: bool = false,
 
     /// A document holding a copy of `initial`, with the cursor at the start.
     pub fn init(gpa: std.mem.Allocator, initial: []const u8) !Document {
@@ -61,6 +66,22 @@ pub const Document = struct {
     /// Frees its text.
     pub fn deinit(d: *Document) void {
         d.bytes.deinit(d.gpa);
+    }
+
+    /// Makes `t` the text (as `insert` puts it), with the cursor at its
+    /// end.
+    pub fn setText(d: *Document, t: []const u8) void {
+        d.bytes.clearRetainingCapacity();
+        d.cursor = 0;
+        d.anchor = null;
+        d.version += 1;
+        d.insert(t);
+    }
+
+    /// Gives the text area editing it the keyboard, when it is next laid
+    /// out.
+    pub fn focus(d: *Document) void {
+        d.focus_asked = true;
     }
 
     /// The text.
@@ -120,7 +141,8 @@ pub const Document = struct {
         d.cursor = d.snap(to);
     }
 
-    fn remove(d: *Document, from: usize, to: usize) void {
+    /// Removes the bytes from `from` to `to`.
+    pub fn remove(d: *Document, from: usize, to: usize) void {
         if (to <= from) return;
         d.bytes.replaceRangeAssumeCapacity(from, to - from, &.{});
         d.version += 1;
@@ -150,7 +172,23 @@ pub const Document = struct {
     /// Puts `t` (UTF-8) at the cursor, over the selection: its characters
     /// but control ones (tabs as four spaces, "\r\n" as "\n").
     pub fn insert(d: *Document, t: []const u8) void {
-        _ = d.deleteSelection();
+        _ = d.insertWith(t, .{});
+    }
+
+    /// How `insertWith` puts text in.
+    pub const InsertOptions = struct {
+        /// One line (a `TextField`'s): line breaks and tabs become spaces.
+        single_line: bool = false,
+        /// The most bytes the text holds: what does not fit is left out
+        /// (whole characters).
+        max_len: usize = std.math.maxInt(usize),
+    };
+
+    /// Puts `t` (UTF-8) at the cursor, over the selection: its characters
+    /// but control ones, as `options` say. Returns whether the text
+    /// changed.
+    pub fn insertWith(d: *Document, t: []const u8, options: InsertOptions) bool {
+        var changed = d.deleteSelection();
         var at: usize = 0;
         while (at < t.len) {
             const n = std.unicode.utf8ByteSequenceLength(t[at]) catch {
@@ -165,15 +203,19 @@ pub const Document = struct {
             const piece = t[at .. at + n];
             at += n;
             const out: []const u8 = switch (c) {
-                '\n' => "\n",
-                '\t' => "    ",
-                0...0x08, 0x0a + 1...0x1f, 0x7f...0x9f => continue,
+                '\n' => if (options.single_line) " " else "\n",
+                '\t' => if (options.single_line) " " else "    ",
+                '\r' => if (options.single_line) " " else continue,
+                0...0x08, 0x0a + 1...0x0c, 0x0e...0x1f, 0x7f...0x9f => continue,
                 else => piece,
             };
-            d.bytes.insertSlice(d.gpa, d.cursor, out) catch return;
+            if (d.bytes.items.len + out.len > options.max_len) break;
+            d.bytes.insertSlice(d.gpa, d.cursor, out) catch break;
             d.cursor += out.len;
             d.version += 1;
+            changed = true;
         }
+        return changed;
     }
 
     /// The character boundary at or before byte `i`.
@@ -384,6 +426,10 @@ pub const TextArea = struct {
         const st = self.remember(n);
         if (self.autofocus and !st.autofocused) {
             st.autofocused = true;
+            n.ui.focus(n);
+        }
+        if (self.doc.focus_asked) {
+            self.doc.focus_asked = false;
             n.ui.focus(n);
         }
         const size = c.constrain(.{ .w = if (c.boundedWidth()) c.max_w else 480, .h = if (c.boundedHeight()) c.max_h else 320 });
@@ -813,6 +859,35 @@ fn wrapLine(gpa: std.mem.Allocator, out: *std.ArrayList(Line), s: font.Style, te
 
 const testing = std.testing;
 const Padding = @import("padding.zig").Padding;
+
+test "a document's text can be set, and its text area given the keyboard" {
+    var d = try Document.init(testing.allocator, "old text");
+    defer d.deinit();
+    const v = d.version;
+    d.selectAll();
+    d.setText("new\ttext");
+    try testing.expectEqualStrings("new    text", d.text());
+    try testing.expectEqual(d.text().len, d.cursor);
+    try testing.expectEqual(@as(?[2]usize, null), d.selection());
+    try testing.expect(d.version != v);
+
+    const WindowUi = @import("runtime.zig").WindowUi;
+    const f = try font.Font.init(font.default_font_data);
+    const u = try WindowUi.create(testing.allocator, testing.io, &f);
+    defer u.destroy();
+    const App = struct {
+        doc: *Document,
+        pub fn build(self: *const @This(), cx: *widget.BuildContext) widget.Widget {
+            return cx.make(TextArea{ .doc = self.doc });
+        }
+    };
+    u.frame(400, 200, 0, App{ .doc = &d });
+    try testing.expect(u.focused == null);
+    d.focus();
+    u.frame(400, 200, 1, App{ .doc = &d });
+    try testing.expect(u.focused != null and u.focused.?.widget.is(TextArea));
+    try testing.expect(!d.focus_asked);
+}
 
 test "a document: typing, selecting and deleting whole characters" {
     var d = try Document.init(testing.allocator, "héllo");
