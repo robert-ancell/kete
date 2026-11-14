@@ -104,6 +104,9 @@ pub const TextField = struct {
         scroll: f32 = 0,
         preedit_buf: [capacity]u8 = undefined,
         preedit_len: usize = 0,
+        /// The keys it took when they went down: it takes their release
+        /// too (which types nothing, so cannot say).
+        keys_down: std.EnumSet(widget.KeyboardKey) = .empty,
         preedit_cursor_begin: i32 = 0,
         preedit_cursor_end: i32 = 0,
         last_change_other: bool = false,
@@ -585,8 +588,15 @@ pub const TextField = struct {
                 st.preedit_len = 0;
             },
             .key => |k| {
+                // What it does not use (Escape, a shortcut) goes on.
                 if (k.isModifier()) return false;
-                if (!k.pressed) return true;
+                if (!k.pressed) {
+                    const was = st.keys_down.contains(k.key);
+                    st.keys_down.remove(k.key);
+                    return was;
+                }
+                if (!edit.usesKey(k, false)) return false;
+                st.keys_down.insert(k.key);
                 n.ui.needs_frame = true;
                 if (k.key == .enter or k.key == .keypad_enter) {
                     if (self.on_submit) |f| f.call();

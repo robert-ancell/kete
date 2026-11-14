@@ -303,6 +303,9 @@ pub const TextArea = struct {
         on_changed: ?widget.Callback = null,
         preedit_buf: [128]u8 = undefined,
         preedit_len: usize = 0,
+        /// The keys it took when they went down: it takes their release
+        /// too (which types nothing, so cannot say).
+        keys_down: std.EnumSet(widget.KeyboardKey) = .empty,
         last_change_other: bool = false,
 
         pub fn deinit(s: *State) void {
@@ -601,8 +604,15 @@ pub const TextArea = struct {
                 st.preedit_len = 0;
             },
             .key => |k| {
+                // What it does not use (Escape, a shortcut) goes on.
                 if (k.isModifier()) return false;
-                if (!k.pressed) return true;
+                if (!k.pressed) {
+                    const was = st.keys_down.contains(k.key);
+                    st.keys_down.remove(k.key);
+                    return was;
+                }
+                if (!edit.usesKey(k, true)) return false;
+                st.keys_down.insert(k.key);
                 st.last_change_other = true;
                 if (self.key(n, st, k)) st.changed() else n.ui.needs_frame = true;
                 return true;

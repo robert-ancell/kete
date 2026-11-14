@@ -236,3 +236,21 @@ test "wordAfter: Ctrl+Right word navigation" {
     // Multibyte: "héllo" → end of string.
     try std.testing.expectEqual(@as(usize, 6), wordAfter("héllo", 0));
 }
+
+/// Whether a text editing widget with the keyboard takes key `k` (an
+/// `Event.Key`), rather than leave it to what it is in (a `KeyHandler`'s
+/// shortcuts): what types, and the keys that edit, move and select (with
+/// Control, those and the clipboard's). `multiline`: a text area's, which
+/// also takes Tab and moves between lines.
+pub fn usesKey(k: anytype, multiline: bool) bool {
+    if (k.ctrl) return switch (k.key) {
+        .a, .c, .x, .v, .left, .right, .backspace, .delete => true,
+        .home, .end => multiline,
+        else => false,
+    };
+    return switch (k.key) {
+        .backspace, .delete, .left, .right, .home, .end, .enter, .keypad_enter => true,
+        .tab, .up, .down, .page_up, .page_down => multiline,
+        else => k.char != null,
+    };
+}

@@ -388,6 +388,10 @@ pub const WindowUi = struct {
     now_ns: u64 = 0,
     /// Something changed (a widget asked for another frame).
     needs_frame: bool = true,
+    /// Offered each input event before the widgets, and taking those it
+    /// wants (returning true): a game's, say, that has the keys and the
+    /// mouse while it is played (`App.WindowOptions.on_input`).
+    on_input: ?widget.Handler(window_mod.InputEvent) = null,
     /// How many input events a widget reacted to (`handleInput`), asking
     /// for another frame.
     reactions: u64 = 0,
@@ -1538,6 +1542,7 @@ pub const WindowUi = struct {
             if (ui.needs_frame) ui.reactions +%= 1;
             ui.needs_frame = ui.needs_frame or asked;
         }
+        if (ui.on_input) |h| if (h.call(e)) return;
         switch (e) {
             .motion => |pos| ui.pointerMotion(pos),
             .button => |b| ui.pointerButton(b.pos, b.button, b.pressed),
@@ -1822,6 +1827,11 @@ pub const WindowUi = struct {
             if (modal_scope) |s| if (!focus_mod.within(n, s)) break;
             if (send(n, .{ .key = e })) return;
         }
+        // With nothing having the keyboard, to the window's key handlers
+        // (in the dialog in front, if one is open; not with a menu open).
+        if (ui.focused == null and ui.menu == null) if (modal_scope orelse ui.root) |r| {
+            if (sendToKeyHandlers(r, e)) return;
+        };
         if (!k.pressed) return;
         switch (k.key) {
             // Escape dismisses the dialog in front.
@@ -1837,6 +1847,17 @@ pub const WindowUi = struct {
             },
             else => {},
         }
+    }
+
+    /// Offers `k` to the `KeyHandler`s in `n`, the innermost (and of
+    /// siblings, the last) first, until one takes it.
+    fn sendToKeyHandlers(n: *Node, k: widget.Event.Key) bool {
+        var i = n.children.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (sendToKeyHandlers(n.children.items[i], k)) return true;
+        }
+        return n.widget.is(@import("key_handler.zig").KeyHandler) and send(n, .{ .key = k });
     }
 
     /// The pointer left the window.
@@ -2100,6 +2121,9 @@ pub const App = struct {
         /// above it.
         parent: ?*Window = null,
         on_close_request: OnCloseRequest = .ignore,
+        /// Offered each input event before its widgets (see
+        /// `WindowUi.on_input`).
+        on_input: ?widget.Handler(window_mod.InputEvent) = null,
     };
 
     /// How a window added by `addWindow` is used.
@@ -2112,6 +2136,7 @@ pub const App = struct {
         draw_in_title_bar: bool = false,
         clear_color: ?u32 = null,
         on_close_request: OnCloseRequest = .ignore,
+        on_input: ?widget.Handler(window_mod.InputEvent) = null,
     };
 
     /// Makes an app with no windows yet (opened by `openWindow`): on the
@@ -2197,7 +2222,7 @@ pub const App = struct {
             .resizable = options.resizable,
         });
         errdefer win.close();
-        const w = try a.adopt(win, .{ .root = options.root, .min_size = options.min_size, .draw_in_title_bar = options.draw_in_title_bar, .clear_color = options.clear_color, .on_close_request = options.on_close_request });
+        const w = try a.adopt(win, .{ .root = options.root, .min_size = options.min_size, .draw_in_title_bar = options.draw_in_title_bar, .clear_color = options.clear_color, .on_close_request = options.on_close_request, .on_input = options.on_input });
         w.owns_window = true;
         // The toolkit's title bar (it knows once the window is open whether
         // it draws one) above what was asked for.
@@ -2236,6 +2261,7 @@ pub const App = struct {
         ui.theme = a.theme.scheme();
         ui.min_size_floor = options.min_size orelse .{ 0, 0 };
         ui.content_in_title_bar = options.draw_in_title_bar;
+        ui.on_input = options.on_input;
         ui.attachWindow(win, &w.controls);
         ui.app_window = w;
         win.setRedraw(.{ .ctx = w, .f = Window.redraw });

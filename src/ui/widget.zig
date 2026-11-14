@@ -213,6 +213,33 @@ pub fn ValueCallback(comptime T: type) type {
     };
 }
 
+/// A callback given a value that says whether it took it (so that it
+/// goes no further): `Handler(Event.Key).of(state, State.key)`.
+pub fn Handler(comptime T: type) type {
+    return struct {
+        /// What `f` is called with (the `ptr` of `of`).
+        ctx: *anyopaque,
+        /// The function to call.
+        f: *const fn (*anyopaque, T) bool,
+
+        /// A handler that calls `f` with `ptr` and the value (`ptr` must last
+        /// as long as the handler is used).
+        pub fn of(ptr: anytype, comptime f: fn (@TypeOf(ptr), T) bool) @This() {
+            const P = @TypeOf(ptr);
+            return .{ .ctx = @ptrCast(@constCast(ptr)), .f = struct {
+                fn call(ctx: *anyopaque, v: T) bool {
+                    return f(@as(P, @ptrCast(@alignCast(ctx))), v);
+                }
+            }.call };
+        }
+
+        /// Calls it with `v`: whether it took it.
+        pub fn call(h: @This(), v: T) bool {
+            return h.f(h.ctx, v);
+        }
+    };
+}
+
 pub const VTable = struct {
     name: []const u8,
     build: ?*const fn (*const anyopaque, *BuildContext, ?*anyopaque) Widget,

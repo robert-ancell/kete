@@ -4033,3 +4033,112 @@ test "a widget scaled about its middle grows every way, and is hit all over" {
     const pressable = find(u.root.?, ui.Pressable).?;
     try testing.expectEqual(ui.Point{ 37.5, 37.5 }, pressable.fromWindow(.{ 55, 55 }).?);
 }
+
+/// A `KeyHandler`'s: the keys it was given, taking those in `takes`.
+const KeyTaker = struct {
+    takes: []const ui.KeyboardKey,
+    log: std.ArrayList(ui.KeyboardKey) = .empty,
+
+    fn key(self: *KeyTaker, k: ui.Event.Key) bool {
+        if (!k.pressed) return false;
+        self.log.append(testing.allocator, k.key) catch {};
+        return std.mem.indexOfScalar(ui.KeyboardKey, self.takes, k.key) != null;
+    }
+};
+
+test "a key handler gets the keys what is in it leaves, and with nothing focused, the innermost first" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    var outer: KeyTaker = .{ .takes = &.{ .delete, .f5 } };
+    defer outer.log.deinit(testing.allocator);
+    var inner: KeyTaker = .{ .takes = &.{.escape} };
+    defer inner.log.deinit(testing.allocator);
+
+    const App = struct {
+        outer: *KeyTaker,
+        inner: *KeyTaker,
+        pub fn build(self: *const @This(), cx: *Context) Widget {
+            return cx.make(ui.KeyHandler{ .on_key = .of(self.outer, KeyTaker.key), .child = cx.make(ui.Column{
+                .fill = false,
+                .children = cx.makeAll(.{
+                    ui.TextField{ .initial = "hi" },
+                    ui.KeyHandler{ .on_key = .of(self.inner, KeyTaker.key), .child = cx.make(ui.SizedBox{ .width = 10, .height = 10 }) },
+                }),
+            }) });
+        }
+    };
+    const root: App = .{ .outer = &outer, .inner = &inner };
+    u.frame(300, 200, 0, root);
+    const press = struct {
+        fn f(w: *ui.WindowUi, key: ui.KeyboardKey, char: ?u21) void {
+            w.key(.{ .key = key, .pressed = true, .char = char });
+            w.key(.{ .key = key, .pressed = false });
+        }
+    }.f;
+
+    // Nothing has the keyboard: the inner handler first, then the outer.
+    try testing.expect(u.focused == null);
+    press(u, .escape, null);
+    press(u, .delete, null);
+    try testing.expectEqualSlices(ui.KeyboardKey, &.{ .escape, .delete }, inner.log.items);
+    try testing.expectEqualSlices(ui.KeyboardKey, &.{.delete}, outer.log.items);
+
+    // A field has it: it keeps what it types, and Backspace; the handler
+    // around it gets what it leaves (the inner one, beside it, nothing).
+    inner.log.clearRetainingCapacity();
+    outer.log.clearRetainingCapacity();
+    const field = find(u.root.?, ui.TextField).?;
+    u.focus(field);
+    press(u, .a, 'a');
+    press(u, .backspace, null);
+    press(u, .escape, null);
+    press(u, .f5, null);
+    u.frame(300, 200, 1, root);
+    try testing.expectEqualStrings("hi", field.state(ui.TextField.State).text());
+    try testing.expectEqualSlices(ui.KeyboardKey, &.{ .escape, .f5 }, outer.log.items);
+    try testing.expectEqual(@as(usize, 0), inner.log.items.len);
+}
+
+test "a window's input handler takes the input it wants before the widgets" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    const Game = struct {
+        keys: u32 = 0,
+        buttons: u32 = 0,
+        fn input(g: *@This(), e: window.InputEvent) bool {
+            switch (e) {
+                .key => |k| if (k.key == .w) {
+                    g.keys += 1;
+                    return true;
+                },
+                .button => |b| if (b.button == .right) {
+                    g.buttons += 1;
+                    return true;
+                },
+                else => {},
+            }
+            return false;
+        }
+    };
+    var game: Game = .{};
+    u.on_input = .of(&game, Game.input);
+    const R = Root(struct {
+        fn f(cx: *Context) Widget {
+            return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.TextField{ .initial = "" }) });
+        }
+    }.f);
+    u.frame(300, 100, 0, R{});
+    const field = find(u.root.?, ui.TextField).?;
+    u.focus(field);
+    // W is the game's; A is typed.
+    u.handleInput(.{ .key = .{ .key = .w, .pressed = true, .char = 'w' } });
+    u.handleInput(.{ .key = .{ .key = .w, .pressed = false } });
+    u.handleInput(.{ .key = .{ .key = .a, .pressed = true, .char = 'a' } });
+    u.handleInput(.{ .button = .{ .pos = .{ 5, 5 }, .button = .right, .pressed = true } });
+    u.frame(300, 100, 1, R{});
+    try testing.expectEqualStrings("a", field.state(ui.TextField.State).text());
+    try testing.expectEqual(@as(u32, 2), game.keys);
+    try testing.expectEqual(@as(u32, 1), game.buttons);
+}

@@ -115,6 +115,7 @@ pub const PointerCursor = widget.PointerCursor;
 pub const TextInputInfo = widget.TextInputInfo;
 pub const Callback = widget.Callback;
 pub const ValueCallback = widget.ValueCallback;
+pub const Handler = widget.Handler;
 
 pub const PointerButton = widget.PointerButton;
 pub const KeyboardKey = widget.KeyboardKey;
@@ -133,6 +134,7 @@ pub const RoundedBox = rounded_box.RoundedBox;
 pub const Pressable = pressable.Pressable;
 pub const PointerInteraction = pressable.PointerInteraction;
 pub const Draggable = drag.Draggable;
+pub const KeyHandler = @import("key_handler.zig").KeyHandler;
 pub const DropTarget = drag.DropTarget;
 pub const MainAxisAlignment = flex.MainAxisAlignment;
 pub const CrossAxisAlignment = flex.CrossAxisAlignment;
