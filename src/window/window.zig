@@ -1618,10 +1618,11 @@ pub const WindowControls = struct {
         if (c.win) |w| if (w.canFullscreen()) w.setFullscreen(!w.isFullscreen());
     }
 
-    /// The title bar was pressed: drag the window (unless it fills the
-    /// screen).
+    /// The title bar was pressed: drag the window. A maximized one too:
+    /// the window system restores it once it is dragged away (as Windows,
+    /// macOS and Wayland's compositors do).
     pub fn drag(c: *WindowControls) void {
-        if (c.win) |w| if (!w.isMaximized()) w.startMove();
+        if (c.win) |w| w.startMove();
     }
 };
 
@@ -1822,4 +1823,26 @@ test "a window's state is read from its methods" {
     try std.testing.expect(!w.isMaximized());
     // What it has no method for has its default.
     try std.testing.expect(!w.isFullscreen());
+}
+
+test "pressing the title bar moves the window, maximized or not" {
+    const Win = struct {
+        maximized: bool = true,
+        moves: u32 = 0,
+        pub fn size(_: *const @This()) [2]u32 {
+            return .{ 1, 1 };
+        }
+        pub fn isMaximized(w: *const @This()) bool {
+            return w.maximized;
+        }
+        pub fn startMove(w: *@This()) void {
+            w.moves += 1;
+        }
+    };
+    var win: Win = .{};
+    var controls: WindowControls = .init(Window.of(&win));
+    controls.drag();
+    win.maximized = false;
+    controls.drag();
+    try std.testing.expectEqual(@as(u32, 2), win.moves);
 }
