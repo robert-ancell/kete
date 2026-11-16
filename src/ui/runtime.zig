@@ -123,15 +123,10 @@ pub const Waker = struct {
 pub const SharedResources = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// The input method typed text goes through, besides emoji (see
-    /// input_method.zig): the app sets it for the system's language
-    /// (`pinyin` for Chinese).
-    input_language: input_method.Language = .none,
-    /// The app's windows compose text themselves (emoji, and the
-    /// `input_language`'s). Turned off where the system has an input method
-    /// that does (a compositor running kete's for its clients), which then
-    /// sends what it composes as an input method's (`text_preedit`,
-    /// `text_commit`).
+    /// The app's windows compose emoji themselves (see input_method.zig).
+    /// Turned off where the system's input method does, and sends what it
+    /// composes as an input method's (`text_preedit`, `text_commit`), as
+    /// it does for languages that need one.
     own_input_method: bool = true,
     /// The interface runs right to left, for Arabic and Hebrew: every
     /// widget's children are mirrored in it as they are laid out (rows run
@@ -1917,7 +1912,6 @@ pub const WindowUi = struct {
         const n = ui.focused orelse return false;
         const st = ui.textInputState() orelse return false;
         if (st.password) return false;
-        ui.ime.language = ui.shared.input_language;
         const before = st.surrounding_text[0..@min(st.cursor, st.surrounding_text.len)];
         const out = ui.ime.key(k, before);
         ui.applyComposing(n, out);
@@ -1965,7 +1959,7 @@ pub const WindowUi = struct {
     /// Ends composing (the focus is going): what was composed goes in as
     /// it is.
     fn finishComposing(ui: *WindowUi) void {
-        if (ui.ime.composing == null) return;
+        if (!ui.ime.composing) return;
         const out = ui.ime.finish();
         if (ui.focused) |n| ui.applyComposing(n, out) else ui.syncCandidates();
     }
@@ -1976,40 +1970,28 @@ pub const WindowUi = struct {
         ui.applyComposing(n, ui.ime.choose(i));
     }
 
-    /// The candidates, one to a row: an emoji and its name, or a
-    /// character and its number (which types it).
+    /// The candidates, one to a row: an emoji and its name.
     fn buildCandidates(ui: *WindowUi, cx: *Context) Widget {
         const a = cx.arena;
         const t = cx.theme();
         const im = &ui.ime;
         const rows = a.alloc(Widget, im.count) catch return cx.make(flex.Column{});
         for (im.candidates[0..im.count], rows, 0..) |cand, *row, i| {
-            // Characters and kana numbered (a digit types them); emoji named.
-            const pinyin = im.composing != .emoji;
-            const label = if (pinyin) (cx.fmt("{d}", .{i + 1})) else cand.label;
             row.* = cx.make(CandidateRow{ .ui = ui, .index = i, .child = cx.make(rounded_box.RoundedBox{
                 .color = if (i == im.selected) t.secondary_container else gfx.Color.argb(0),
                 .radius = .all(8),
                 .child = cx.make(padding_mod.Padding{ .padding = .{ .left = 10, .right = 12, .top = 4, .bottom = 4 }, .child = cx.make(flex.Row{
                     .cross_axis_alignment = .center,
                     .spacing = 10,
-                    .children = a.dupe(Widget, if (pinyin) &.{
-                        cx.make(text_mod.Text{ .text = label, .style = .{ .size = 14, .color = t.on_surface_variant }, .wrap = false }),
-                        cx.make(expanded_mod.Expanded{ .child = cx.make(text_mod.Text{ .text = cand.text, .style = .{ .size = 22, .color = t.on_surface }, .wrap = false, .ellipsis = true }) }),
-                    } else &.{
+                    .children = a.dupe(Widget, &.{
                         cx.make(text_mod.Text{ .text = cand.text, .style = .{ .size = 22, .color = t.on_surface }, .wrap = false }),
-                        cx.make(expanded_mod.Expanded{ .child = cx.make(text_mod.Text{ .text = label, .style = .{ .size = 15, .color = t.on_surface }, .wrap = false, .ellipsis = true }) }),
+                        cx.make(expanded_mod.Expanded{ .child = cx.make(text_mod.Text{ .text = cand.label, .style = .{ .size = 15, .color = t.on_surface }, .wrap = false, .ellipsis = true }) }),
                     }) catch &.{},
                 }) }),
             }) });
         }
-        // As wide as an emoji's name, or a character, needs: by the cursor.
-        return cx.make(sized_box.SizedBox{ .width = switch (im.composing orelse .emoji) {
-            .pinyin => 140,
-            // Kana can be a phrase.
-            .kana => 260,
-            .emoji => 340,
-        }, .child = cx.make(rounded_box.RoundedBox{
+        // As wide as an emoji's name needs: by the cursor.
+        return cx.make(sized_box.SizedBox{ .width = 340, .child = cx.make(rounded_box.RoundedBox{
             .color = t.surface_container_highest,
             .border_width = 1,
             .border_color = t.outline_variant,
