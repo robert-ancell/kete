@@ -20,7 +20,9 @@ const widget = @import("widget.zig");
 const Rect = geometry.Rect;
 const Node = widget.WidgetNode;
 
-/// Rectangles in window pixels (whole pixels), overlapping ones merged.
+/// Rectangles in window pixels (whole pixels), overlapping ones merged:
+/// no two overlap, so a renderer drawing each in turn draws every pixel
+/// once (what is see-through is blended once).
 pub const Region = struct {
     pub const max_rects = 4;
 
@@ -213,6 +215,20 @@ test "regions merge what touches, and keep at most a few rectangles" {
             if (q.x <= x and q.x + q.w >= x + 10) break true;
         } else false;
         try testing.expect(covered);
+    }
+}
+
+test "no two rectangles of a region overlap" {
+    var prng: std.Random.DefaultPrng = .init(7);
+    const rand = prng.random();
+    for (0..200) |_| {
+        var r: Region = .{};
+        for (0..12) |_| {
+            r.add(.{ .x = rand.float(f32) * 300, .y = rand.float(f32) * 200, .w = 1 + rand.float(f32) * 60, .h = 1 + rand.float(f32) * 40 });
+            for (r.slice(), 0..) |a, i| for (r.slice()[i + 1 ..]) |b| {
+                try testing.expect(!(a.x < b.x + b.w and b.x < a.x + a.w and a.y < b.y + b.h and b.y < a.y + a.h));
+            };
+        }
     }
 }
 
