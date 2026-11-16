@@ -1972,7 +1972,8 @@ pub const WindowUi = struct {
         const im = &ui.ime;
         const rows = a.alloc(Widget, im.count) catch return cx.make(flex.Column{});
         for (im.candidates[0..im.count], rows, 0..) |cand, *row, i| {
-            const pinyin = im.composing == .pinyin;
+            // Characters and kana numbered (a digit types them); emoji named.
+            const pinyin = im.composing != .emoji;
             const label = if (pinyin) (cx.fmt("{d}", .{i + 1})) else cand.label;
             row.* = cx.make(CandidateRow{ .ui = ui, .index = i, .child = cx.make(rounded_box.RoundedBox{
                 .color = if (i == im.selected) t.secondary_container else gfx.Color.argb(0),
@@ -1982,7 +1983,7 @@ pub const WindowUi = struct {
                     .spacing = 10,
                     .children = a.dupe(Widget, if (pinyin) &.{
                         cx.make(text_mod.Text{ .text = label, .style = .{ .size = 14, .color = t.on_surface_variant }, .wrap = false }),
-                        cx.make(text_mod.Text{ .text = cand.text, .style = .{ .size = 22, .color = t.on_surface }, .wrap = false }),
+                        cx.make(expanded_mod.Expanded{ .child = cx.make(text_mod.Text{ .text = cand.text, .style = .{ .size = 22, .color = t.on_surface }, .wrap = false, .ellipsis = true }) }),
                     } else &.{
                         cx.make(text_mod.Text{ .text = cand.text, .style = .{ .size = 22, .color = t.on_surface }, .wrap = false }),
                         cx.make(expanded_mod.Expanded{ .child = cx.make(text_mod.Text{ .text = label, .style = .{ .size = 15, .color = t.on_surface }, .wrap = false, .ellipsis = true }) }),
@@ -1991,7 +1992,12 @@ pub const WindowUi = struct {
             }) });
         }
         // As wide as an emoji's name, or a character, needs: by the cursor.
-        return cx.make(sized_box.SizedBox{ .width = if (im.composing == .pinyin) 140 else 340, .child = cx.make(rounded_box.RoundedBox{
+        return cx.make(sized_box.SizedBox{ .width = switch (im.composing orelse .emoji) {
+            .pinyin => 140,
+            // Kana can be a phrase.
+            .kana => 260,
+            .emoji => 340,
+        }, .child = cx.make(rounded_box.RoundedBox{
             .color = t.surface_container_highest,
             .border_width = 1,
             .border_color = t.outline_variant,

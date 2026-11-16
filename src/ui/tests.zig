@@ -1562,6 +1562,33 @@ test "Chinese by pinyin in a text field" {
     try testing.expectEqualStrings("你好ok", st.text());
 }
 
+test "Japanese by romaji in a text field" {
+    const fira = try font.Font.init(fira_data);
+    const shared = try ui.SharedResources.create(testing.allocator, testing.io, &fira);
+    defer shared.destroy();
+    shared.input_language = .romaji;
+    const u = try shared.createWindowUi();
+    defer u.destroy();
+    const FieldApp = struct {
+        pub fn build(_: *const @This(), cx: *Context) Widget {
+            return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.SizedBox{ .width = 240, .child = cx.make(ui.TextField{}) }) });
+        }
+    };
+    u.frame(400, 300, 0, FieldApp{});
+    const tf = find(u.root.?, ui.TextField).?;
+    clickAt(u, .{ tf.position()[0] + 100, tf.position()[1] + 15 });
+    u.frame(400, 300, 1, FieldApp{});
+    const st = tf.state(ui.TextField.State);
+    typeKeys(u, "nihongo");
+    try testing.expectEqualStrings("にほんご", st.preedit());
+    try testing.expect(u.menu != null);
+    // Space: the word; Enter puts it in.
+    typeKeys(u, " ");
+    tapKey(u, .enter);
+    try testing.expectEqualStrings("日本語", st.text());
+    try testing.expect(u.menu == null);
+}
+
 test "WindowUi.createDefault loads bundled Fira Sans and Twemoji fallback fonts" {
     const u = try ui.WindowUi.createDefault(testing.allocator, testing.io);
     defer u.destroy();
