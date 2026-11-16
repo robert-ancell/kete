@@ -30,6 +30,8 @@ pub const Style = text.Style;
 pub const Layout = text.Layout;
 pub const Run = text.Run;
 pub const RunCache = text.RunCache;
+/// Right-to-left text (see bidi.zig).
+pub const bidi = @import("bidi.zig");
 pub const GlyphBitmap = text.GlyphBitmap;
 pub const GlyphBounds = text.GlyphBounds;
 pub const glyphBounds = text.glyphBounds;
@@ -62,4 +64,6 @@ test {
     _ = system;
     _ = raster;
     _ = text;
+    _ = @import("arabic.zig");
+    _ = @import("bidi.zig");
 }

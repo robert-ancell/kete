@@ -7,6 +7,8 @@
 
 const std = @import("std");
 const opentype = @import("opentype.zig");
+const arabic = @import("arabic.zig");
+const bidi = @import("bidi.zig");
 const Rasterizer = @import("raster.zig").Rasterizer;
 
 pub const Font = opentype.Font;
@@ -331,9 +333,17 @@ pub const Layout = struct {
     }
 
     pub fn next(l: *Layout) ?Item {
-        while (decodeAt(l.text, l.at)) |d| {
+        while (decodeAt(l.text, l.at)) |d_in| {
+            var d = d_in;
+            const start = l.at;
             l.at = d.next_at;
             if (d.cp == 0xfe0e or d.cp == 0xfe0f or d.cp == 0x200d) continue;
+            // Arabic letters joined to their neighbours.
+            if (arabic.joins(d.cp)) {
+                const s = arabic.shape(l.text, start, d.next_at);
+                d.cp = s.cp;
+                l.at = s.end;
+            }
 
             var f: *const Font = l.style.font;
             var glyph = f.glyphIndex(d.cp);
@@ -600,11 +610,23 @@ pub const RunCache = struct {
             return e.run;
         }
         var glyphs: std.ArrayList(Layout.Item) = .empty;
+        var starts: std.ArrayList(usize) = .empty;
+        defer starts.deinit(c.gpa);
         var l = Layout.init(style, text, 0);
-        while (l.next()) |item| glyphs.append(c.gpa, item) catch {
-            glyphs.deinit(c.gpa);
-            return null;
-        };
+        while (true) {
+            const at = l.at;
+            const item = l.next() orelse break;
+            glyphs.append(c.gpa, item) catch {
+                glyphs.deinit(c.gpa);
+                return null;
+            };
+            starts.append(c.gpa, at) catch {
+                glyphs.deinit(c.gpa);
+                return null;
+            };
+        }
+        // Right-to-left text in the order it shows.
+        if (bidi.hasRightToLeft(text)) arrange(c.gpa, text, glyphs.items, starts.items, l.x) catch {};
         const run: Run = .{ .glyphs = glyphs.toOwnedSlice(c.gpa) catch {
             glyphs.deinit(c.gpa);
             return null;
@@ -651,6 +673,41 @@ pub const RunCache = struct {
 };
 
 const text_measure = measure;
+
+/// Glyphs laid out in the order they are written, given the places (from
+/// the left) they show at, for text with some that runs right to left
+/// (see bidi.zig). `starts` are where each glyph's text starts; `width`
+/// is the whole run's.
+fn arrange(gpa: std.mem.Allocator, text: []const u8, glyphs: []Layout.Item, starts: []const usize, width: f32) !void {
+    const n = glyphs.len;
+    const classes = try gpa.alloc(bidi.Class, n);
+    defer gpa.free(classes);
+    const cps = try gpa.alloc(u21, n);
+    defer gpa.free(cps);
+    for (starts, classes, cps) |at, *cl, *cp| {
+        cp.* = (Layout.decodeAt(text, at) orelse continue).cp;
+        cl.* = bidi.classOf(cp.*);
+    }
+    const lvls = try gpa.alloc(u8, n);
+    defer gpa.free(lvls);
+    bidi.levels(classes, bidi.rightToLeft(text), lvls);
+    const order = try gpa.alloc(usize, n);
+    defer gpa.free(order);
+    bidi.visualOrder(lvls, order);
+    // Each glyph's advance (and kerning), as laid out.
+    const advances = try gpa.alloc(f32, n);
+    defer gpa.free(advances);
+    for (glyphs, advances, 0..) |g, *a, i| a.* = (if (i + 1 < n) glyphs[i + 1].x else width) - g.x;
+    var x: f32 = 0;
+    for (order) |i| {
+        glyphs[i].x = x;
+        x += advances[i];
+        if (lvls[i] % 2 == 1) if (bidi.mirror(cps[i])) |m| {
+            const g = glyphs[i].font.glyphIndex(m);
+            if (g != opentype.missing_glyph) glyphs[i].glyph = g;
+        };
+    }
+}
 
 test "runs are laid out once, match measuring, and are swept when unused" {
     const f = try Font.init(fira);
