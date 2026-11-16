@@ -278,6 +278,9 @@ pub const VTable = struct {
     /// counting the rest as overflow (`pub const clips_children = true`:
     /// a scroll view).
     clips_children: bool,
+    /// Keeps itself and what is in it left to right in a right-to-left
+    /// interface (`pub const left_to_right = true`: see `LeftToRight`).
+    left_to_right: bool,
     /// How it and its children are drawn moved, scaled or turned
     /// (`pub fn paintTransform(self, n) gfx.Affine`, in its own coordinates):
     /// drawn and hit there, laid out as if not.
@@ -387,6 +390,7 @@ fn makeVTable(comptime T: type) VTable {
         .item_rect = if (@hasDecl(T, "itemRect")) S.itemRect else null,
         .scrolls = @hasDecl(T, "scrolls") and T.scrolls,
         .clips_children = @hasDecl(T, "clips_children") and T.clips_children,
+        .left_to_right = @hasDecl(T, "left_to_right") and T.left_to_right,
         .paint_transform = if (@hasDecl(T, "paintTransform")) S.paintTransform else null,
         .state = if (@hasDecl(T, "State")) .{
             .size = @sizeOf(T.State),
@@ -647,6 +651,11 @@ pub const WidgetNode = struct {
         }
         const want = if (n.widget.vtable.layout) |f| f(n.widget.ptr, n, c) else n.defaultLayout(c);
         n.size = c.sanitizeSize(want);
+        // Right to left: its children mirrored in it (and theirs in them,
+        // as they were laid out).
+        if (n.children.items.len > 0 and n.rightToLeft()) for (n.children.items) |ch| {
+            ch.offset[0] = n.size.w - ch.offset[0] - ch.size.w;
+        };
         if (n.widget.vtable.clips_children) n.overflow = .{} else n.findOverflow();
         return n.size;
     }
@@ -900,6 +909,15 @@ pub const WidgetNode = struct {
     pub fn fromWindow(n: *const WidgetNode, p: Point) ?Point {
         const outer = if (n.parent) |up| up.fromWindow(p) orelse return null else p;
         return n.untransform(.{ outer[0] - n.offset[0], outer[1] - n.offset[1] });
+    }
+
+    /// Whether it runs right to left: the interface does (see
+    /// `SharedResources.right_to_left`), and it is not in a `LeftToRight`.
+    pub fn rightToLeft(n: *const WidgetNode) bool {
+        if (!n.ui.shared.right_to_left) return false;
+        var up: ?*const WidgetNode = n;
+        while (up) |u| : (up = u.parent) if (u.widget.vtable.left_to_right) return false;
+        return true;
     }
 
     /// Where the node's top left is in the window (as last laid out,

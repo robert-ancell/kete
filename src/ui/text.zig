@@ -217,7 +217,13 @@ pub const Text = struct {
         const h = n.size.h;
         for (laid.lines, 0..) |l, i| {
             // Along the line and across the lines, then turned.
-            const a: f32 = switch (self.text_align) {
+            // Starting on the right, right to left.
+            const text_align: TextAlign = if (self.direction == .right and n.rightToLeft()) switch (self.text_align) {
+                .start => .end,
+                .end => .start,
+                .center => .center,
+            } else self.text_align;
+            const a: f32 = switch (text_align) {
                 .start => 0,
                 .center => @max((length - l.width) / 2, 0),
                 .end => @max(length - l.width, 0),

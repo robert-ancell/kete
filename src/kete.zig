@@ -35,6 +35,7 @@ pub const PointerButton = ui.PointerButton;
 pub const KeyboardKey = ui.KeyboardKey;
 
 pub const SizedBox = ui.SizedBox;
+pub const LeftToRight = ui.LeftToRight;
 pub const ConstrainedBox = ui.ConstrainedBox;
 pub const Padding = ui.Padding;
 pub const Align = ui.Align;

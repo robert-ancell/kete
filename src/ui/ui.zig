@@ -121,6 +121,8 @@ pub const PointerButton = widget.PointerButton;
 pub const KeyboardKey = widget.KeyboardKey;
 
 pub const SizedBox = sized_box.SizedBox;
+pub const left_to_right = @import("left_to_right.zig");
+pub const LeftToRight = left_to_right.LeftToRight;
 pub const ConstrainedBox = constrained_box.ConstrainedBox;
 pub const Padding = padding.Padding;
 pub const Align = @"align".Align;

@@ -1562,6 +1562,33 @@ test "Chinese by pinyin in a text field" {
     try testing.expectEqualStrings("你好ok", st.text());
 }
 
+test "right to left: rows run from the right, and a LeftToRight does not" {
+    const fira = try font.Font.init(fira_data);
+    const shared = try ui.SharedResources.create(testing.allocator, testing.io, &fira);
+    defer shared.destroy();
+    shared.right_to_left = true;
+    const u = try shared.createWindowUi();
+    defer u.destroy();
+    const RowApp = struct {
+        pub fn build(_: *const @This(), cx: *Context) Widget {
+            return cx.make(ui.Column{ .children = cx.makeAll(.{
+                ui.Row{ .children = cx.makeAll(.{ ui.SizedBox{ .width = 50, .height = 10 }, ui.SizedBox{ .width = 30, .height = 10 } }) },
+                ui.LeftToRight{ .child = cx.make(ui.Row{ .children = cx.makeAll(.{ ui.SizedBox{ .width = 50, .height = 10 }, ui.SizedBox{ .width = 30, .height = 10 } }) }) },
+            }) });
+        }
+    };
+    u.frame(400, 300, 0, RowApp{});
+    const col = find(u.root.?, ui.Column).?;
+    const row = col.child(0);
+    // The first at the right, the second to its left.
+    try testing.expectEqual(@as(f32, 350), row.child(0).position()[0]);
+    try testing.expectEqual(@as(f32, 320), row.child(1).position()[0]);
+    // Left to right: from the left of where the row is (on the right).
+    const ltr_row = col.child(1).child(0);
+    try testing.expectEqual(ltr_row.position()[0], ltr_row.child(0).position()[0]);
+    try testing.expect(ltr_row.child(1).position()[0] > ltr_row.child(0).position()[0]);
+}
+
 test "Japanese by romaji in a text field" {
     const fira = try font.Font.init(fira_data);
     const shared = try ui.SharedResources.create(testing.allocator, testing.io, &fira);

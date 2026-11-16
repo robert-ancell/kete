@@ -127,6 +127,11 @@ pub const SharedResources = struct {
     /// input_method.zig): the app sets it for the system's language
     /// (`pinyin` for Chinese).
     input_language: input_method.Language = .none,
+    /// The interface runs right to left, for Arabic and Hebrew: every
+    /// widget's children are mirrored in it as they are laid out (rows run
+    /// from the right, padding and alignment swap sides), and text starts
+    /// on the right. What is in a `LeftToRight` is not.
+    right_to_left: bool = false,
     /// Text is drawn in it; without one, text takes no space.
     font: ?*const font.Font,
     owned_font: ?font.Font = null,

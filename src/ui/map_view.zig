@@ -80,6 +80,10 @@ const max_fallback = 6;
 /// A map of the world made of tiles (vectors drawn by a style, or images), that
 /// can be dragged, zoomed and flung, and is a globe when zoomed far out.
 pub const MapView = struct {
+    /// North is up, and east to the right, whichever way the interface
+    /// runs.
+    pub const left_to_right = true;
+
     /// Where the tiles come from.
     source: MapSource,
     /// How vector tiles are drawn: a plain style in the theme's colours if
