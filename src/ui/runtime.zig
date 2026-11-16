@@ -2483,6 +2483,16 @@ pub const App = struct {
         };
     }
 
+    /// Lays its windows out right to left, or left to right (see
+    /// `SharedResources.right_to_left`).
+    pub fn setRightToLeft(a: *App, rtl: bool) void {
+        if (a.shared.right_to_left == rtl) return;
+        a.shared.right_to_left = rtl;
+        for (a.windows.items) |w| if (!w.closed) {
+            w.dirty = true;
+        };
+    }
+
     /// Sets the theme (light or dark) of all its windows.
     pub fn setTheme(a: *App, mode: theme_mod.ThemeMode) void {
         a.theme = mode;
