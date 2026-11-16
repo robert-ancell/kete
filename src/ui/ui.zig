@@ -122,10 +122,6 @@ pub const KeyboardKey = widget.KeyboardKey;
 
 pub const SizedBox = sized_box.SizedBox;
 pub const left_to_right = @import("left_to_right.zig");
-/// Emoji by name: kete's own input method, and for a system's input method
-/// to find them by (see emoji.zig).
-pub const input_method = @import("input_method.zig");
-pub const emoji = @import("emoji.zig");
 pub const LeftToRight = left_to_right.LeftToRight;
 pub const ConstrainedBox = constrained_box.ConstrainedBox;
 pub const Padding = padding.Padding;

@@ -264,6 +264,9 @@ pub const TextArea = struct {
     on_changed: ?widget.Callback = null,
     /// Take the keyboard when it first appears.
     autofocus: bool = false,
+    /// `:` then a name types an emoji ("tada": 🎉), from a popup (see
+    /// input_method.zig). Off where `:` has to stay as typed (code).
+    emoji: bool = true,
     /// Says what each byte of the text is, for its colour (`out` is as long
     /// as the text, and all `plain` to start with).
     highlighter: ?Highlighter = null,
@@ -405,6 +408,7 @@ pub const TextArea = struct {
             .password = false,
             .multiline = true,
             .change_cause_other = st.last_change_other,
+            .emoji = self.emoji,
         };
     }
 

@@ -6,11 +6,12 @@
 //! what was typed. What is typed shows in the field as its preedit,
 //! underlined.
 //!
-//! Languages that need an input method (Chinese, Japanese and others) are
-//! the system's to provide, and arrive as an input method's text
-//! (`text_preedit`, `text_commit`). So can emoji, where the system has an
-//! input method that does them: then this is turned off (see
-//! `SharedResources.own_input_method`).
+//! Emoji by name is a convention of apps (chat apps have it), not of
+//! systems, which have pickers of their own (Win+., Ctrl+Cmd+Space) that
+//! work beside it; so kete has it, in every text field and area unless the
+//! app turns it off there (their `emoji`). Languages that need an input
+//! method (Chinese, Japanese and others) are the system's to provide, and
+//! arrive as an input method's text (`text_preedit`, `text_commit`).
 //!
 //! Never in a password field. `WindowUi` gives it the keys first (see
 //! `WindowUi.key`), and sends what it composes and puts in to the field

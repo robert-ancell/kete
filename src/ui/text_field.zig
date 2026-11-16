@@ -59,6 +59,9 @@ pub const TextField = struct {
     doc: ?*Document = null,
     /// Dots instead of the characters (for passwords).
     obscure: bool = false,
+    /// `:` then a name types an emoji ("tada": 🎉), from a popup (see
+    /// input_method.zig). Off where `:` has to stay as typed.
+    emoji: bool = true,
     /// The most bytes it holds.
     max_len: usize = 63,
     /// Its width, in pixels.
@@ -406,6 +409,7 @@ pub const TextField = struct {
             .password = self.obscure,
             .multiline = false,
             .change_cause_other = st.last_change_other,
+            .emoji = self.emoji,
         };
     }
 

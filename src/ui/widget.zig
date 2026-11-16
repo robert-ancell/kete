@@ -93,6 +93,9 @@ pub const TextInputInfo = struct {
     password: bool = false,
     multiline: bool = false,
     change_cause_other: bool = false,
+    /// `:` then a name types an emoji (kete's own input method: see
+    /// input_method.zig).
+    emoji: bool = true,
 };
 
 /// What happens to a widget with an `event` function. It returns whether it

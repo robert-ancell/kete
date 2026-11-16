@@ -123,11 +123,6 @@ pub const Waker = struct {
 pub const SharedResources = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// The app's windows compose emoji themselves (see input_method.zig).
-    /// Turned off where the system's input method does, and sends what it
-    /// composes as an input method's (`text_preedit`, `text_commit`), as
-    /// it does for languages that need one.
-    own_input_method: bool = true,
     /// The interface runs right to left, for Arabic and Hebrew: every
     /// widget's children are mirrored in it as they are laid out (rows run
     /// from the right, padding and alignment swap sides), and text starts
@@ -1908,11 +1903,16 @@ pub const WindowUi = struct {
     /// input method's would, and its candidates show in a popup by the
     /// cursor. Returns whether the key was the input method's.
     fn inputMethodKey(ui: *WindowUi, k: widget.Event.Key) bool {
-        if (!ui.shared.own_input_method) return false;
         const n = ui.focused orelse return false;
-        const st = ui.textInputState() orelse return false;
-        if (st.password) return false;
-        const before = st.surrounding_text[0..@min(st.cursor, st.surrounding_text.len)];
+        const f = n.widget.vtable.text_input orelse return false;
+        const info = f(n.widget.ptr, n) orelse return false;
+        // Not in a password, nor where the widget turns emoji off (and if
+        // they go off while one is being typed, it is put in as typed).
+        if (info.password or !info.emoji) {
+            if (ui.ime.composing) ui.finishComposing();
+            return false;
+        }
+        const before = info.surrounding_text[0..@min(info.cursor, info.surrounding_text.len)];
         const out = ui.ime.key(k, before);
         ui.applyComposing(n, out);
         return out.taken;
