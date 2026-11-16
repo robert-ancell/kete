@@ -25,6 +25,7 @@ const geometry = @import("geometry.zig");
 const widget = @import("widget.zig");
 const painter_mod = @import("painter.zig");
 const menu = @import("menu.zig");
+const text_field = @import("text_field.zig");
 const SyntaxHighlight = @import("theme.zig").SyntaxHighlight;
 
 const Node = widget.WidgetNode;
@@ -306,6 +307,10 @@ pub const TextArea = struct {
         on_changed: ?widget.Callback = null,
         preedit_buf: [128]u8 = undefined,
         preedit_len: usize = 0,
+        /// The part of it the input method marks (the phrase being
+        /// converted).
+        preedit_cursor_begin: i32 = 0,
+        preedit_cursor_end: i32 = 0,
         /// The keys it took when they went down: it takes their release
         /// too (which types nothing, so cannot say).
         keys_down: std.EnumSet(widget.KeyboardKey) = .empty,
@@ -389,7 +394,7 @@ pub const TextArea = struct {
             const li = lineOf(lines, d.cursor);
             if (li < lines.len or lines.len == 0) {
                 const l = if (lines.len == 0) Line{ .start = 0, .end = 0 } else lines[li];
-                const x = pad + font.measure(s, t[l.start..@min(d.cursor, l.end)]);
+                const x = pad + font.measure(s, t[l.start..@min(d.cursor, l.end)]) + text_field.preeditOffset(s, st.preedit_buf[0..st.preedit_len], st.preedit_cursor_begin);
                 const top = pad + @as(f32, @floatFromInt(li)) * lh - st.scroll;
                 cx_px = @intFromFloat(@round(x));
                 cy_px = @intFromFloat(@round(top));
@@ -549,6 +554,7 @@ pub const TextArea = struct {
                     const pre_w = font.measure(s, pre);
                     const baseline = top + s.ascent();
                     c.fillRect(.{ .x = @round(x), .y = baseline + 1, .w = pre_w, .h = 1 }, t.primary);
+                    text_field.markPreedit(c, s, pre, st.preedit_cursor_begin, st.preedit_cursor_end, @round(x), baseline, t.primary);
                     _ = p.text(s.size, @round(x), baseline, pre, t.primary);
                 } else {
                     c.fillRect(.{ .x = @round(x), .y = top, .w = 2, .h = lh }, t.primary);
@@ -637,6 +643,8 @@ pub const TextArea = struct {
                 const len = @min(pre.text.len, st.preedit_buf.len);
                 @memcpy(st.preedit_buf[0..len], pre.text[0..len]);
                 st.preedit_len = len;
+                st.preedit_cursor_begin = pre.cursor_begin;
+                st.preedit_cursor_end = pre.cursor_end;
                 n.ui.needs_frame = true;
                 return true;
             },

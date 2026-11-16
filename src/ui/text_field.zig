@@ -391,7 +391,9 @@ pub const TextField = struct {
         var cy_px: i32 = 8;
         var ch_px: i32 = @max(1, @as(i32, @intFromFloat(@round(n.size.h))) - 16);
         if (self.fontStyle(n)) |style| {
-            const cursor_x = self.xOf(style, st, st.doc().cursor);
+            // At the preedit's marked part (the phrase being converted),
+            // for the input method's candidates to go by.
+            const cursor_x = self.xOf(style, st, st.doc().cursor) + preeditOffset(style, st.preedit(), st.preedit_cursor_begin);
             const scroll = self.updateScroll(n, style, st);
             const baseline = @round((n.size.h - style.lineHeight()) / 2 + style.ascent());
             cx_px = @intFromFloat(@round(pad - scroll + cursor_x));
@@ -501,6 +503,7 @@ pub const TextField = struct {
             const pre_w = font.measure(style, pre);
             const px = @round(pad - scroll + cursor_x);
             c.fillRect(.{ .x = px, .y = baseline + 1, .w = pre_w, .h = 1 }, t.primary);
+            markPreedit(c, style, pre, st.preedit_cursor_begin, st.preedit_cursor_end, px, baseline, t.primary);
             _ = p.text(style.size, px, baseline, pre, t.primary);
         } else if (st.focused and st.selection() == null) {
             const x = @round(pad - scroll + cursor_x);
@@ -705,6 +708,23 @@ fn charClassAt(text: []const u8, i: usize) CharClass {
     if (i + seq_len > text.len) return .word;
     const cp = std.unicode.utf8Decode(text[i..][0..seq_len]) catch return .word;
     return edit.charClass(cp);
+}
+
+/// Underlines the part of a preedit an input method marks (its cursor's
+/// begin to end: the phrase being converted) more heavily.
+pub fn markPreedit(c: anytype, style: font.Style, pre: []const u8, begin: i32, end: i32, x: f32, baseline: f32, color: anytype) void {
+    if (begin < 0 or end <= begin) return;
+    const b: usize = @min(@as(usize, @intCast(begin)), pre.len);
+    const e: usize = @min(@as(usize, @intCast(end)), pre.len);
+    if (e <= b) return;
+    const mx = x + font.measure(style, pre[0..b]);
+    c.fillRect(.{ .x = @round(mx), .y = baseline + 1, .w = font.measure(style, pre[b..e]), .h = 2 }, color);
+}
+
+/// How far into a preedit its cursor (begin) is.
+pub fn preeditOffset(style: font.Style, pre: []const u8, begin: i32) f32 {
+    if (begin <= 0) return 0;
+    return font.measure(style, pre[0..@min(@as(usize, @intCast(begin)), pre.len)]);
 }
 
 const testing = std.testing;

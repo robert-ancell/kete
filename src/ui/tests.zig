@@ -1477,6 +1477,15 @@ test "zwp_text_input_v3 events commit text, render preedit, and delete surroundi
     u.handleInput(pre_ev);
     try testing.expectEqualStrings("hello", tf_state.text());
     u.frame(300, 100, 2, FieldApp{});
+    // A part of it marked (a phrase being converted): the cursor the
+    // input method is told of is at that part, for its candidates (here,
+    // after "n" rather than after "ni").
+    const at_end = u.textInputState().?.cursor_rect[0];
+    pre_ev.text_preedit.cursor_begin = 1;
+    pre_ev.text_preedit.cursor_end = 2;
+    u.handleInput(pre_ev);
+    u.frame(300, 100, 3, FieldApp{});
+    try testing.expect(u.textInputState().?.cursor_rect[0] < at_end);
 
     // Commit string replaces preedit and inserts into the TextField.
     var com_ev: window.InputEvent = .{ .text_commit = .{ .len = 1 } };
