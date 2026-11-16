@@ -45,6 +45,8 @@ const flex = @import("flex.zig");
 const text_mod = @import("text.zig");
 const padding_mod = @import("padding.zig");
 const rounded_box = @import("rounded_box.zig");
+const sized_box = @import("sized_box.zig");
+const expanded_mod = @import("expanded.zig");
 const sys = window_mod.sys;
 /// AT-SPI is Linux's (on other systems, nothing is offered yet).
 const has_atspi = sys.is_linux;
@@ -1978,18 +1980,18 @@ pub const WindowUi = struct {
                 .child = cx.make(padding_mod.Padding{ .padding = .{ .left = 10, .right = 12, .top = 4, .bottom = 4 }, .child = cx.make(flex.Row{
                     .cross_axis_alignment = .center,
                     .spacing = 10,
-                    .fill = false,
                     .children = a.dupe(Widget, if (pinyin) &.{
                         cx.make(text_mod.Text{ .text = label, .style = .{ .size = 14, .color = t.on_surface_variant }, .wrap = false }),
                         cx.make(text_mod.Text{ .text = cand.text, .style = .{ .size = 22, .color = t.on_surface }, .wrap = false }),
                     } else &.{
                         cx.make(text_mod.Text{ .text = cand.text, .style = .{ .size = 22, .color = t.on_surface }, .wrap = false }),
-                        cx.make(text_mod.Text{ .text = label, .style = .{ .size = 15, .color = t.on_surface }, .wrap = false }),
+                        cx.make(expanded_mod.Expanded{ .child = cx.make(text_mod.Text{ .text = label, .style = .{ .size = 15, .color = t.on_surface }, .wrap = false, .ellipsis = true }) }),
                     }) catch &.{},
                 }) }),
             }) });
         }
-        return cx.make(rounded_box.RoundedBox{
+        // As wide as an emoji's name, or a character, needs: by the cursor.
+        return cx.make(sized_box.SizedBox{ .width = if (im.composing == .pinyin) 140 else 340, .child = cx.make(rounded_box.RoundedBox{
             .color = t.surface_container_highest,
             .border_width = 1,
             .border_color = t.outline_variant,
@@ -1999,7 +2001,7 @@ pub const WindowUi = struct {
                 .fill = false,
                 .children = rows,
             }) }),
-        });
+        }) });
     }
 
     /// A candidate's row: chosen when clicked, without taking the focus
