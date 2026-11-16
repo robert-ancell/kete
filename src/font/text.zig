@@ -342,12 +342,16 @@ pub const Layout = struct {
             if (glyph == opentype.missing_glyph or next_non_ascii or f.num_ccmp_lookups > 0) {
                 const first_next = if (next_non_ascii) decodeAt(l.text, l.at) else null;
                 const wants_emoji = if (first_next) |fn_d| (fn_d.cp == 0xfe0f or fn_d.cp == 0x20e3) else false;
-                if (f.fallback) |fb| {
-                    if (glyph == opentype.missing_glyph or wants_emoji) {
+                // Along the fallbacks (emoji, then other scripts) to the
+                // first that has it.
+                if (glyph == opentype.missing_glyph or wants_emoji) {
+                    var tried = f.fallback;
+                    while (tried) |fb| : (tried = fb.fallback) {
                         const fg = fb.glyphIndex(d.cp);
                         if (fg != opentype.missing_glyph) {
                             f = fb;
                             glyph = fg;
+                            break;
                         }
                     }
                 }

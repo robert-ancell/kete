@@ -123,6 +123,11 @@ pub const SharedResources = struct {
     /// The fonts' bytes, when read from files (see `Fonts`).
     font_bytes: ?[]u8 = null,
     emoji_font_bytes: ?[]u8 = null,
+    /// Fonts for the scripts the text font lacks (`Fonts.fallback_paths`:
+    /// Chinese, say), after the emoji font, and their files' contents.
+    fallback_fonts: [max_fallbacks]font.Font = undefined,
+    fallback_bytes: [max_fallbacks][]u8 = undefined,
+    fallback_count: usize = 0,
     /// Icons are drawn with it (see `Icon`).
     icon_font: font.Font,
     atlas: gfx.Atlas,
@@ -201,6 +206,8 @@ pub const SharedResources = struct {
     /// What the app's windows share, using the bundled default Fira Sans and
     /// Twemoji Mozilla fallback fonts (or, if kete was built without them,
     /// the same fonts found on the system: see `Fonts`).
+    pub const max_fallbacks = 4;
+
     pub fn createDefault(gpa: std.mem.Allocator, io: std.Io) !*SharedResources {
         return createWithFonts(gpa, io, .empty, .{});
     }
@@ -226,6 +233,10 @@ pub const SharedResources = struct {
         path: ?[]const u8 = null,
         /// The emoji font's file.
         emoji_path: ?[]const u8 = null,
+        /// Fonts for characters neither has (scripts the text font lacks:
+        /// Chinese, say), tried in order after the emoji font; one that
+        /// cannot be read is left out. At most `max_fallbacks`.
+        fallback_paths: []const []const u8 = &.{},
     };
 
     /// What the app's windows share, drawing text in `fonts`.
@@ -243,7 +254,24 @@ pub const SharedResources = struct {
         const emoji_data: ?[]const u8 = s.emoji_font_bytes orelse if (comptime font.has_embedded_fonts) font.emoji_font_data else null;
         if (emoji_data) |d| s.emoji_font = font.Font.init(d) catch null;
         const f = &s.owned_font.?;
-        if (s.emoji_font) |*ef| f.fallback = ef;
+        // The chain: the text font, the emoji font, then the others.
+        var last: *font.Font = f;
+        if (s.emoji_font) |*ef| {
+            last.fallback = ef;
+            last = ef;
+        }
+        for (fonts.fallback_paths[0..@min(fonts.fallback_paths.len, max_fallbacks)]) |p| {
+            const bytes = font.system.read(io, gpa, p) catch continue;
+            const ff = font.Font.init(bytes) catch {
+                gpa.free(bytes);
+                continue;
+            };
+            s.fallback_bytes[s.fallback_count] = bytes;
+            s.fallback_fonts[s.fallback_count] = ff;
+            last.fallback = &s.fallback_fonts[s.fallback_count];
+            last = &s.fallback_fonts[s.fallback_count];
+            s.fallback_count += 1;
+        }
         s.font = f;
         return s;
     }
@@ -277,6 +305,7 @@ pub const SharedResources = struct {
         s.atlas.deinit();
         if (s.font_bytes) |b| s.gpa.free(b);
         if (s.emoji_font_bytes) |b| s.gpa.free(b);
+        for (s.fallback_bytes[0..s.fallback_count]) |b| s.gpa.free(b);
         s.gpa.destroy(s);
     }
 
@@ -2085,6 +2114,8 @@ pub const App = struct {
         /// The file to read the font emoji are drawn in from; the bundled
         /// Twemoji Mozilla if null.
         emoji_font_path: ?[]const u8 = null,
+        /// Fonts for characters neither has (see `SharedResources.Fonts`).
+        fallback_font_paths: []const []const u8 = &.{},
         /// What its windows are on (a custom backend's, or
         /// `window.Display.single` for a custom backend's one window),
         /// which stays the caller's to close after the app; the system's
@@ -2151,7 +2182,7 @@ pub const App = struct {
         else
             return error.NoDisplay;
         errdefer if (owns_display) display.close();
-        const shared = try SharedResources.createWithFonts(gpa, io, environ, .{ .data = options.font_data, .path = options.font_path, .emoji_path = options.emoji_font_path });
+        const shared = try SharedResources.createWithFonts(gpa, io, environ, .{ .data = options.font_data, .path = options.font_path, .emoji_path = options.emoji_font_path, .fallback_paths = options.fallback_font_paths });
         errdefer shared.destroy();
         const a = try gpa.create(App);
         a.* = .{
