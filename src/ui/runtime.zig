@@ -40,6 +40,11 @@ const tooltip_mod = @import("tooltip.zig");
 const title_bar_mod = @import("title_bar.zig");
 const accessibility = @import("accessibility.zig");
 const focus_mod = @import("focus.zig");
+const input_method = @import("input_method.zig");
+const flex = @import("flex.zig");
+const text_mod = @import("text.zig");
+const padding_mod = @import("padding.zig");
+const rounded_box = @import("rounded_box.zig");
 const sys = window_mod.sys;
 /// AT-SPI is Linux's (on other systems, nothing is offered yet).
 const has_atspi = sys.is_linux;
@@ -116,6 +121,10 @@ pub const Waker = struct {
 pub const SharedResources = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// The input method typed text goes through, besides emoji (see
+    /// input_method.zig): the app sets it for the system's language
+    /// (`pinyin` for Chinese).
+    input_language: input_method.Language = .none,
     /// Text is drawn in it; without one, text takes no space.
     font: ?*const font.Font,
     owned_font: ?font.Font = null,
@@ -454,6 +463,9 @@ pub const WindowUi = struct {
     focus_before_menu: ?*Node = null,
     /// Whether the menu is to be given the focus when it is made.
     menu_focus_pending: bool = false,
+    /// kete's own input method (see input_method.zig), for its text
+    /// widgets.
+    ime: input_method.InputMethod = .{},
     /// The keyboard layout in use (from the window, or `loaded_keymap`).
     keyboard: window_mod.KeyboardLayout = .{},
     /// A keymap of its own (`loadKeymap`), for keys from `keyEvent` that
@@ -1793,6 +1805,7 @@ pub const WindowUi = struct {
     /// Gives the keyboard focus to `n` (or to none), telling the nodes losing and gaining it.
     pub fn focus(ui: *WindowUi, n: ?*Node) void {
         if (ui.focused == n) return;
+        ui.finishComposing();
         if (ui.focused) |old| _ = send(old, .blur);
         ui.focused = n;
         if (n) |new| _ = send(new, .focus);
@@ -1831,6 +1844,8 @@ pub const WindowUi = struct {
     /// A key went down or up, with what it types (if anything) and the
     /// modifiers held.
     pub fn key(ui: *WindowUi, k: widget.Event.Key) void {
+        // kete's input method (emoji, Chinese) first, for a text widget.
+        if (ui.inputMethodKey(k)) return;
         // Modifiers go to what has the focus too (an app may pass them on, to
         // a remote machine or an emulator): widgets that type ignore them.
         if (k.key == .escape and k.pressed and ui.menu != null) {
@@ -1877,6 +1892,135 @@ pub const WindowUi = struct {
             else => {},
         }
     }
+
+    // --- kete's input method -------------------------------------------------------
+
+    /// Offers `k` to kete's input method, if what has the focus takes text
+    /// (and not a password): what it composes and puts in goes to it, as an
+    /// input method's would, and its candidates show in a popup by the
+    /// cursor. Returns whether the key was the input method's.
+    fn inputMethodKey(ui: *WindowUi, k: widget.Event.Key) bool {
+        const n = ui.focused orelse return false;
+        const st = ui.textInputState() orelse return false;
+        if (st.password) return false;
+        ui.ime.language = ui.shared.input_language;
+        const before = st.surrounding_text[0..@min(st.cursor, st.surrounding_text.len)];
+        const out = ui.ime.key(k, before);
+        ui.applyComposing(n, out);
+        return out.taken;
+    }
+
+    /// Sends what the input method put in, and what it composes, to `n`;
+    /// shows (or hides) its candidates.
+    fn applyComposing(ui: *WindowUi, n: *Node, out: input_method.InputMethod.Outcome) void {
+        if (out.commit) |c| _ = send(n, .{ .text_commit = c });
+        if (out.preedit) {
+            const len: i32 = @intCast(ui.ime.composed().len);
+            _ = send(n, .{ .text_preedit = .{ .text = ui.ime.composed(), .cursor_begin = len, .cursor_end = len } });
+        }
+        if (out.commit != null or out.preedit or out.taken) ui.needs_frame = true;
+        ui.syncCandidates();
+    }
+
+    /// The candidates' popup: shown by the cursor while there are any.
+    fn syncCandidates(ui: *WindowUi) void {
+        const ours = if (ui.menu) |m| m.content == .popup and m.content.popup.ctx == @as(*const anyopaque, @ptrCast(ui)) else false;
+        const n = ui.focused orelse {
+            if (ours) ui.closeMenu();
+            return;
+        };
+        if (!ui.ime.showing()) {
+            if (ours) ui.closeMenu();
+            return;
+        }
+        const st = ui.textInputState() orelse return;
+        const r = st.cursor_rect;
+        const at: Point = .{ @floatFromInt(r[0]), @floatFromInt(r[1] + r[3] + 4) };
+        if (ours) {
+            ui.menu.?.at = at;
+            ui.needs_frame = true;
+            return;
+        }
+        // Not as a menu opened from the keyboard is: the focus stays where
+        // the text is typed.
+        ui.closeMenu();
+        ui.menu = .{ .content = .{ .popup = .of(ui, buildCandidates) }, .at = at, .owner = n };
+        ui.needs_frame = true;
+    }
+
+    /// Ends composing (the focus is going): what was composed goes in as
+    /// it is.
+    fn finishComposing(ui: *WindowUi) void {
+        if (ui.ime.composing == null) return;
+        const out = ui.ime.finish();
+        if (ui.focused) |n| ui.applyComposing(n, out) else ui.syncCandidates();
+    }
+
+    /// A candidate clicked.
+    fn chooseCandidate(ui: *WindowUi, i: usize) void {
+        const n = ui.focused orelse return;
+        ui.applyComposing(n, ui.ime.choose(i));
+    }
+
+    /// The candidates, one to a row: an emoji and its name, or a
+    /// character and its number (which types it).
+    fn buildCandidates(ui: *WindowUi, cx: *Context) Widget {
+        const a = cx.arena;
+        const t = cx.theme();
+        const im = &ui.ime;
+        const rows = a.alloc(Widget, im.count) catch return cx.make(flex.Column{});
+        for (im.candidates[0..im.count], rows, 0..) |cand, *row, i| {
+            const pinyin = im.composing == .pinyin;
+            const label = if (pinyin) (cx.fmt("{d}", .{i + 1})) else cand.label;
+            row.* = cx.make(CandidateRow{ .ui = ui, .index = i, .child = cx.make(rounded_box.RoundedBox{
+                .color = if (i == im.selected) t.secondary_container else gfx.Color.argb(0),
+                .radius = .all(8),
+                .child = cx.make(padding_mod.Padding{ .padding = .{ .left = 10, .right = 12, .top = 4, .bottom = 4 }, .child = cx.make(flex.Row{
+                    .cross_axis_alignment = .center,
+                    .spacing = 10,
+                    .fill = false,
+                    .children = a.dupe(Widget, if (pinyin) &.{
+                        cx.make(text_mod.Text{ .text = label, .style = .{ .size = 14, .color = t.on_surface_variant }, .wrap = false }),
+                        cx.make(text_mod.Text{ .text = cand.text, .style = .{ .size = 22, .color = t.on_surface }, .wrap = false }),
+                    } else &.{
+                        cx.make(text_mod.Text{ .text = cand.text, .style = .{ .size = 22, .color = t.on_surface }, .wrap = false }),
+                        cx.make(text_mod.Text{ .text = label, .style = .{ .size = 15, .color = t.on_surface }, .wrap = false }),
+                    }) catch &.{},
+                }) }),
+            }) });
+        }
+        return cx.make(rounded_box.RoundedBox{
+            .color = t.surface_container_highest,
+            .border_width = 1,
+            .border_color = t.outline_variant,
+            .radius = .all(12),
+            .child = cx.make(padding_mod.Padding{ .padding = .all(4), .child = cx.make(flex.Column{
+                .cross_axis_alignment = .stretch,
+                .fill = false,
+                .children = rows,
+            }) }),
+        });
+    }
+
+    /// A candidate's row: chosen when clicked, without taking the focus
+    /// from where the text is typed.
+    const CandidateRow = struct {
+        ui: *WindowUi,
+        index: usize,
+        child: Widget,
+
+        pub fn event(self: *const CandidateRow, _: *Node, e: Event) bool {
+            switch (e) {
+                .press => |p| return p.button == .left,
+                .release => |r| {
+                    if (r.button != .left or !r.inside) return false;
+                    self.ui.chooseCandidate(self.index);
+                    return true;
+                },
+                else => return false,
+            }
+        }
+    };
 
     /// Offers `k` to the `KeyHandler`s in `n`, the innermost (and of
     /// siblings, the last) first, until one takes it.

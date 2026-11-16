@@ -275,4 +275,6 @@ test {
     _ = damage;
     _ = runtime;
     _ = @import("tests.zig");
+    _ = @import("emoji.zig");
+    _ = @import("input_method.zig");
 }

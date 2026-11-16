@@ -1490,6 +1490,78 @@ test "zwp_text_input_v3 events commit text, render preedit, and delete surroundi
     try testing.expectEqualStrings("hell", tf_state.text());
 }
 
+/// Types `text` into what has the focus, a key at a time.
+fn typeKeys(u: *ui.WindowUi, text: []const u8) void {
+    var it = (std.unicode.Utf8View.init(text) catch unreachable).iterator();
+    while (it.nextCodepoint()) |c| {
+        const key: ui.KeyboardKey = if (c == ' ') .space else .a;
+        u.handleInput(.{ .key = .{ .key = key, .pressed = true, .char = c } });
+        u.handleInput(.{ .key = .{ .key = key, .pressed = false } });
+    }
+}
+
+fn tapKey(u: *ui.WindowUi, key: ui.KeyboardKey) void {
+    u.handleInput(.{ .key = .{ .key = key, .pressed = true } });
+    u.handleInput(.{ .key = .{ .key = key, .pressed = false } });
+}
+
+test "emoji by name in a text field: ':' then the name, chosen from a popup" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    const FieldApp = struct {
+        pub fn build(_: *const @This(), cx: *Context) Widget {
+            return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.SizedBox{ .width = 240, .child = cx.make(ui.TextField{ .initial = "hi " }) }) });
+        }
+    };
+    u.frame(400, 300, 0, FieldApp{});
+    const tf = find(u.root.?, ui.TextField).?;
+    clickAt(u, .{ tf.position()[0] + 200, tf.position()[1] + 15 });
+    u.frame(400, 300, 1, FieldApp{});
+    const st = tf.state(ui.TextField.State);
+    typeKeys(u, ":tad");
+    u.frame(400, 300, 2, FieldApp{});
+    // Composed (not yet in the text), with the candidates in a popup.
+    try testing.expectEqualStrings("hi ", st.text());
+    try testing.expectEqualStrings(":tad", st.preedit());
+    try testing.expect(u.menu != null);
+    tapKey(u, .enter);
+    u.frame(400, 300, 3, FieldApp{});
+    try testing.expectEqualStrings("hi 🎉", st.text());
+    try testing.expectEqualStrings("", st.preedit());
+    try testing.expect(u.menu == null);
+    // Not a name: as typed.
+    typeKeys(u, " :x ok");
+    try testing.expectEqualStrings("hi 🎉 :x ok", st.text());
+}
+
+test "Chinese by pinyin in a text field" {
+    const fira = try font.Font.init(fira_data);
+    const shared = try ui.SharedResources.create(testing.allocator, testing.io, &fira);
+    defer shared.destroy();
+    shared.input_language = .pinyin;
+    const u = try shared.createWindowUi();
+    defer u.destroy();
+    const FieldApp = struct {
+        pub fn build(_: *const @This(), cx: *Context) Widget {
+            return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.SizedBox{ .width = 240, .child = cx.make(ui.TextField{}) }) });
+        }
+    };
+    u.frame(400, 300, 0, FieldApp{});
+    const tf = find(u.root.?, ui.TextField).?;
+    clickAt(u, .{ tf.position()[0] + 100, tf.position()[1] + 15 });
+    u.frame(400, 300, 1, FieldApp{});
+    const st = tf.state(ui.TextField.State);
+    typeKeys(u, "nihao");
+    try testing.expectEqualStrings("nihao", st.preedit());
+    typeKeys(u, "  ");
+    try testing.expectEqualStrings("你好", st.text());
+    // Shift alone: English.
+    tapKey(u, .left_shift);
+    typeKeys(u, "ok");
+    try testing.expectEqualStrings("你好ok", st.text());
+}
+
 test "WindowUi.createDefault loads bundled Fira Sans and Twemoji fallback fonts" {
     const u = try ui.WindowUi.createDefault(testing.allocator, testing.io);
     defer u.destroy();
