@@ -252,7 +252,9 @@ pub fn ellipsize(gpa: std.mem.Allocator, runs: *font.RunCache, style: font.Style
 }
 
 /// Breaks text into lines no wider than `max_width` where it can: at
-/// newlines, and at spaces (a word too wide gets a line of its own).
+/// newlines, at spaces, and between the characters of Chinese and Japanese
+/// (which have no spaces), though not before their closing punctuation or
+/// after their opening (a word too wide gets a line of its own).
 pub fn wrap(gpa: std.mem.Allocator, runs: *font.RunCache, style: font.Style, text: []const u8, max_width: f32) ![]Line {
     var lines: std.ArrayList(Line) = .empty;
     var paragraphs = std.mem.splitScalar(u8, text, '\n');
@@ -264,37 +266,80 @@ pub fn wrap(gpa: std.mem.Allocator, runs: *font.RunCache, style: font.Style, tex
         }
         var start: usize = 0;
         while (start < para.len) {
-            // The longest run of whole words that fits, or one word.
-            var end = std.mem.indexOfScalarPos(u8, para, start, ' ') orelse para.len;
-            var width: f32 = 0;
-            var target_rel: usize = end - start;
-            var have_first = false;
-            var l = font.Layout.init(style, para[start..], 0);
-            while (l.next()) |_| {
-                if (l.at == target_rel) {
-                    if (!have_first) {
-                        have_first = true;
-                        width = l.x;
-                        if (end >= para.len or width > max_width) break;
-                        const next = std.mem.indexOfScalarPos(u8, para, end + 1, ' ') orelse para.len;
-                        target_rel = next - start;
-                    } else {
-                        if (l.x > max_width) break;
-                        end = start + target_rel;
-                        width = l.x;
-                        if (end >= para.len) break;
-                        const next = std.mem.indexOfScalarPos(u8, para, end + 1, ' ') orelse para.len;
-                        target_rel = next - start;
-                    }
+            const rest = para[start..];
+            var l = font.Layout.init(style, rest, 0);
+            // The end of the last character that is not a space, and where
+            // it is.
+            var ink_at: usize = 0;
+            var ink_x: f32 = 0;
+            // The last place it may break: where the next line starts, and
+            // the end and width of this one if it does.
+            var brk: ?struct { next: usize, end: usize, width: f32 } = null;
+            var prev: u21 = 0;
+            var broke = false;
+            while (true) {
+                const before = l.at;
+                if (l.next() == null) break;
+                const cp = firstCodepoint(rest[before..]);
+                if (before > 0 and ink_at > 0 and breaksBetween(prev, cp)) brk = .{ .next = before, .end = ink_at, .width = ink_x };
+                if (cp != ' ') {
+                    if (l.x > max_width) if (brk) |b| {
+                        try lines.append(gpa, .{ .text = rest[0..b.end], .width = b.width });
+                        start += b.next;
+                        broke = true;
+                        break;
+                    };
+                    ink_at = l.at;
+                    ink_x = l.x;
                 }
+                prev = cp;
             }
-            try lines.append(gpa, .{ .text = para[start..end], .width = width });
+            if (!broke) {
+                if (ink_at > 0) try lines.append(gpa, .{ .text = rest[0..ink_at], .width = ink_x });
+                start = para.len;
+            }
             // The spaces where it broke start no line.
-            start = end;
             while (start < para.len and para[start] == ' ') start += 1;
         }
     }
     return lines.items;
+}
+
+fn firstCodepoint(s: []const u8) u21 {
+    const len = std.unicode.utf8ByteSequenceLength(s[0]) catch return 0xfffd;
+    if (len > s.len) return 0xfffd;
+    return std.unicode.utf8Decode(s[0..len]) catch 0xfffd;
+}
+
+/// Whether a line may break between `a` and `b`: after spaces, and
+/// between Chinese, Japanese and Korean characters, but not before
+/// closing punctuation and small kana ("。", "）", "ょ"), nor after opening
+/// punctuation ("「").
+fn breaksBetween(a: u21, b: u21) bool {
+    if (b == ' ') return false;
+    if (a == ' ') return true;
+    if (std.mem.indexOfScalar(u21, no_line_start, b) != null) return false;
+    if (std.mem.indexOfScalar(u21, no_line_end, a) != null) return false;
+    return wide(a) or wide(b);
+}
+
+const no_line_start: []const u21 = &.{
+    ')',  ']',  '}',  ',',  '.',  ':',  ';',  '!',  '?',  '%',
+    '、', '。', '，', '．', '・', '：', '；', '？', '！', 'ー',
+    '」', '』', '）', '】', '〕', '〉', '》', '｝', '］', '〙',
+    '〗', '々', '〜', '～', '…', '‥', 'ゝ', 'ゞ', 'ヽ', 'ヾ',
+    'ぁ', 'ぃ', 'ぅ', 'ぇ', 'ぉ', 'っ', 'ゃ', 'ゅ', 'ょ', 'ゎ',
+    'ァ', 'ィ', 'ゥ', 'ェ', 'ォ', 'ッ', 'ャ', 'ュ', 'ョ', 'ヮ',
+    'ヵ', 'ヶ', '％', '”', '’',
+};
+const no_line_end: []const u21 = &.{ '(', '[', '{', '「', '『', '（', '【', '〔', '〈', '《', '｛', '［', '〘', '〖', '“', '‘' };
+
+/// Chinese, Japanese and Korean characters, and their punctuation and
+/// full-width forms, which lines break between.
+fn wide(c: u21) bool {
+    return (c >= 0x2e80 and c <= 0x9fff) or (c >= 0xac00 and c <= 0xd7af) or
+        (c >= 0xf900 and c <= 0xfaff) or (c >= 0xff00 and c <= 0xffef) or
+        (c >= 0x20000 and c <= 0x3ffff);
 }
 
 test "ellipsis" {
@@ -339,4 +384,14 @@ test "wrapping" {
     try std.testing.expect(long[0].width > 30);
     try std.testing.expectEqualStrings("is", long[1].text);
     try std.testing.expectEqualStrings("long", long[2].text);
+    // Japanese breaks between its characters, but not before "。".
+    const ja = try wrap(a, &runs, style, "日本語の文章です。", font.measure(style, "日本語の") + 1);
+    try std.testing.expectEqual(@as(usize, 3), ja.len);
+    try std.testing.expectEqualStrings("日本語の", ja[0].text);
+    try std.testing.expectEqualStrings("文章で", ja[1].text);
+    try std.testing.expectEqualStrings("す。", ja[2].text);
+    // And between them and words, at spaces as ever.
+    const mixed = try wrap(a, &runs, style, "USB デバイス", font.measure(style, "USB デ") + 1);
+    try std.testing.expectEqualStrings("USB デ", mixed[0].text);
+    try std.testing.expectEqualStrings("バイス", mixed[1].text);
 }
