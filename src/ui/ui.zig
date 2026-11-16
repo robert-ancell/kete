@@ -122,6 +122,9 @@ pub const KeyboardKey = widget.KeyboardKey;
 
 pub const SizedBox = sized_box.SizedBox;
 pub const left_to_right = @import("left_to_right.zig");
+/// kete's input methods (emoji, pinyin, romaji), for a compositor to run
+/// for its clients too.
+pub const input_method = @import("input_method.zig");
 pub const LeftToRight = left_to_right.LeftToRight;
 pub const ConstrainedBox = constrained_box.ConstrainedBox;
 pub const Padding = padding.Padding;

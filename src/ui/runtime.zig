@@ -127,6 +127,12 @@ pub const SharedResources = struct {
     /// input_method.zig): the app sets it for the system's language
     /// (`pinyin` for Chinese).
     input_language: input_method.Language = .none,
+    /// The app's windows compose text themselves (emoji, and the
+    /// `input_language`'s). Turned off where the system has an input method
+    /// that does (a compositor running kete's for its clients), which then
+    /// sends what it composes as an input method's (`text_preedit`,
+    /// `text_commit`).
+    own_input_method: bool = true,
     /// The interface runs right to left, for Arabic and Hebrew: every
     /// widget's children are mirrored in it as they are laid out (rows run
     /// from the right, padding and alignment swap sides), and text starts
@@ -1907,6 +1913,7 @@ pub const WindowUi = struct {
     /// input method's would, and its candidates show in a popup by the
     /// cursor. Returns whether the key was the input method's.
     fn inputMethodKey(ui: *WindowUi, k: widget.Event.Key) bool {
+        if (!ui.shared.own_input_method) return false;
         const n = ui.focused orelse return false;
         const st = ui.textInputState() orelse return false;
         if (st.password) return false;

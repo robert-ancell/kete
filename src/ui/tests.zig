@@ -1589,6 +1589,28 @@ test "right to left: rows run from the right, and a LeftToRight does not" {
     try testing.expect(ltr_row.child(1).position()[0] > ltr_row.child(0).position()[0]);
 }
 
+test "without its own input method, keys type as they are" {
+    const fira = try font.Font.init(fira_data);
+    const shared = try ui.SharedResources.create(testing.allocator, testing.io, &fira);
+    defer shared.destroy();
+    shared.input_language = .romaji;
+    shared.own_input_method = false;
+    const u = try shared.createWindowUi();
+    defer u.destroy();
+    const FieldApp = struct {
+        pub fn build(_: *const @This(), cx: *Context) Widget {
+            return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.SizedBox{ .width = 240, .child = cx.make(ui.TextField{}) }) });
+        }
+    };
+    u.frame(400, 300, 0, FieldApp{});
+    const tf = find(u.root.?, ui.TextField).?;
+    clickAt(u, .{ tf.position()[0] + 100, tf.position()[1] + 15 });
+    u.frame(400, 300, 1, FieldApp{});
+    typeKeys(u, ":tada ka");
+    try testing.expectEqualStrings(":tada ka", tf.state(ui.TextField.State).text());
+    try testing.expect(u.menu == null);
+}
+
 test "Japanese by romaji in a text field" {
     const fira = try font.Font.init(fira_data);
     const shared = try ui.SharedResources.create(testing.allocator, testing.io, &fira);
