@@ -107,8 +107,8 @@ pub fn main(init: std.process.Init) !void {
     const out = try cwd.createFile(io, args[2], .{});
     defer out.close(io);
     try out.writeStreamingAll(io, buf.items);
-
-    std.debug.print("scan_icons: {d} icon(s) found\n", .{sorted.len});
+    // Nothing said when all is well: a build step's output to stderr
+    // shows in `zig build`'s as if the step had failed.
 }
 
 fn scanDir(
