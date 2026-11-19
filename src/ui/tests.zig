@@ -1144,6 +1144,8 @@ test "sliders, dropdowns, dialogs, tooltips, chips, badges, tabs and rails" {
     const Gallery = struct {
         pub const State = struct {
             slider_val: f32 = 0.25,
+            slider_ended: f32 = -1,
+            slider_ends: u32 = 0,
             discrete_val: f32 = 20,
             mode: Mode = .one,
             chip_selected: bool = false,
@@ -1157,6 +1159,10 @@ test "sliders, dropdowns, dialogs, tooltips, chips, badges, tabs and rails" {
 
             fn setSlider(s: *State, v: f32) void {
                 s.slider_val = v;
+            }
+            fn endSlider(s: *State, v: f32) void {
+                s.slider_ended = v;
+                s.slider_ends += 1;
             }
             fn setDiscrete(s: *State, v: f32) void {
                 s.discrete_val = v;
@@ -1225,6 +1231,7 @@ test "sliders, dropdowns, dialogs, tooltips, chips, badges, tabs and rails" {
                                 ui.Slider{
                                     .value = state.slider_val,
                                     .on_changed = .of(state, State.setSlider),
+                                    .on_change_end = .of(state, State.endSlider),
                                 },
                                 ui.Slider{
                                     .value = state.discrete_val,
@@ -1307,8 +1314,13 @@ test "sliders, dropdowns, dialogs, tooltips, chips, badges, tabs and rails" {
         u.pointerMotion(.{ x0 + (x1 - x0) * 0.5, pos[1] + 10 });
         u.pointerButton(.{ x0 + (x1 - x0) * 0.5, pos[1] + 10 }, .left, true);
         u.pointerMotion(.{ x0 + (x1 - x0) * 0.75, pos[1] + 10 });
+        // Changed as it is dragged; not ended until it is let go.
+        try testing.expectApproxEqAbs(@as(f32, 0.75), st.slider_val, 0.01);
+        try testing.expectEqual(@as(u32, 0), st.slider_ends);
         u.pointerButton(.{ x0 + (x1 - x0) * 0.75, pos[1] + 10 }, .left, false);
         try testing.expectApproxEqAbs(@as(f32, 0.75), st.slider_val, 0.01);
+        try testing.expectEqual(@as(u32, 1), st.slider_ends);
+        try testing.expectApproxEqAbs(@as(f32, 0.75), st.slider_ended, 0.01);
 
         const s1 = sliders.items[1];
         const p1 = s1.position();

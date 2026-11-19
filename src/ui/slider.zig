@@ -37,6 +37,10 @@ pub const Slider = struct {
     divisions: ?u32 = null,
     /// Without it the slider is disabled.
     on_changed: ?ValueCallback(f32) = null,
+    /// When a change is done (the pointer let go, or a key pressed), with
+    /// the value it ended at: for what is too costly to do at each step of
+    /// a drag.
+    on_change_end: ?ValueCallback(f32) = null,
 
     pub const height = control.target;
     pub const track_height = 6;
@@ -46,6 +50,8 @@ pub const Slider = struct {
     pub const State = struct {
         hovered: bool = false,
         pressed: bool = false,
+        /// The value the drag last gave (for `on_change_end`).
+        dragged: f32 = 0,
     };
 
     pub fn focusable(self: *const Slider, _: *Node) bool {
@@ -161,13 +167,15 @@ pub const Slider = struct {
                 if (pr.button != .left) return false;
                 const on_changed = self.on_changed orelse return false;
                 st.pressed = true;
-                on_changed.call(self.valueAt(n.size.w, pr.pos[0]));
+                st.dragged = self.valueAt(n.size.w, pr.pos[0]);
+                on_changed.call(st.dragged);
                 n.ui.needs_frame = true;
                 return true;
             },
             .motion => |pos| {
                 if (!st.pressed) return false;
-                if (self.on_changed) |on_changed| on_changed.call(self.valueAt(n.size.w, pos[0]));
+                st.dragged = self.valueAt(n.size.w, pos[0]);
+                if (self.on_changed) |on_changed| on_changed.call(st.dragged);
                 n.ui.needs_frame = true;
                 return true;
             },
@@ -184,7 +192,9 @@ pub const Slider = struct {
                     else => return false,
                 };
                 if (k.pressed) {
-                    on_changed.call(std.math.clamp(v, self.min, self.max));
+                    const clamped = std.math.clamp(v, self.min, self.max);
+                    on_changed.call(clamped);
+                    if (self.on_change_end) |end| end.call(clamped);
                     n.ui.needs_frame = true;
                 }
                 return true;
@@ -192,6 +202,7 @@ pub const Slider = struct {
             .release => |rel| {
                 if (rel.button == .left and st.pressed) {
                     st.pressed = false;
+                    if (self.on_change_end) |end| end.call(st.dragged);
                     n.ui.needs_frame = true;
                     return true;
                 }
