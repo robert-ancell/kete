@@ -61,6 +61,10 @@ pub const Text = struct {
     text_align: TextAlign = .start,
     /// Wrap at spaces to fit the width (otherwise only `\n` breaks lines).
     wrap: bool = true,
+    /// Wrapping, break a word too wide for the width where it reaches the
+    /// edge, rather than giving it a line of its own that overflows (for
+    /// paths, URLs and logs).
+    break_words: bool = false,
     /// End lines too wide for the space with "…" instead of overflowing.
     ellipsis: bool = false,
     /// The way its lines run: right (as usual), or up (turned a quarter
@@ -86,6 +90,7 @@ pub const Text = struct {
 
         const Entry = struct {
             valid: bool = false,
+            break_words: bool = false,
             font: ?*const font.Font = null,
             size: f32 = 0,
             width: f32 = 0,
@@ -118,15 +123,15 @@ pub const Text = struct {
         st.gpa = gpa;
         if (!std.mem.eql(u8, st.text, self.text)) {
             st.forget();
-            st.text = gpa.dupe(u8, self.text) catch return wrap(arena, &n.ui.atlas.runs, style, self.text, width);
+            st.text = gpa.dupe(u8, self.text) catch return wrapWith(arena, &n.ui.atlas.runs, style, self.text, width, self.break_words);
         }
         for (&st.entries) |*e| {
-            if (!e.valid or e.font != style.font or e.size != style.size or e.width != width) continue;
+            if (!e.valid or e.font != style.font or e.size != style.size or e.width != width or e.break_words != self.break_words) continue;
             const lines = try arena.alloc(Line, e.lines.len);
             for (lines, e.lines) |*l, span| l.* = .{ .text = self.text[span.start..span.end], .width = span.width };
             return lines;
         }
-        const lines = try wrap(arena, &n.ui.atlas.runs, style, self.text, width);
+        const lines = try wrapWith(arena, &n.ui.atlas.runs, style, self.text, width, self.break_words);
         const e = &st.entries[st.next];
         st.next +%= 1;
         gpa.free(e.lines);
@@ -136,7 +141,7 @@ pub const Text = struct {
                 const start = @intFromPtr(l.text.ptr) - @intFromPtr(self.text.ptr);
                 span.* = .{ .start = @intCast(start), .end = @intCast(start + l.text.len), .width = l.width };
             }
-            e.* = .{ .valid = true, .font = style.font, .size = style.size, .width = width, .lines = spans };
+            e.* = .{ .valid = true, .break_words = self.break_words, .font = style.font, .size = style.size, .width = width, .lines = spans };
         } else |_| {}
         return lines;
     }
@@ -262,6 +267,12 @@ pub fn ellipsize(gpa: std.mem.Allocator, runs: *font.RunCache, style: font.Style
 /// (which have no spaces), though not before their closing punctuation or
 /// after their opening (a word too wide gets a line of its own).
 pub fn wrap(gpa: std.mem.Allocator, runs: *font.RunCache, style: font.Style, text: []const u8, max_width: f32) ![]Line {
+    return wrapWith(gpa, runs, style, text, max_width, false);
+}
+
+/// `wrap`, and with `break_words` a word too wide is broken where it
+/// reaches the edge (each line has at least one character).
+pub fn wrapWith(gpa: std.mem.Allocator, runs: *font.RunCache, style: font.Style, text: []const u8, max_width: f32, break_words: bool) ![]Line {
     var lines: std.ArrayList(Line) = .empty;
     var paragraphs = std.mem.splitScalar(u8, text, '\n');
     while (paragraphs.next()) |para| {
@@ -292,6 +303,11 @@ pub fn wrap(gpa: std.mem.Allocator, runs: *font.RunCache, style: font.Style, tex
                     if (l.x > max_width) if (brk) |b| {
                         try lines.append(gpa, .{ .text = rest[0..b.end], .width = b.width });
                         start += b.next;
+                        broke = true;
+                        break;
+                    } else if (break_words and ink_at > 0 and ink_at == before) {
+                        try lines.append(gpa, .{ .text = rest[0..before], .width = ink_x });
+                        start += before;
                         broke = true;
                         break;
                     };
@@ -439,6 +455,16 @@ test "wrapping" {
     try std.testing.expect(long[0].width > 30);
     try std.testing.expectEqualStrings("is", long[1].text);
     try std.testing.expectEqualStrings("long", long[2].text);
+    // Or broken at the edge, if asked.
+    const path = try wrapWith(a, &runs, style, "at /devices/platform/soc/usb1/input/event3 now", font.measure(style, "at /devices/plat") + 1, true);
+    try std.testing.expectEqualStrings("at", path[0].text);
+    try std.testing.expectEqualStrings("/devices/plat", path[1].text[0..13]);
+    var joined: std.ArrayList(u8) = .empty;
+    for (path) |l| {
+        try std.testing.expect(l.width <= font.measure(style, "at /devices/plat") + 1);
+        for (l.text) |c| if (c != ' ') try joined.append(a, c);
+    }
+    try std.testing.expectEqualStrings("at/devices/platform/soc/usb1/input/event3now", joined.items);
     // Japanese breaks between its characters, but not before "。".
     const ja = try wrap(a, &runs, style, "日本語の文章です。", font.measure(style, "日本語の") + 1);
     try std.testing.expectEqual(@as(usize, 3), ja.len);
