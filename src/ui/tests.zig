@@ -4255,3 +4255,59 @@ test "a window's input handler takes the input it wants before the widgets" {
     try testing.expectEqual(@as(u32, 2), game.keys);
     try testing.expectEqual(@as(u32, 1), game.buttons);
 }
+
+test "two fingers pinch: what is under them is told how much further apart they are, and nothing is pressed" {
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, null);
+    defer u.destroy();
+    const Pinched = struct {
+        var scale: f32 = 1;
+        var presses: u32 = 0;
+        var at: ui.Point = .{ 0, 0 };
+        pub fn layout(_: *const @This(), _: *Node, c: ui.Constraints) ui.Size {
+            return c.constrain(.{ .w = c.max_w, .h = c.max_h });
+        }
+        pub fn event(_: *const @This(), _: *Node, e: ui.Event) bool {
+            switch (e) {
+                .pinch => |p| {
+                    scale *= p.scale;
+                    at = p.pos;
+                    return true;
+                },
+                .press => {
+                    presses += 1;
+                    return true;
+                },
+                .release => return true,
+                else => {},
+            }
+            return false;
+        }
+    };
+    const App = struct {
+        pub fn build(_: *const @This(), cx: *Context) Widget {
+            return cx.make(Pinched{});
+        }
+    };
+    u.frame(400, 400, 0, App{});
+    // One finger, then another 100 apart; they go 200 apart.
+    u.touchDown(1, .{ 100, 200 });
+    u.touchDown(2, .{ 200, 200 });
+    u.touchMotion(2, .{ 250, 200 });
+    u.touchMotion(1, .{ 50, 200 });
+    try testing.expectApproxEqAbs(@as(f32, 2), Pinched.scale, 0.001);
+    try testing.expectEqual(ui.Point{ 150, 200 }, Pinched.at);
+    // Together again, to half: back to as it was.
+    u.touchMotion(2, .{ 150, 200 });
+    try testing.expectApproxEqAbs(@as(f32, 1), Pinched.scale, 0.001);
+    u.touchUp(2);
+    // The first, still down, moves and comes up: nothing more.
+    u.touchMotion(1, .{ 20, 220 });
+    u.touchUp(1);
+    try testing.expectApproxEqAbs(@as(f32, 1), Pinched.scale, 0.001);
+    // Its press was taken back (cancelled), not released as a tap.
+    try testing.expectEqual(@as(u32, 1), Pinched.presses);
+    // A tap after it is a press, as ever.
+    u.touchDown(3, .{ 100, 100 });
+    u.touchUp(3);
+    try testing.expectEqual(@as(u32, 2), Pinched.presses);
+}

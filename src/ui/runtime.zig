@@ -548,8 +548,13 @@ pub const WindowUi = struct {
     /// A touch held down on a widget, which becomes a long press
     /// (`Event.context`) if it stays there.
     hold: ?struct { node: *Node, pos: Point, since: ?u64 = null } = null,
-    /// The touch followed (others are ignored).
-    touch: ?struct { id: i32, start: Point, last: Point, moved: bool = false, panning: bool = false } = null,
+    /// The touch followed (others are ignored, but a second: a pinch).
+    /// `pinched`: a second finger went down with it, so it presses
+    /// nothing.
+    touch: ?struct { id: i32, start: Point, last: Point, moved: bool = false, panning: bool = false, pinched: bool = false } = null,
+    /// A second finger, down with the first (`touch`): where it is, and
+    /// how far apart they were when last said (see `Event.pinch`).
+    pinch: ?struct { id: i32, pos: Point, dist: f32 } = null,
     /// The release of a press that became a long press is not sent.
     swallow_release: bool = false,
     /// The window's physical buffer size at the last frame (`logical_size * scale`).
@@ -1726,7 +1731,16 @@ pub const WindowUi = struct {
 
     /// A touch went down at `pos`; one at a time is followed, and acts as the left button.
     pub fn touchDown(ui: *WindowUi, id: i32, pos: Point) void {
-        if (ui.touch != null) return;
+        if (ui.touch) |*t| {
+            // A second finger: the two pinch (the first presses nothing).
+            if (ui.pinch != null or t.id == id) return;
+            if (!t.panning and !t.pinched) ui.cancelPress();
+            t.pinched = true;
+            t.moved = true;
+            ui.hold = null;
+            ui.pinch = .{ .id = id, .pos = pos, .dist = distance(t.last, pos) };
+            return;
+        }
         ui.touch = .{ .id = id, .start = pos, .last = pos };
         ui.pointerButton(pos, .left, true);
         if (ui.captured) |n| ui.hold = .{ .node = n, .pos = pos };
@@ -1735,7 +1749,14 @@ pub const WindowUi = struct {
     /// The touch `id` moved to `pos`.
     pub fn touchMotion(ui: *WindowUi, id: i32, pos: Point) void {
         const t = &(ui.touch orelse return);
+        if (ui.pinch) |*p| {
+            if (id == p.id) p.pos = pos else if (id == t.id) t.last = pos else return;
+            ui.pinchMoved();
+            return;
+        }
         if (t.id != id) return;
+        // The other finger of a pinch is still down: nothing more.
+        if (t.pinched) return;
         if (ui.swallow_release) return;
         if (!t.moved and @abs(pos[0] - t.start[0]) <= touch_slop and @abs(pos[1] - t.start[1]) <= touch_slop) return;
         const first = !t.moved;
@@ -1758,9 +1779,17 @@ pub const WindowUi = struct {
 
     /// The touch `id` came up.
     pub fn touchUp(ui: *WindowUi, id: i32) void {
+        // A pinch's second finger: the first stays down, pressing nothing.
+        if (ui.pinch) |p| if (p.id == id) {
+            ui.pinch = null;
+            return;
+        };
         const t = ui.touch orelse return;
         if (t.id != id) return;
-        if (!t.panning) ui.pointerButton(t.last, .left, false);
+        // The first: the pinch ends; the second, still down, does nothing
+        // more.
+        ui.pinch = null;
+        if (!t.panning and !t.pinched) ui.pointerButton(t.last, .left, false);
         ui.touch = null;
         ui.hold = null;
         ui.swallow_release = false;
@@ -1771,9 +1800,37 @@ pub const WindowUi = struct {
     pub fn touchCancel(ui: *WindowUi) void {
         ui.cancelPress();
         ui.touch = null;
+        ui.pinch = null;
         ui.hold = null;
         ui.swallow_release = false;
         ui.pointerLeave();
+    }
+
+    /// A pinch's fingers moved: how much further apart (or closer) they
+    /// are, to the widgets under the point between them.
+    fn pinchMoved(ui: *WindowUi) void {
+        const t = ui.touch orelse return;
+        const p = &(ui.pinch orelse return);
+        const d = distance(t.last, p.pos);
+        if (!(p.dist >= 1) or !(d >= 1)) {
+            p.dist = d;
+            return;
+        }
+        const scale = d / p.dist;
+        if (@abs(scale - 1) < 0.002) return;
+        p.dist = d;
+        const at: Point = .{ (t.last[0] + p.pos[0]) / 2, (t.last[1] + p.pos[1]) / 2 };
+        ui.updateHover(at);
+        var i: usize = 0;
+        while (i < ui.hovered.items.len) {
+            const n = ui.hovered.items[i];
+            if (send(n, .{ .pinch = .{ .pos = local(n, at), .scale = scale } })) return;
+            if (i < ui.hovered.items.len and ui.hovered.items[i] == n) i += 1;
+        }
+    }
+
+    fn distance(a: Point, b: Point) f32 {
+        return @sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]));
     }
 
     fn pan(ui: *WindowUi, at: Point, dx: f32, dy: f32) bool {

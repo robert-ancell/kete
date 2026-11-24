@@ -653,7 +653,7 @@ pub const TextField = struct {
                 });
                 return true;
             },
-            .scroll => {},
+            .scroll, .pinch => {},
         }
         return false;
     }

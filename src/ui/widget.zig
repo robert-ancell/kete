@@ -120,6 +120,11 @@ pub const Event = union(enum) {
     /// `touch`: a finger moved it (by exactly that much: a pan), rather
     /// than a wheel (whose notches may scroll further).
     scroll: struct { pos: Point, dx: f32, dy: f32, touch: bool = false },
+    /// Two fingers moved apart or together around `pos` (between them):
+    /// `scale` is how far apart they are now over how far they were (more
+    /// than 1: apart, to zoom in). Returning true says it zoomed;
+    /// otherwise it goes to the widgets around it.
+    pinch: struct { pos: Point, scale: f32 },
     /// It got the keyboard (`WindowUi.focus`), or lost it.
     focus,
     blur,
