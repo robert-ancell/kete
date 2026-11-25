@@ -424,9 +424,7 @@ pub const fourcc = struct {
     }
     pub const xrgb8888 = code("XR24");
     pub const argb8888 = code("AR24");
-    /// Red in the top 5 bits.
     pub const rgb565 = code("RG16");
-    /// Red in the low 5 bits.
     pub const bgr565 = code("BG16");
 };
 
