@@ -4253,6 +4253,34 @@ test "Wrap puts as many across as fit, and the rest in rows below" {
     try testing.expectEqual(ui.Point{ 0, 60 }, w.child(2).offset);
 }
 
+test "ScaleDown leaves a child that fits, and draws one that does not smaller, without overflow" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    const App = struct {
+        room: f32,
+        pub fn build(self: *const @This(), cx: *Context) Widget {
+            return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.SizedBox{ .width = self.room, .height = 100, .child = cx.make(ui.Align{
+                .alignment = .top_left,
+                .child = cx.make(ui.ScaleDown{ .child = cx.make(ui.RoundedBox{ .color = red, .child = cx.make(ui.SizedBox{ .width = 80, .height = 40 }) }) }),
+            }) }) });
+        }
+    };
+    u.frame(200, 200, 0, App{ .room = 160 });
+    var s = find(u.root.?, ui.ScaleDown).?;
+    try testing.expectEqual(@as(f32, 80), s.size.w);
+    // Half the room: half the size, drawn so, and not counted as overflow.
+    u.frame(200, 200, 1, App{ .room = 40 });
+    s = find(u.root.?, ui.ScaleDown).?;
+    try testing.expectEqual(@as(f32, 40), s.size.w);
+    try testing.expectEqual(@as(f32, 20), s.size.h);
+    try testing.expect(!s.overflow.any());
+    const img = try Image.init(u, 200, 200);
+    defer img.deinit();
+    try testing.expectEqual(@as(u32, 0xffff0000), img.at(30, 15));
+    try testing.expectEqual(@as(u32, 0xff000000), img.at(60, 15));
+}
+
 /// A `KeyHandler`'s: the keys it was given, taking those in `takes`.
 const KeyTaker = struct {
     takes: []const ui.KeyboardKey,

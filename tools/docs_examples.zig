@@ -456,6 +456,13 @@ fn wrapWidget(cx: *BuildContext) Widget {
     }) }) });
 }
 
+fn scaleDown(cx: *BuildContext) Widget {
+    return cx.make(kete.Padding{ .padding = .all(16), .child = cx.make(kete.Row{ .spacing = 16, .children = cx.makeAll(.{
+        kete.SizedBox{ .width = 200, .height = 60, .child = cx.make(kete.ScaleDown{ .child = box(cx, "Fits", 120, 48) }) },
+        kete.SizedBox{ .width = 120, .height = 60, .child = cx.make(kete.ScaleDown{ .child = box(cx, "Made smaller", 200, 48) }) },
+    }) }) });
+}
+
 fn sizedBox(cx: *BuildContext) Widget {
     return cx.make(kete.RoundedBox{
         .border_color = cx.theme().outline,
@@ -570,6 +577,7 @@ pub const all = .{
     Example("Opacity", opacityWidget, .{}),
     Example("Place", placeWidget, .{}),
     Example("Wrap", wrapWidget, .{}),
+    Example("ScaleDown", scaleDown, .{}),
     Example("SizedBox", sizedBox, .{}),
     Example("ConstrainedBox", constrainedBox, .{}),
     Example("RoundedBox", roundedBox, .{}),
