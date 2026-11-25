@@ -446,6 +446,16 @@ fn placeWidget(cx: *BuildContext) Widget {
     }) }) });
 }
 
+fn wrapWidget(cx: *BuildContext) Widget {
+    return cx.make(kete.SizedBox{ .width = 260, .child = cx.make(kete.Wrap{ .spacing = 8, .run_spacing = 8, .children = cx.makeAll(.{
+        kete.Chip{ .label = "Apples", .on_press = .of(state, State.save) },
+        kete.Chip{ .label = "Bananas", .on_press = .of(state, State.save) },
+        kete.Chip{ .label = "Cherries", .on_press = .of(state, State.save) },
+        kete.Chip{ .label = "Dates", .on_press = .of(state, State.save) },
+        kete.Chip{ .label = "Elderberries", .on_press = .of(state, State.save) },
+    }) }) });
+}
+
 fn sizedBox(cx: *BuildContext) Widget {
     return cx.make(kete.RoundedBox{
         .border_color = cx.theme().outline,
@@ -559,6 +569,7 @@ pub const all = .{
     Example("Transform", transformWidget, .{}),
     Example("Opacity", opacityWidget, .{}),
     Example("Place", placeWidget, .{}),
+    Example("Wrap", wrapWidget, .{}),
     Example("SizedBox", sizedBox, .{}),
     Example("ConstrainedBox", constrainedBox, .{}),
     Example("RoundedBox", roundedBox, .{}),

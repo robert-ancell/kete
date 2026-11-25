@@ -4222,6 +4222,37 @@ test "Place puts a point of its child at a fraction of the space, moved, and kep
     try testing.expectEqual(ui.Point{ 30, 40 }, placed.child(0).offset);
 }
 
+test "Wrap puts as many across as fit, and the rest in rows below" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    const App = struct {
+        width: f32,
+        pub fn build(self: *const @This(), cx: *Context) Widget {
+            return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.SizedBox{ .width = self.width, .child = cx.make(ui.Wrap{ .spacing = 10, .run_spacing = 5, .children = cx.makeAll(.{
+                ui.SizedBox{ .width = 40, .height = 20 },
+                ui.SizedBox{ .width = 40, .height = 30 },
+                ui.SizedBox{ .width = 40, .height = 20 },
+            }) }) }) });
+        }
+    };
+    // All three fit.
+    u.frame(300, 200, 0, App{ .width = 200 });
+    var w = find(u.root.?, ui.Wrap).?;
+    try testing.expectEqual(@as(f32, 30), w.size.h);
+    try testing.expectEqual(ui.Point{ 100, 5 }, w.child(2).offset);
+    // Two fit; the third below, by the taller's height and the gap.
+    u.frame(300, 200, 1, App{ .width = 95 });
+    w = find(u.root.?, ui.Wrap).?;
+    try testing.expectEqual(ui.Point{ 50, 0 }, w.child(1).offset);
+    try testing.expectEqual(ui.Point{ 0, 35 }, w.child(2).offset);
+    try testing.expectEqual(@as(f32, 55), w.size.h);
+    // Narrower than one: each in a row of its own.
+    u.frame(300, 200, 2, App{ .width = 30 });
+    w = find(u.root.?, ui.Wrap).?;
+    try testing.expectEqual(ui.Point{ 0, 60 }, w.child(2).offset);
+}
+
 /// A `KeyHandler`'s: the keys it was given, taking those in `takes`.
 const KeyTaker = struct {
     takes: []const ui.KeyboardKey,

@@ -42,6 +42,7 @@ pub const Align = ui.Align;
 pub const Transform = ui.Transform;
 pub const Opacity = ui.Opacity;
 pub const Place = ui.Place;
+pub const Wrap = ui.Wrap;
 pub const Row = ui.Row;
 pub const Column = ui.Column;
 pub const Expanded = ui.Expanded;
