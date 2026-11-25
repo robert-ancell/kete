@@ -68,6 +68,8 @@ pub const TextField = struct {
     width: f32 = 240,
     /// Text size; the theme's body size if null.
     size: ?f32 = null,
+    /// The text in the middle (while it fits), rather than at the start.
+    centered: bool = false,
     /// Called with the text each time it changes.
     on_changed: ?widget.ValueCallback([]const u8) = null,
     /// Enter was pressed.
@@ -423,6 +425,12 @@ pub const TextField = struct {
         return buf[0 .. count * dot.len];
     }
 
+    /// Where the placeholder starts.
+    fn placeholderX(self: *const TextField, style: font.Style, room: f32) f32 {
+        if (!self.centered) return pad;
+        return pad + @max((room - font.measure(style, self.placeholder)) / 2, 0);
+    }
+
     /// How far into the text (as shown) byte `i` is.
     fn xOf(self: *const TextField, style: font.Style, st: *const State, i: usize) f32 {
         var buf: [capacity * dot.len]u8 = undefined;
@@ -442,6 +450,9 @@ pub const TextField = struct {
             st.scroll = cursor_x - room;
         }
         st.scroll = std.math.clamp(st.scroll, 0, @max(total_w - room, 0));
+        // Centred, text that fits starts as far in as it is short (a
+        // scroll back past the start: everything is placed from it).
+        if (self.centered and total_w < room) st.scroll = -(room - total_w) / 2;
         return st.scroll;
     }
 
@@ -480,7 +491,7 @@ pub const TextField = struct {
         defer p.restoreClip(old);
         if (!self.enabled) {
             const shown_text = if (st.text().len == 0) self.placeholder else text;
-            _ = p.text(style.size, if (st.text().len == 0) pad else pad - scroll, baseline, shown_text, t.on_surface.withAlpha(0.38));
+            _ = p.text(style.size, if (st.text().len == 0) self.placeholderX(style, room) else pad - scroll, baseline, shown_text, t.on_surface.withAlpha(0.38));
             return;
         }
         // The selection behind its text.
@@ -494,7 +505,7 @@ pub const TextField = struct {
             }
         }
         if (st.text().len == 0 and st.preedit_len == 0 and !st.focused) {
-            _ = p.text(style.size, pad, baseline, self.placeholder, t.on_surface_variant);
+            _ = p.text(style.size, self.placeholderX(style, room), baseline, self.placeholder, t.on_surface_variant);
         } else {
             _ = p.text(style.size, pad - scroll, baseline, text, t.on_surface);
         }
@@ -728,6 +739,34 @@ pub fn preeditOffset(style: font.Style, pre: []const u8, begin: i32) f32 {
 }
 
 const testing = std.testing;
+
+test "a centred field's text is in the middle, and is clicked there" {
+    const WindowUi = @import("runtime.zig").WindowUi;
+    const f = try font.Font.init(font.default_font_data);
+    const u = try WindowUi.create(testing.allocator, testing.io, &f);
+    defer u.destroy();
+    const App = struct {
+        centered: bool,
+        pub fn build(self: *const @This(), cx: *widget.BuildContext) widget.Widget {
+            return cx.make(Padding{ .padding = .all(20), .child = cx.make(Column{ .cross_axis_alignment = .start, .children = cx.makeAll(.{
+                TextField{ .initial = "abcd", .width = 300, .centered = self.centered },
+            }) }) });
+        }
+    };
+    for ([_]bool{ true, false }, [_]usize{ 2, 4 }) |centered, want| {
+        u.frame(400, 200, 0, App{ .centered = centered });
+        var n = u.root.?;
+        while (!n.widget.is(TextField)) n = n.children.items[0];
+        // The middle of the field: the middle of the text, centred; past
+        // its end, not.
+        const at: geometry.Point = .{ 20 + 150, 40 };
+        u.pointerMotion(at);
+        u.pointerButton(at, .left, true);
+        u.pointerButton(at, .left, false);
+        try testing.expectEqual(want, n.state(TextField.State).doc().cursor);
+        try testing.expect(!n.overflow.any());
+    }
+}
 
 test "typing into a text field" {
     const WindowUi = @import("runtime.zig").WindowUi;
