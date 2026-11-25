@@ -4234,6 +4234,42 @@ const KeyTaker = struct {
     }
 };
 
+test "a watching key handler sees every key on its way, taking none" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    // It would take everything, if it took.
+    var watcher: KeyTaker = .{ .takes = &.{ .a, .backspace, .escape } };
+    defer watcher.log.deinit(testing.allocator);
+    const App = struct {
+        watcher: *KeyTaker,
+        pub fn build(self: *const @This(), cx: *Context) Widget {
+            return cx.make(ui.KeyHandler{ .watch = true, .on_key = .of(self.watcher, KeyTaker.key), .child = cx.make(ui.TextField{ .initial = "" }) });
+        }
+    };
+    u.frame(300, 200, 0, App{ .watcher = &watcher });
+    const press = struct {
+        fn f(w: *ui.WindowUi, key: ui.KeyboardKey, char: ?u21) void {
+            w.key(.{ .key = key, .pressed = true, .char = char });
+            w.key(.{ .key = key, .pressed = false });
+        }
+    }.f;
+    // The field has the keyboard: it types, and the watcher sees the keys.
+    const field = find(u.root.?, ui.TextField).?;
+    u.focus(field);
+    press(u, .a, 'a');
+    press(u, .b, 'b');
+    press(u, .backspace, null);
+    try testing.expectEqualSlices(ui.KeyboardKey, &.{ .a, .b, .backspace }, watcher.log.items);
+    u.frame(300, 200, 1, App{ .watcher = &watcher });
+    try testing.expectEqualStrings("a", field.state(ui.TextField.State).text());
+    // Nothing has it: it sees the key, once.
+    u.focus(null);
+    watcher.log.clearRetainingCapacity();
+    press(u, .escape, null);
+    try testing.expectEqualSlices(ui.KeyboardKey, &.{.escape}, watcher.log.items);
+}
+
 test "a key handler gets the keys what is in it leaves, and with nothing focused, the innermost first" {
     const fira = try font.Font.init(fira_data);
     const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);

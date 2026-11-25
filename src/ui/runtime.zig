@@ -1904,6 +1904,15 @@ pub const WindowUi = struct {
     /// A key went down or up, with what it types (if anything) and the
     /// modifiers held.
     pub fn key(ui: *WindowUi, k: widget.Event.Key) void {
+        // The key handlers watching it on its way: those it goes through to
+        // what has the keyboard (or, with nothing having it, all of them).
+        var watched = false;
+        if (ui.focused) |f| {
+            var at: ?*Node = f;
+            while (at) |n| : (at = n.parent) watched = watchKey(n, k) or watched;
+        } else if (ui.root) |r| watched = watchAll(r, k);
+        // (What it watched for has changed, as likely as not.)
+        if (watched) ui.needs_frame = true;
         // kete's input method (emoji, Chinese) first, for a text widget.
         if (ui.inputMethodKey(k)) return;
         // Modifiers go to what has the focus too (an app may pass them on, to
@@ -2083,6 +2092,23 @@ pub const WindowUi = struct {
 
     /// Offers `k` to the `KeyHandler`s in `n`, the innermost (and of
     /// siblings, the last) first, until one takes it.
+    /// `n`, if it is a key handler watching keys, shown `k`.
+    /// Whether it was.
+    fn watchKey(n: *Node, k: widget.Event.Key) bool {
+        const h = n.widget.as(@import("key_handler.zig").KeyHandler) orelse return false;
+        if (!h.watch) return false;
+        _ = h.on_key.call(k);
+        return true;
+    }
+
+    /// Every key handler watching keys in `n`, shown `k`: whether there
+    /// were any.
+    fn watchAll(n: *Node, k: widget.Event.Key) bool {
+        var any = false;
+        for (n.children.items) |ch| any = watchAll(ch, k) or any;
+        return watchKey(n, k) or any;
+    }
+
     fn sendToKeyHandlers(n: *Node, k: widget.Event.Key) bool {
         var i = n.children.items.len;
         while (i > 0) {

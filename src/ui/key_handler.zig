@@ -14,6 +14,11 @@
 //! too (`Event.Key`), and returns whether it took it. Keys are where they
 //! are on the keyboard (`KeyboardKey`), whatever the layout: `.char` is
 //! what one types, without Control.
+//!
+//! One that `watch`es sees every key on its way to what has the keyboard
+//! in it (or, with nothing having it, every key), before it goes there,
+//! and takes none: to show the keys being pressed, say, while a text field
+//! in it types them.
 
 const widget = @import("widget.zig");
 
@@ -26,8 +31,13 @@ pub const KeyHandler = struct {
     on_key: widget.Handler(Event.Key),
     /// The part of the window whose keys it handles.
     child: ?Widget = null,
+    /// It sees every key on its way (before what is in it does), and takes
+    /// none (what `on_key` returns does not matter).
+    watch: bool = false,
 
     pub fn event(self: *const KeyHandler, _: *Node, e: Event) bool {
+        // A watcher has seen it already (`WindowUi.key`).
+        if (self.watch) return false;
         return switch (e) {
             .key => |k| self.on_key.call(k),
             else => false,
