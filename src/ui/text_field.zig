@@ -70,6 +70,9 @@ pub const TextField = struct {
     size: ?f32 = null,
     /// The text in the middle (while it fits), rather than at the start.
     centered: bool = false,
+    /// Drawn in an outline (if not, it is only its text and caret: a field
+    /// that is the page's whole point, plain on it).
+    outlined: bool = true,
     /// Called with the text each time it changes.
     on_changed: ?widget.ValueCallback([]const u8) = null,
     /// Enter was pressed.
@@ -461,7 +464,9 @@ pub const TextField = struct {
         const st = n.state(State);
         const c = p.canvas();
         const r: gfx.Rect = .{ .x = 0, .y = 0, .w = n.size.w, .h = n.size.h };
-        if (!self.enabled) {
+        if (!self.outlined) {
+            // No outline.
+        } else if (!self.enabled) {
             c.strokeRoundedRect(r.outset(-0.5), .all(4), 1, t.on_surface.withAlpha(0.12));
         } else if (st.focused) {
             c.strokeRoundedRect(r.outset(-1), .all(4), 2, t.primary);
