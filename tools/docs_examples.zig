@@ -431,6 +431,21 @@ fn transformWidget(cx: *BuildContext) Widget {
     }) }) });
 }
 
+fn opacityWidget(cx: *BuildContext) Widget {
+    return cx.make(kete.Padding{ .padding = .all(16), .child = cx.make(kete.Row{ .spacing = 16, .children = cx.makeAll(.{
+        box(cx, "Opaque", 80, 48),
+        kete.Opacity{ .opacity = 0.6, .child = box(cx, "0.6", 80, 48) },
+        kete.Opacity{ .opacity = 0.25, .child = box(cx, "0.25", 80, 48) },
+    }) }) });
+}
+
+fn placeWidget(cx: *BuildContext) Widget {
+    return cx.make(kete.SizedBox{ .width = 240, .height = 120, .child = cx.make(kete.Overlay{ .children = cx.makeAll(.{
+        kete.Place{ .at = .{ 0.25, 0.3 }, .child = box(cx, "A quarter", 96, 40) },
+        kete.Place{ .at = .{ 0.75, 0.7 }, .child = box(cx, "Three quarters", 120, 40) },
+    }) }) });
+}
+
 fn sizedBox(cx: *BuildContext) Widget {
     return cx.make(kete.RoundedBox{
         .border_color = cx.theme().outline,
@@ -542,6 +557,8 @@ pub const all = .{
     Example("Padding", paddingWidget, .{}),
     Example("Align", alignWidget, .{}),
     Example("Transform", transformWidget, .{}),
+    Example("Opacity", opacityWidget, .{}),
+    Example("Place", placeWidget, .{}),
     Example("SizedBox", sizedBox, .{}),
     Example("ConstrainedBox", constrainedBox, .{}),
     Example("RoundedBox", roundedBox, .{}),

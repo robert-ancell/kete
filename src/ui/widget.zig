@@ -293,6 +293,9 @@ pub const VTable = struct {
     /// (`pub fn paintTransform(self, n) gfx.Affine`, in its own coordinates):
     /// drawn and hit there, laid out as if not.
     paint_transform: ?*const fn (*const anyopaque, *const WidgetNode) gfx.Affine,
+    /// How opaque it and its children are drawn (`pub fn paintOpacity(self,
+    /// n) f32`, 0 to 1, times that of what it is in).
+    paint_opacity: ?*const fn (*const anyopaque, *const WidgetNode) f32,
 };
 
 pub const StateOps = struct {
@@ -367,6 +370,9 @@ fn makeVTable(comptime T: type) VTable {
         fn itemRect(ptr: *const anyopaque, n: *WidgetNode, index: usize) ?Rect {
             return T.itemRect(self(ptr), n, index);
         }
+        fn paintOpacity(ptr: *const anyopaque, n: *const WidgetNode) f32 {
+            return T.paintOpacity(self(ptr), n);
+        }
         fn paintTransform(ptr: *const anyopaque, n: *const WidgetNode) gfx.Affine {
             return T.paintTransform(self(ptr), n);
         }
@@ -400,6 +406,7 @@ fn makeVTable(comptime T: type) VTable {
         .clips_children = @hasDecl(T, "clips_children") and T.clips_children,
         .left_to_right = @hasDecl(T, "left_to_right") and T.left_to_right,
         .paint_transform = if (@hasDecl(T, "paintTransform")) S.paintTransform else null,
+        .paint_opacity = if (@hasDecl(T, "paintOpacity")) S.paintOpacity else null,
         .state = if (@hasDecl(T, "State")) .{
             .size = @sizeOf(T.State),
             .alignment = .of(T.State),

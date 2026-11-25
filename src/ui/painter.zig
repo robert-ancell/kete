@@ -47,6 +47,9 @@ pub const Painter = struct {
     /// transform their children): `origin` and the widgets' boxes are
     /// where they would be without it.
     transform: ?gfx.Affine = null,
+    /// How opaque what is painted is (the widgets it is in that fade their
+    /// children, multiplied: see `Opacity`).
+    opacity: f32 = 1,
     /// What the node being painted draws (see `damage.zig`).
     rec: ?*gfx.Record = null,
     /// Whether what is painted damages the window (not in a popup, which
@@ -64,6 +67,7 @@ pub const Painter = struct {
         const c = p.ui.currentCanvas();
         c.setOrigin(p.origin);
         c.setTransform(p.transform);
+        c.setOpacity(p.opacity);
         c.clip = if (p.clip) |r| scaleRect(r, c.scale) else null;
         c.recorder = p.rec;
         return c;
@@ -202,11 +206,13 @@ pub const Painter = struct {
         const saved_clip = p.clip;
         const saved_node = p.node;
         const saved_transform = p.transform;
+        const saved_opacity = p.opacity;
         defer {
             p.origin = saved_origin;
             p.clip = saved_clip;
             p.node = saved_node;
             p.transform = saved_transform;
+            p.opacity = saved_opacity;
         }
         p.node = n;
         p.origin = .{ p.origin[0] + n.offset[0], p.origin[1] + n.offset[1] };
@@ -214,6 +220,11 @@ pub const Painter = struct {
             // Its own, about its top left, before those of what it is in.
             const m = f(n.widget.ptr, n).about(p.origin);
             p.transform = if (p.transform) |outer| m.then(outer) else m;
+        }
+        if (n.widget.vtable.paint_opacity) |f| {
+            p.opacity *= std.math.clamp(f(n.widget.ptr, n), 0, 1);
+            // Not drawn at all (nor what is in it).
+            if (p.opacity <= 0) return;
         }
         const box = p.boxRect();
         const shown = p.toFrame(box);
@@ -265,6 +276,8 @@ pub const Painter = struct {
         const c = p.ui.currentCanvas();
         c.setOrigin(.{ 0, 0 });
         c.setTransform(p.transform);
+        // A warning: never faded.
+        c.setOpacity(1);
         c.clip = scaleRect(clip, c.scale);
         c.recorder = p.rec;
         c.fillRect(r, stripe_colors[1]);

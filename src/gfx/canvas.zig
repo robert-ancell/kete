@@ -368,6 +368,8 @@ pub const Canvas = struct {
     /// Applied to everything drawn, last (in the target's pixels: see
     /// `setTransform`), or nothing.
     transform: ?Affine = null,
+    /// How opaque what is drawn is (`setOpacity`).
+    opacity: f32 = 1,
     /// Set if a shape could not be recorded (out of memory); the frame is
     /// missing it.
     failed: bool = false,
@@ -425,6 +427,7 @@ pub const Canvas = struct {
         c.clip = null;
         c.origin = .{ 0, 0 };
         c.transform = null;
+        c.opacity = 1;
         c.failed = false;
         c.atlas = null;
         c.recorder = null;
@@ -446,6 +449,19 @@ pub const Canvas = struct {
     /// Transforms what is drawn after (with the origin applied first: `m`
     /// works in logical coordinates of the whole canvas), or not at all.
     /// Clips set after are transformed too, to the rectangle they fit in.
+    /// How opaque what is drawn from now on is (0 to 1): each colour's,
+    /// and each image's, opacity multiplied by it (see `Opacity`, the widget).
+    /// Shapes drawn over each other each fade (each shows through the one
+    /// above it), as a group drawn and faded whole would not.
+    pub fn setOpacity(c: *Canvas, opacity: f32) void {
+        c.opacity = std.math.clamp(opacity, 0, 1);
+    }
+
+    /// `color`, as opaque as `opacity` makes it.
+    fn faded(c: *const Canvas, color: Color) Color {
+        return if (c.opacity >= 1) color else color.withAlpha(color.a * c.opacity);
+    }
+
     pub fn setTransform(c: *Canvas, m: ?Affine) void {
         c.transform = if (m) |t| t.scaledBy(c.scale) else null;
     }
@@ -479,7 +495,8 @@ pub const Canvas = struct {
     }
 
     /// Fills a simple polygon (convex or concave, not self-intersecting).
-    pub fn fillPolygon(c: *Canvas, points: []const Point, color: Color) void {
+    pub fn fillPolygon(c: *Canvas, points: []const Point, color_in: Color) void {
+        const color = c.faded(color_in);
         const s = c.scale;
         const bounds = c.moved(boundsOf(points)).outset(1);
         c.note(.polygon, bounds, .{ c.origin, s, color }, std.mem.sliceAsBytes(points));
@@ -494,7 +511,8 @@ pub const Canvas = struct {
 
     /// Fills what is inside an odd number of `rings` (each closed, of any
     /// number of points): a ring inside another is a hole in it.
-    pub fn fillPath(c: *Canvas, rings: []const []const Point, color: Color) void {
+    pub fn fillPath(c: *Canvas, rings: []const []const Point, color_in: Color) void {
+        const color = c.faded(color_in);
         if (color.a <= 0) return;
         const s = c.scale;
         var total: usize = 0;
@@ -526,7 +544,8 @@ pub const Canvas = struct {
     /// (`x`, `y`) and how much of the colour it has there (0 to 1), blended
     /// smoothly between them (a shadow that fades, say). Their edges are
     /// not smoothed.
-    pub fn fillShaded(c: *Canvas, corners: []const [3]f32, color: Color) void {
+    pub fn fillShaded(c: *Canvas, corners: []const [3]f32, color_in: Color) void {
+        const color = c.faded(color_in);
         if (corners.len < 3 or color.a <= 0) return;
         const s = c.scale;
         var lo: Point = .{ corners[0][0], corners[0][1] };
@@ -553,7 +572,8 @@ pub const Canvas = struct {
     }
 
     /// Strokes a polyline centred on it, with mitred joins and butt ends.
-    pub fn strokePolyline(c: *Canvas, points: []const Point, closed: bool, width: f32, color: Color) void {
+    pub fn strokePolyline(c: *Canvas, points: []const Point, closed: bool, width: f32, color_in: Color) void {
+        const color = c.faded(color_in);
         const s = c.scale;
         const sw = width * s;
         const bounds = c.moved(boundsOf(points)).outset(sw * geometry.miter_limit / 2 + 1);
@@ -573,7 +593,8 @@ pub const Canvas = struct {
     /// mostly out of sight (across a map zoomed far in) costs as much as
     /// the part of it in view. The pattern runs on round the corners,
     /// where a dash bends as the line does. Any number of points.
-    pub fn strokeDashedPolyline(c: *Canvas, points: []const Point, closed: bool, width: f32, dash: Dash, color: Color) void {
+    pub fn strokeDashedPolyline(c: *Canvas, points: []const Point, closed: bool, width: f32, dash: Dash, color_in: Color) void {
+        const color = c.faded(color_in);
         if (points.len < 2 or width <= 0 or color.a <= 0) return;
         const s = c.scale;
         const sw = width * s;
@@ -725,7 +746,8 @@ pub const Canvas = struct {
     /// Turned by quarters, its glyphs stay as sharp as upright ones, and
     /// so do they when the canvas's transform only moves and scales it the
     /// same both ways (they are drawn at the size they end up).
-    pub fn drawTextRunning(c: *Canvas, atlas: *Atlas, style: font.Style, from: Point, direction: TextDirection, text: []const u8, color: Color) Point {
+    pub fn drawTextRunning(c: *Canvas, atlas: *Atlas, style: font.Style, from: Point, direction: TextDirection, text: []const u8, color_in: Color) Point {
+        const color = c.faded(color_in);
         c.atlas = atlas;
         const transform = c.transform;
         const upright = if (transform) |m| m.isUniformScale() else false;
@@ -862,7 +884,8 @@ pub const Canvas = struct {
 
     /// Draws `img` stretched over `dest`, `alpha` opaque. It must last
     /// until the frame is drawn.
-    pub fn drawImage(c: *Canvas, img: *const Image, dest_in: Rect, alpha: f32) void {
+    pub fn drawImage(c: *Canvas, img: *const Image, dest_in: Rect, alpha_in: f32) void {
+        const alpha = alpha_in * c.opacity;
         const r = c.moved(dest_in);
         if (r.w <= 0 or r.h <= 0 or alpha <= 0 or img.width == 0 or img.height == 0) return;
         c.note(.image, r, .{ img.id, img.version, alpha, r }, "");
@@ -881,7 +904,8 @@ pub const Canvas = struct {
     /// (`x`, `y`) and where in the image it shows (`u`, `v`, from 0 to 1
     /// across and down). For pictures bent to a shape (a map's tiles on a
     /// globe), or a part of one.
-    pub fn drawImageTriangles(c: *Canvas, img: *const Image, corners: []const [4]f32, alpha: f32) void {
+    pub fn drawImageTriangles(c: *Canvas, img: *const Image, corners: []const [4]f32, alpha_in: f32) void {
+        const alpha = alpha_in * c.opacity;
         if (corners.len < 3 or alpha <= 0 or img.width == 0 or img.height == 0) return;
         const s = c.scale;
         var x0 = corners[0][0];
@@ -907,7 +931,8 @@ pub const Canvas = struct {
 
     // --- Rounded rectangles --------------------------------------------------
 
-    fn roundedRect(c: *Canvas, r_in: Rect, radii_in: CornerRadii, stroke_in: f32, color: Color) void {
+    fn roundedRect(c: *Canvas, r_in: Rect, radii_in: CornerRadii, stroke_in: f32, color_in: Color) void {
+        const color = c.faded(color_in);
         const s = c.scale;
         const r = c.moved(r_in);
         if (r.w <= 0 or r.h <= 0 or color.a <= 0) return;

@@ -4147,6 +4147,81 @@ test "a widget scaled about its middle grows every way, and is hit all over" {
     try testing.expectEqual(ui.Point{ 37.5, 37.5 }, pressable.fromWindow(.{ 55, 55 }).?);
 }
 
+/// A red square 40 pixels across, faded by `outer` and `inner` (nested).
+const Faded = struct {
+    outer: f32 = 1,
+    inner: f32 = 1,
+
+    pub fn build(self: *const Faded, cx: *Context) Widget {
+        return cx.make(ui.Align{ .alignment = .top_left, .child = cx.make(ui.Opacity{ .opacity = self.outer, .child = cx.make(ui.Opacity{
+            .opacity = self.inner,
+            .child = cx.make(ui.RoundedBox{ .color = red, .child = cx.make(ui.SizedBox{ .width = 40, .height = 40 }) }),
+        }) }) });
+    }
+};
+
+test "a widget in an Opacity is drawn faded, by every Opacity it is in, and not at all at 0" {
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    const redOf = struct {
+        fn of(img: Image) u32 {
+            return img.at(20, 20) >> 16 & 0xff;
+        }
+    }.of;
+    u.frame(100, 100, 0, Faded{});
+    var img = try Image.init(u, 100, 100);
+    try testing.expectEqual(@as(u32, 0xff), redOf(img));
+    img.deinit();
+    u.frame(100, 100, 1, Faded{ .outer = 0.5 });
+    img = try Image.init(u, 100, 100);
+    try testing.expect(redOf(img) >= 0x7e and redOf(img) <= 0x81);
+    img.deinit();
+    // Half of a half.
+    u.frame(100, 100, 2, Faded{ .outer = 0.5, .inner = 0.5 });
+    img = try Image.init(u, 100, 100);
+    try testing.expect(redOf(img) >= 0x3e and redOf(img) <= 0x41);
+    img.deinit();
+    // Changed, it is drawn again.
+    u.frame(100, 100, 3, Faded{ .outer = 0.5, .inner = 0.5 });
+    try testing.expect(!u.changed());
+    u.frame(100, 100, 4, Faded{ .outer = 0 });
+    try testing.expect(u.changed());
+    img = try Image.init(u, 100, 100);
+    try testing.expectEqual(@as(u32, 0), redOf(img));
+    img.deinit();
+}
+
+test "Place puts a point of its child at a fraction of the space, moved, and kept inside" {
+    const box: ui.Size = .{ .w = 40, .h = 20 };
+    const space: ui.Size = .{ .w = 200, .h = 100 };
+    // Its middle a quarter across, half down.
+    try testing.expectEqual(ui.Point{ 30, 40 }, (ui.Place{ .at = .{ 0.25, 0.5 } }).childAt(space, box));
+    // Its top left in the middle, ten pixels right.
+    try testing.expectEqual(ui.Point{ 110, 50 }, (ui.Place{ .anchor = .top_left, .offset = .{ 10, 0 } }).childAt(space, box));
+    // Its top centre below the middle of the top edge.
+    try testing.expectEqual(ui.Point{ 80, 25 }, (ui.Place{ .at = .{ 0.5, 0.25 }, .anchor = .top_center }).childAt(space, box));
+    // At the corner: inside, or (asked) over the edge.
+    try testing.expectEqual(ui.Point{ 160, 80 }, (ui.Place{ .at = .{ 1, 1 } }).childAt(space, box));
+    try testing.expectEqual(ui.Point{ 180, 90 }, (ui.Place{ .at = .{ 1, 1 }, .keep_inside = false }).childAt(space, box));
+
+    // Laid out in an Overlay, it fills it and puts its child there.
+    const fira = try font.Font.init(fira_data);
+    const u = try ui.WindowUi.create(testing.allocator, testing.io, &fira);
+    defer u.destroy();
+    const App = struct {
+        pub fn build(_: *const @This(), cx: *Context) Widget {
+            return cx.make(ui.Overlay{ .children = cx.makeAll(.{
+                ui.Place{ .at = .{ 0.25, 0.5 }, .child = cx.make(ui.SizedBox{ .width = 40, .height = 20 }) },
+            }) });
+        }
+    };
+    u.frame(200, 100, 0, App{});
+    const placed = find(u.root.?, ui.Place).?;
+    try testing.expectEqual(@as(f32, 200), placed.size.w);
+    try testing.expectEqual(ui.Point{ 30, 40 }, placed.child(0).offset);
+}
+
 /// A `KeyHandler`'s: the keys it was given, taking those in `takes`.
 const KeyTaker = struct {
     takes: []const ui.KeyboardKey,
